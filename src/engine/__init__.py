@@ -3,7 +3,9 @@
 from src.engine.knapsack import calculate_optimal_vouchers
 from src.engine.models import (
     Currency,
+    DEFAULT_MAX_VOUCHERS_PER_ORDER,
     Denomination,
+    MAX_PERMITTED_VOUCHERS_PER_ORDER,
     OptimizationResult,
     Region,
     SelectedDenomination,
@@ -20,4 +22,7 @@ __all__ = [
     "Currency",
     "ValidationError",
     "validate_input_contract",
+    "DEFAULT_MAX_VOUCHERS_PER_ORDER",
+    "MAX_PERMITTED_VOUCHERS_PER_ORDER",
 ]
+

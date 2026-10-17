@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple
 from src.engine import (
     Currency,
     Denomination,
+    DEFAULT_MAX_VOUCHERS_PER_ORDER,
     OptimizationResult,
     Region,
     ValidationError,
@@ -23,6 +24,8 @@ from src.engine import (
 def brute_force_reference_solver(
     target_amount_minor: int,
     denominations: List[Denomination],
+    max_vouchers_per_order: int = DEFAULT_MAX_VOUCHERS_PER_ORDER,
+    max_allowed_overshoot_minor: Optional[int] = None,
 ) -> Optional[Tuple[int, int, int, Tuple[int, ...], dict]]:
     """Exhaustive brute-force oracle for independent verification on small catalogs.
 
@@ -51,15 +54,20 @@ def brute_force_reference_solver(
     for combo in itertools.product(*ranges):
         tot_face = sum(q * d.face_value_minor for q, d in zip(combo, active))
         if tot_face >= target_amount_minor:
-            tot_cost = sum(q * d.cost_rub_kopecks for q, d in zip(combo, active))
-            leftover = tot_face - target_amount_minor
             count = sum(combo)
+            if count > max_vouchers_per_order:
+                continue
+            leftover = tot_face - target_amount_minor
+            if max_allowed_overshoot_minor is not None and leftover > max_allowed_overshoot_minor:
+                continue
+            tot_cost = sum(q * d.cost_rub_kopecks for q, d in zip(combo, active))
             tb = tuple(-q for q in combo)
             cand = (tot_cost, leftover, count, tb, {i: q for i, q in enumerate(combo) if q > 0})
             if best is None or cand < best:
                 best = cand
 
     return best
+
 
 
 class TestKnapsackCoreRequirements(unittest.TestCase):
@@ -337,14 +345,14 @@ class TestSecurityAndInputValidation(unittest.TestCase):
         self.assertEqual(us_res.currency, "USD")
 
     def test_large_permitted_inputs(self):
-        """Verify performance and correct behavior on large permitted inputs."""
+        """Verify performance and correct behavior on realistic PSN maximum inputs."""
         denoms = [
-            Denomination(face_value_minor=500000, cost_rub_kopecks=1500000, stock_limit=100),
-            Denomination(face_value_minor=250000, cost_rub_kopecks=800000, stock_limit=100),
-            Denomination(face_value_minor=100000, cost_rub_kopecks=350000, stock_limit=100),
+            Denomination(face_value_minor=500000, cost_rub_kopecks=1500000, stock_limit=50),
+            Denomination(face_value_minor=250000, cost_rub_kopecks=800000, stock_limit=50),
+            Denomination(face_value_minor=100000, cost_rub_kopecks=350000, stock_limit=50),
         ]
-        target = 12_700_000  # 127,000 TRY
-        res = calculate_optimal_vouchers("TR", "TRY", target, denoms)
+        target = 4_500_000  # 45,000 TRY (realistic high-end PSN cart)
+        res = calculate_optimal_vouchers("TR", "TRY", target, denoms, max_vouchers_per_order=15)
 
         self.assertEqual(res.status, "success")
         self.assertGreaterEqual(res.total_face_value_minor, target)
@@ -366,16 +374,130 @@ class TestSecurityAndInputValidation(unittest.TestCase):
             self.assertEqual(first_res, res)
 
     def test_resource_limits_exceeded(self):
-        """Reject inputs that exceed resource safety bounds."""
+        """Reject inputs that exceed realistic PSN safety bounds (Algo-DoS prevention)."""
         denoms = [Denomination(face_value_minor=1000, cost_rub_kopecks=500, stock_limit=1)]
-        # Target amount > 10^12
+        # Target amount > 5,000,000
         with self.assertRaises(ValidationError):
-            validate_input_contract("TR", "TRY", 10**13, denoms)
+            validate_input_contract("TR", "TRY", 5_000_001, denoms)
 
-        # Denomination count > 100
-        too_many = [Denomination(face_value_minor=1000, cost_rub_kopecks=500, stock_limit=1) for _ in range(101)]
+        # Denomination count > 20
+        too_many = [Denomination(face_value_minor=1000, cost_rub_kopecks=500, stock_limit=1) for _ in range(21)]
         with self.assertRaises(ValidationError):
             validate_input_contract("TR", "TRY", 1000, too_many)
+
+        # Stock limit > 1,000
+        with self.assertRaises(ValidationError):
+            Denomination(face_value_minor=1000, cost_rub_kopecks=500, stock_limit=1001)
+
+        # max_vouchers_per_order invalid
+        with self.assertRaises(ValidationError):
+            validate_input_contract("TR", "TRY", 1000, denoms, max_vouchers_per_order=0)
+
+        with self.assertRaises(ValidationError):
+            validate_input_contract("TR", "TRY", 1000, denoms, max_vouchers_per_order=21)
+
+        # max_allowed_overshoot_minor negative
+        with self.assertRaises(ValidationError):
+            validate_input_contract("TR", "TRY", 1000, denoms, max_allowed_overshoot_minor=-1)
+
+
+class TestArgonGateReviewProtections(unittest.TestCase):
+    """Specific tests addressing Argon's 3 critical risk recommendations."""
+
+    def test_risk_1_max_vouchers_per_order_prevents_toxic_ux(self):
+        """Voucher count cap (max_vouchers_per_order=6) prevents dumping 15 small vouchers."""
+        # 100 TRY voucher is slightly cheaper per unit (30 RUB vs 31 RUB per 100 TRY)
+        # Target is 1000 TRY.
+        # Unconstrained (e.g. limit=15): would take 10 vouchers of 100 TRY = 300 RUB.
+        # With max_vouchers_per_order=4: cannot take 10 vouchers, cannot take 6 vouchers.
+        # Must pick 2 x 500 TRY (voucher_count=2, cost=310 RUB).
+        denoms = [
+            Denomination(face_value_minor=100000, cost_rub_kopecks=31500, stock_limit=5), # 1000 TRY
+            Denomination(face_value_minor=50000, cost_rub_kopecks=15500, stock_limit=5),  # 500 TRY (31 RUB / 100)
+            Denomination(face_value_minor=10000, cost_rub_kopecks=3000, stock_limit=20),  # 100 TRY (30 RUB / 100)
+        ]
+        target = 100000 # 1000 TRY
+
+        # Test A: Cap at 4 vouchers -> forces 2 x 500 TRY
+        res_4 = calculate_optimal_vouchers("TR", "TRY", target, denoms, max_vouchers_per_order=4)
+        self.assertEqual(res_4.status, "success")
+        self.assertEqual(res_4.voucher_count, 2)
+        self.assertEqual(res_4.selected_denominations[0].face_value_minor, 50000)
+        self.assertEqual(res_4.selected_denominations[0].quantity, 2)
+
+        # Test B: Default cap at 6 vouchers -> takes 1 x 500 TRY + 5 x 100 TRY (6 vouchers <= 6)
+        res_6 = calculate_optimal_vouchers("TR", "TRY", target, denoms, max_vouchers_per_order=6)
+        self.assertEqual(res_6.status, "success")
+        self.assertEqual(res_6.voucher_count, 6)
+        self.assertLessEqual(res_6.voucher_count, 6)
+
+
+    def test_risk_1_max_vouchers_per_order_fails_safely_when_impossible(self):
+        """If only small vouchers exist and they exceed the cap, return clear no_solution."""
+        denoms = [
+            Denomination(face_value_minor=10000, cost_rub_kopecks=3000, stock_limit=20), # only 100 TRY cards
+        ]
+        target = 100000 # 1000 TRY (needs 10 vouchers)
+
+        # Cap at 5 vouchers
+        res = calculate_optimal_vouchers("TR", "TRY", target, denoms, max_vouchers_per_order=5)
+        self.assertEqual(res.status, "no_solution")
+        self.assertIn("maximum limit of 5 vouchers", res.reason)
+
+    def test_risk_2_max_allowed_overshoot_protects_business_margin(self):
+        """When smaller cards are depleted, max_allowed_overshoot prevents gifting huge change."""
+        # Target: 900 TRY. Small cards (100, 250, 500) are depleted (stock=0).
+        # Only 2000 TRY card in stock.
+        denoms = [
+            Denomination(face_value_minor=200000, cost_rub_kopecks=600000, stock_limit=1), # 2000 TRY
+            Denomination(face_value_minor=50000, cost_rub_kopecks=160000, stock_limit=0),  # Out of stock
+        ]
+        target = 90000 # 900 TRY
+
+        # Without overshoot limit: gives 2000 TRY with 1100 TRY leftover
+        res_no_cap = calculate_optimal_vouchers("TR", "TRY", target, denoms)
+        self.assertEqual(res_no_cap.status, "success")
+        self.assertEqual(res_no_cap.wallet_change_minor, 110000)
+
+        # With max_allowed_overshoot_minor = 500 TRY (50000 kurus): fails safely
+        res_capped = calculate_optimal_vouchers(
+            "TR", "TRY", target, denoms, max_allowed_overshoot_minor=50000
+        )
+        self.assertEqual(res_capped.status, "no_solution")
+        self.assertIn("exceeding maximum allowed overshoot", res_capped.reason)
+
+    def test_risk_3_depleted_stock_invariant_and_active_stock_calculation(self):
+        """Overshoot and reachability bounds must strictly operate only on stock > 0 denominations."""
+        # Case A from Skeptic: target = 1100 TRY, 500 TRY has stock=0, 1000 TRY has stock=2
+        denoms_a = [
+            Denomination(face_value_minor=100000, cost_rub_kopecks=310000, stock_limit=2),
+            Denomination(face_value_minor=50000, cost_rub_kopecks=160000, stock_limit=0),
+        ]
+        target_a = 110000
+        res_a = calculate_optimal_vouchers("TR", "TRY", target_a, denoms_a)
+        self.assertEqual(res_a.status, "success")
+        self.assertEqual(res_a.total_face_value_minor, 200000)
+        self.assertEqual(res_a.wallet_change_minor, 90000)
+        self.assertEqual(res_a.selected_denominations[0].face_value_minor, 100000)
+        self.assertEqual(res_a.selected_denominations[0].quantity, 2)
+
+        # Case B: target = 1100 TRY, stock has 1 x 1000 TRY and 1 x 2500 TRY, 500 TRY stock=0
+        denoms_b = [
+            Denomination(face_value_minor=250000, cost_rub_kopecks=800000, stock_limit=1),
+            Denomination(face_value_minor=100000, cost_rub_kopecks=310000, stock_limit=1),
+            Denomination(face_value_minor=50000, cost_rub_kopecks=160000, stock_limit=0),
+        ]
+        target_b = 110000
+        res_b = calculate_optimal_vouchers("TR", "TRY", target_b, denoms_b)
+        # Option 1: 1 x 2500 TRY = 2500 TRY (cost 8000 RUB, leftover 1400 TRY, 1 voucher)
+        # Option 2: 1 x 1000 + 1 x 2500 = 3500 TRY (redundant since 2500 already covers 1100)
+        # Algorithm must choose 1 x 2500 TRY
+        self.assertEqual(res_b.status, "success")
+        self.assertEqual(res_b.total_face_value_minor, 250000)
+        self.assertEqual(res_b.wallet_change_minor, 140000)
+        self.assertEqual(res_b.voucher_count, 1)
+        self.assertEqual(res_b.selected_denominations[0].face_value_minor, 250000)
+
 
 
 class TestIndependentExhaustiveOracle(unittest.TestCase):

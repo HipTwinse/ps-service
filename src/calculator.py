@@ -1,6 +1,8 @@
 """Top-level calculator module facade as specified in the project context."""
 
 from src.engine import (
+    DEFAULT_MAX_VOUCHERS_PER_ORDER,
+    MAX_PERMITTED_VOUCHERS_PER_ORDER,
     Currency,
     Denomination,
     OptimizationResult,
@@ -20,4 +22,7 @@ __all__ = [
     "Currency",
     "ValidationError",
     "validate_input_contract",
+    "DEFAULT_MAX_VOUCHERS_PER_ORDER",
+    "MAX_PERMITTED_VOUCHERS_PER_ORDER",
 ]
+

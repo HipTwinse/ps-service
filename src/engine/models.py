@@ -32,12 +32,14 @@ REGION_CURRENCY_MAP = {
     Region.US: Currency.USD,
 }
 
-# Maximum sensible limits to protect against memory exhaustion / resource abuse
-MAX_TARGET_AMOUNT_MINOR = 10**12       # 10 billion major units
-MAX_FACE_VALUE_MINOR = 10**12          # 10 billion major units
-MAX_COST_RUB_KOPECKS = 10**12          # 10 billion RUB
-MAX_STOCK_LIMIT = 1_000_000            # Up to 1M vouchers per denomination
-MAX_DENOMINATIONS_COUNT = 100          # Up to 100 distinct denominations
+# Realistic PlayStation Store limits to prevent Algorithmic DoS and protect resources
+MAX_TARGET_AMOUNT_MINOR = 5_000_000    # 50,000 TRY or 50,000 USD (PSN wallet max is ~5,000 TRY)
+MAX_FACE_VALUE_MINOR = 5_000_000       # Up to 50,000 TRY / USD
+MAX_COST_RUB_KOPECKS = 50_000_000      # 500,000 RUB
+MAX_STOCK_LIMIT = 1_000                # Up to 1,000 vouchers per denomination
+MAX_DENOMINATIONS_COUNT = 20           # Up to 20 distinct denominations in catalog
+DEFAULT_MAX_VOUCHERS_PER_ORDER = 6     # Maximum vouchers per order to prevent toxic UX (PSN flood control)
+MAX_PERMITTED_VOUCHERS_PER_ORDER = 20  # Hard ceiling for order voucher count
 
 
 class ValidationError(ValueError):
@@ -134,14 +136,16 @@ def validate_input_contract(
     currency: Union[Currency, str],
     target_amount_minor: int,
     denominations: Sequence[Denomination],
-) -> tuple[Region, Currency, int, list[Denomination]]:
+    max_vouchers_per_order: int = DEFAULT_MAX_VOUCHERS_PER_ORDER,
+    max_allowed_overshoot_minor: Optional[int] = None,
+) -> tuple[Region, Currency, int, list[Denomination], int, Optional[int]]:
     """Strictly validates all input fields according to the specification.
 
     Raises:
         ValidationError: If any parameter violates contract rules or types.
 
     Returns:
-        Validated tuple of (Region, Currency, target_amount_minor, list of Denominations).
+        Validated tuple of (Region, Currency, target_amount_minor, list of Denominations, max_vouchers, max_overshoot).
     """
     # 1. Validate Region
     if isinstance(region, str):
@@ -205,4 +209,30 @@ def validate_input_contract(
             )
         validated_denoms.append(d)
 
-    return reg_enum, curr_enum, target_amount_minor, validated_denoms
+    # 6. Validate max_vouchers_per_order
+    if isinstance(max_vouchers_per_order, bool) or not isinstance(max_vouchers_per_order, int):
+        raise ValidationError(
+            f"max_vouchers_per_order must be an integer, got {type(max_vouchers_per_order).__name__}"
+        )
+    if max_vouchers_per_order <= 0:
+        raise ValidationError(
+            f"max_vouchers_per_order must be strictly positive (> 0), got {max_vouchers_per_order}"
+        )
+    if max_vouchers_per_order > MAX_PERMITTED_VOUCHERS_PER_ORDER:
+        raise ValidationError(
+            f"max_vouchers_per_order cannot exceed {MAX_PERMITTED_VOUCHERS_PER_ORDER}, got {max_vouchers_per_order}"
+        )
+
+    # 7. Validate max_allowed_overshoot_minor
+    if max_allowed_overshoot_minor is not None:
+        if isinstance(max_allowed_overshoot_minor, bool) or not isinstance(max_allowed_overshoot_minor, int):
+            raise ValidationError(
+                f"max_allowed_overshoot_minor must be an integer or None, got {type(max_allowed_overshoot_minor).__name__}"
+            )
+        if max_allowed_overshoot_minor < 0:
+            raise ValidationError(
+                f"max_allowed_overshoot_minor cannot be negative, got {max_allowed_overshoot_minor}"
+            )
+
+    return reg_enum, curr_enum, target_amount_minor, validated_denoms, max_vouchers_per_order, max_allowed_overshoot_minor
+

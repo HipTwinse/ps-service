@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from src.engine.models import (
+    DEFAULT_MAX_VOUCHERS_PER_ORDER,
     Currency,
     Denomination,
     OptimizationResult,
@@ -23,6 +24,7 @@ from src.engine.models import (
     ValidationError,
     validate_input_contract,
 )
+
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,8 @@ def calculate_optimal_vouchers(
     currency: Union[Currency, str],
     target_amount_minor: int,
     denominations: Sequence[Denomination],
+    max_vouchers_per_order: int = DEFAULT_MAX_VOUCHERS_PER_ORDER,
+    max_allowed_overshoot_minor: Optional[int] = None,
     raise_on_invalid: bool = False,
 ) -> OptimizationResult:
     """Calculates the optimal combination of vouchers to cover a target amount.
@@ -48,6 +52,8 @@ def calculate_optimal_vouchers(
         currency: Store currency ('TRY' or 'USD').
         target_amount_minor: Purchase target in minor currency units (> 0).
         denominations: Sequence of available Denomination items.
+        max_vouchers_per_order: Max vouchers allowed in a single order (default 6).
+        max_allowed_overshoot_minor: Optional ceiling on wallet change (leftover).
         raise_on_invalid: If True, raises ValidationError on invalid inputs;
                           if False, returns OptimizationResult with status='no_solution'.
 
@@ -56,11 +62,20 @@ def calculate_optimal_vouchers(
     """
     # 1. Input Validation
     try:
-        reg_enum, curr_enum, target, validated_denoms = validate_input_contract(
+        (
+            reg_enum,
+            curr_enum,
+            target,
+            validated_denoms,
+            max_vouchers,
+            max_overshoot,
+        ) = validate_input_contract(
             region=region,
             currency=currency,
             target_amount_minor=target_amount_minor,
             denominations=denominations,
+            max_vouchers_per_order=max_vouchers_per_order,
+            max_allowed_overshoot_minor=max_allowed_overshoot_minor,
         )
     except ValidationError as err:
         if raise_on_invalid:
@@ -70,7 +85,8 @@ def calculate_optimal_vouchers(
             reason=f"Input validation failed: {str(err)}",
         )
 
-    # 2. Filter active denominations (enabled=True and stock_limit > 0)
+    # 2. Filter active denominations (strictly enabled=True and stock_limit > 0)
+    # Invariant: Denominations with stock_limit == 0 are completely excluded
     active_denoms: List[_ActiveDenom] = []
     for idx, d in enumerate(validated_denoms):
         if d.enabled and d.stock_limit > 0:
@@ -126,6 +142,8 @@ def calculate_optimal_vouchers(
     # Evaluation tuple: (cost, leftover, voucher_count, tie_breaker_tuple)
     # tie_breaker_tuple: (-q_0, -q_1, ..., -q_{n-1}) preferring larger denominations
     best_candidate: Optional[Tuple[int, int, int, Tuple[int, ...], Dict[int, int]]] = None
+    had_voucher_overflow = False
+    had_overshoot_overflow = False
 
     # Greedy initial upper bound to quickly constrain the search space
     def _seed_initial_solution() -> None:
@@ -139,19 +157,19 @@ def calculate_optimal_vouchers(
         for i, d in enumerate(active_denoms):
             if rem <= 0:
                 break
-            take = min(d.stock_limit, rem // d.face_value_minor)
-            if take > 0:
-                combo[i] = take
-                cost_acc += take * d.cost_rub_kopecks
-                cnt_acc += take
-                rem -= take * d.face_value_minor
+            max_take = min(d.stock_limit, rem // d.face_value_minor, max_vouchers - cnt_acc)
+            if max_take > 0:
+                combo[i] = max_take
+                cost_acc += max_take * d.cost_rub_kopecks
+                cnt_acc += max_take
+                rem -= max_take * d.face_value_minor
 
         # If not covered yet, complete with the smallest possible single overshoot
-        if rem > 0:
+        if rem > 0 and cnt_acc < max_vouchers:
             for i in reversed(range(n)):
                 d = active_denoms[i]
                 cur = combo.get(i, 0)
-                avail = d.stock_limit - cur
+                avail = min(d.stock_limit - cur, max_vouchers - cnt_acc)
                 if avail > 0:
                     take = min(avail, (rem - 1) // d.face_value_minor + 1)
                     combo[i] = cur + take
@@ -161,11 +179,12 @@ def calculate_optimal_vouchers(
                     if rem <= 0:
                         break
 
-        if rem <= 0:
+        if rem <= 0 and cnt_acc <= max_vouchers:
             tot_face = sum(combo[i] * active_denoms[i].face_value_minor for i in combo)
             leftover = tot_face - target
-            tb = tuple(-combo.get(i, 0) for i in range(n))
-            best_candidate = (cost_acc, leftover, cnt_acc, tb, dict(combo))
+            if max_overshoot is None or leftover <= max_overshoot:
+                tb = tuple(-combo.get(i, 0) for i in range(n))
+                best_candidate = (cost_acc, leftover, cnt_acc, tb, dict(combo))
 
     _seed_initial_solution()
 
@@ -178,11 +197,19 @@ def calculate_optimal_vouchers(
         current_cost: int,
         current_count: int,
     ) -> None:
-        nonlocal best_candidate
+        nonlocal best_candidate, had_voucher_overflow, had_overshoot_overflow
 
         # Candidate check: target reached or exceeded
         if current_face >= target:
             leftover = current_face - target
+            # Check business limits
+            if current_count > max_vouchers:
+                had_voucher_overflow = True
+                return
+            if max_overshoot is not None and leftover > max_overshoot:
+                had_overshoot_overflow = True
+                return
+
             tb = tuple(-current_combo.get(i, 0) for i in range(n))
             cand = (current_cost, leftover, current_count, tb, dict(current_combo))
             if best_candidate is None or cand < best_candidate:
@@ -192,19 +219,28 @@ def calculate_optimal_vouchers(
         if idx >= n:
             return
 
+        # Prune: Depth limit (max vouchers per order)
+        if current_count >= max_vouchers:
+            had_voucher_overflow = True
+            return
+
         denom = active_denoms[idx]
 
         # Prune 1: Suffix stock reachability
-        # If even taking 100% of remaining stock cannot reach target, backtrack
         if current_face + suffix_max_face[idx] < target:
             return
 
-        # Prune 2: Cost lower bound using integer arithmetic
-        # The remaining face value needed is `needed`
         needed = target - current_face
+
+        # Prune 2: Minimum vouchers needed bound against max_vouchers limit
+        # The largest available voucher face value in this suffix is active_denoms[idx].face_value_minor
+        min_vouchers_needed = (needed + denom.face_value_minor - 1) // denom.face_value_minor
+        if current_count + min_vouchers_needed > max_vouchers:
+            had_voucher_overflow = True
+            return
+
+        # Prune 3: Cost lower bound using integer arithmetic
         if best_candidate is not None:
-            # Theoretical absolute lower bound on cost to cover `needed` using available suffix
-            # For each denomination j >= idx: minimum integer ratio (needed * c_j) // v_j
             min_extra_cost = min(
                 (needed * active_denoms[j].cost_rub_kopecks) // active_denoms[j].face_value_minor
                 for j in range(idx, n)
@@ -212,19 +248,30 @@ def calculate_optimal_vouchers(
             if current_cost + min_extra_cost > best_candidate[0]:
                 return
 
-        # Prune 3: Redundant voucher elimination (Theorem 1)
-        # We never take more vouchers of denomination `idx` than needed to overshoot once
-        max_q = min(denom.stock_limit, (needed - 1) // denom.face_value_minor + 1)
+        # Prune 4: Redundant voucher elimination (Theorem 1)
+        # We never take more vouchers of denomination `idx` than needed to overshoot once,
+        # nor more than allowed by max_vouchers limit.
+        max_q = min(
+            denom.stock_limit,
+            (needed - 1) // denom.face_value_minor + 1,
+            max_vouchers - current_count,
+        )
 
-        # Prune 4: Lower bound on q
-        # If remaining stock after this denomination is insufficient to cover the rest,
-        # we MUST take at least min_q of this denomination
+        # Prune 5: Maximum overshoot limit bound
+        if max_overshoot is not None:
+            max_allowed_q = (needed + max_overshoot) // denom.face_value_minor
+            if max_allowed_q < max_q:
+                had_overshoot_overflow = True
+                max_q = max_allowed_q
+
+
+        # Prune 6: Lower bound on q
         stock_after = suffix_max_face[idx + 1]
         needed_from_this = needed - stock_after
         min_q = 0
         if needed_from_this > 0:
             min_q = (needed_from_this + denom.face_value_minor - 1) // denom.face_value_minor
-        if min_q > denom.stock_limit:
+        if min_q > max_q:
             return
 
         # Branching: iterate from max_q down to min_q
@@ -247,13 +294,25 @@ def calculate_optimal_vouchers(
     _search(0, 0, 0, 0)
 
     if best_candidate is None:
+        reason = "No combination of available stock can cover the target amount."
+        if had_overshoot_overflow and not had_voucher_overflow:
+            reason = (
+                f"Smallest available combination produces wallet leftover exceeding "
+                f"maximum allowed overshoot ({max_overshoot})."
+            )
+        elif had_voucher_overflow and not had_overshoot_overflow:
+            reason = (
+                f"No combination covers target within the maximum limit of "
+                f"{max_vouchers} vouchers per order."
+            )
         return OptimizationResult(
             status="no_solution",
             region=reg_enum.value,
             currency=curr_enum.value,
             target_amount_minor=target,
-            reason="No combination of available stock can cover the target amount.",
+            reason=reason,
         )
+
 
     # 6. Format successful result
     opt_cost, opt_leftover, opt_count, _, opt_combo = best_candidate
