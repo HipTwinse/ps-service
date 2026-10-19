@@ -1,5 +1,6 @@
 """Repository layer for catalog, users, inventory, orders, and receipts."""
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -349,9 +350,22 @@ class InventoryRepository:
                 continue
 
             fp = compute_fingerprint(code_str)
-            cur.execute("SELECT id FROM inventory_items WHERE fingerprint = ?", (fp,))
-            if cur.fetchone():
+            legacy_fp = hashlib.sha256(code_str.encode("utf-8")).hexdigest()
+
+            # Check both modern HMAC fingerprint and legacy SHA-256 fingerprint
+            cur.execute(
+                "SELECT id, fingerprint FROM inventory_items WHERE fingerprint = ? OR fingerprint = ?",
+                (fp, legacy_fp),
+            )
+            existing_row = cur.fetchone()
+            if existing_row:
                 duplicates += 1
+                # Auto-upgrade legacy fingerprint to HMAC if needed
+                if existing_row["fingerprint"] == legacy_fp and fp != legacy_fp:
+                    cur.execute(
+                        "UPDATE inventory_items SET fingerprint = ? WHERE id = ?",
+                        (fp, existing_row["id"]),
+                    )
                 continue
 
             encrypted = encrypt_payload(code_str)
@@ -375,12 +389,35 @@ class InventoryRepository:
             except sqlite3.IntegrityError:
                 duplicates += 1
 
+        self.conn.commit()
         return {
             "accepted": accepted,
             "duplicates": duplicates,
             "rejected": rejected,
             "total_submitted": len(raw_codes),
         }
+
+    def migrate_legacy_fingerprints(self, pepper: Optional[bytes] = None) -> int:
+        """Scans and upgrades any existing items with legacy unsalted SHA-256 fingerprints to HMAC-SHA256.
+
+        Preserves all encrypted payloads, keeps records intact, and executes atomically.
+        """
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, encrypted_payload, fingerprint FROM inventory_items")
+        rows = cur.fetchall()
+        upgraded = 0
+        for row in rows:
+            raw_code = decrypt_payload(row["encrypted_payload"])
+            legacy_sha = hashlib.sha256(raw_code.strip().encode("utf-8")).hexdigest()
+            new_hmac = compute_fingerprint(raw_code, pepper=pepper)
+            if row["fingerprint"] == legacy_sha and row["fingerprint"] != new_hmac:
+                cur.execute(
+                    "UPDATE inventory_items SET fingerprint = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (new_hmac, row["id"]),
+                )
+                upgraded += 1
+        self.conn.commit()
+        return upgraded
 
     def reserve_items_for_order(
         self,

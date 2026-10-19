@@ -167,8 +167,7 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
         src_conn.close()
 
     try:
-        os.replace(temp_file, target_file)
-        # Clean up stale WAL sidecars from previous database instance
+        # Remove stale WAL sidecars BEFORE swapping target file, so old WAL frames are never applied to the restored database
         for suffix in ("-wal", "-shm"):
             wal_sidecar = target_file.parent / f"{target_file.name}{suffix}"
             if wal_sidecar.exists():
@@ -176,6 +175,8 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
                     wal_sidecar.unlink()
                 except OSError:
                     pass
+
+        os.replace(temp_file, target_file)
     except Exception:
         if temp_file.exists():
             try:

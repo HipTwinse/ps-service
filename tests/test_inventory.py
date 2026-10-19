@@ -1,11 +1,13 @@
 """Unit and concurrency tests for inventory management, encryption, and reservation."""
 
+import hashlib
 import os
 import sqlite3
 import tempfile
 import unittest
 
 from src.db.connection import create_connection
+from src.db.crypto import compute_fingerprint, encrypt_payload
 from src.db.migrations import run_migrations
 from src.db.models import (
     DeliveryMethod,
@@ -190,6 +192,87 @@ class TestInventoryManagement(unittest.TestCase):
         still_sold = [r["status"] for r in cur.fetchall()]
         self.assertEqual(still_sold, ["SOLD", "SOLD"])
 
+    def test_legacy_sha256_migration_and_dual_lookup(self):
+        """Verify backward compatibility: legacy SHA-256 items are detected as duplicates,
+
+        decrypted properly, and safely upgraded to HMAC fingerprints.
+        """
+        legacy_code = "LEGACY-CARD-9999"
+        legacy_fp = hashlib.sha256(legacy_code.encode("utf-8")).hexdigest()
+        modern_fp = compute_fingerprint(legacy_code)
+        self.assertNotEqual(legacy_fp, modern_fp)
+
+        # 1. Manually insert an item with legacy unsalted SHA-256 fingerprint
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO inventory_items (
+                product_id, denomination_id, inventory_type, encrypted_payload, fingerprint, status
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.product.id,
+                self.denom.id,
+                InventoryType.VOUCHER_CODE.value,
+                encrypt_payload(legacy_code),
+                legacy_fp,
+                InventoryStatus.AVAILABLE.value,
+            ),
+        )
+        self.conn.commit()
+        item_id = cur.lastrowid
+
+        # 2. Attempting to import the exact same code must be caught as duplicate
+        import_result = self.inv_repo.import_items(
+            product_id=self.product.id,
+            raw_codes=[legacy_code],
+            inventory_type=InventoryType.VOUCHER_CODE,
+            denomination_id=self.denom.id,
+        )
+        self.assertEqual(import_result["accepted"], 0)
+        self.assertEqual(import_result["duplicates"], 1)
+
+        # 3. Verify auto-upgrade in place during duplicate check
+        cur.execute("SELECT fingerprint FROM inventory_items WHERE id = ?", (item_id,))
+        updated_fp = cur.fetchone()["fingerprint"]
+        self.assertEqual(updated_fp, modern_fp)
+        self.assertEqual(self.inv_repo.get_revealed_code(item_id), legacy_code)
+
+        # 4. Insert another legacy item and test batch migrate_legacy_fingerprints
+        legacy_code_2 = "LEGACY-CARD-8888"
+        legacy_fp_2 = hashlib.sha256(legacy_code_2.encode("utf-8")).hexdigest()
+        cur.execute(
+            """
+            INSERT INTO inventory_items (
+                product_id, denomination_id, inventory_type, encrypted_payload, fingerprint, status
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.product.id,
+                self.denom.id,
+                InventoryType.VOUCHER_CODE.value,
+                encrypt_payload(legacy_code_2),
+                legacy_fp_2,
+                InventoryStatus.AVAILABLE.value,
+            ),
+        )
+        self.conn.commit()
+
+        upgraded = self.inv_repo.migrate_legacy_fingerprints()
+        self.assertEqual(upgraded, 1)
+
+        # Idempotency check: running again upgrades 0
+        upgraded_again = self.inv_repo.migrate_legacy_fingerprints()
+        self.assertEqual(upgraded_again, 0)
+
+        # Verify decryption of both items
+        cur.execute("SELECT id, fingerprint FROM inventory_items ORDER BY id ASC")
+        all_items = cur.fetchall()
+        for row in all_items:
+            code = self.inv_repo.get_revealed_code(row["id"])
+            self.assertEqual(row["fingerprint"], compute_fingerprint(code))
+
 
 if __name__ == "__main__":
     unittest.main()
+
