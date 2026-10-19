@@ -123,6 +123,10 @@ class CatalogRepository:
             raise ValidationError("price_rub_kopecks must be strictly positive.")
         if duration_days is not None and duration_days <= 0:
             raise ValidationError("duration_days must be strictly positive if provided.")
+        if status == ProductStatus.APPROVED and approval_status != ApprovalStatus.APPROVED:
+            raise ValidationError(
+                "Cannot create active FIXED_PRODUCT without approved supply method (approval_status must be APPROVED)."
+            )
 
         cur = self.conn.cursor()
         cur.execute(
@@ -536,6 +540,18 @@ class OrderRepository:
             if prod_row["status"] != ProductStatus.APPROVED.value:
                 raise ValidationError(f"Product '{prod_id}' is not approved for sale.")
 
+            # Defense-in-depth: For FIXED_PRODUCT, verify approval_status directly
+            if prod_row["product_type"] == ProductType.FIXED_PRODUCT.value:
+                cur.execute(
+                    "SELECT approval_status FROM fixed_product_details WHERE product_id = ?",
+                    (prod_id,),
+                )
+                fp_row = cur.fetchone()
+                if not fp_row or fp_row["approval_status"] != ApprovalStatus.APPROVED.value:
+                    raise ValidationError(
+                        f"Fixed product '{prod_id}' does not have an approved supply method."
+                    )
+
             cur.execute(
                 """
                 INSERT INTO order_items (
@@ -629,8 +645,9 @@ class ReceiptRepository:
         user_id: int,
         file_bytes: bytes,
         provider_tx_id: Optional[str] = None,
+        provider_name: str = "MANUAL",
     ) -> PaymentReceipt:
-        """Submits a receipt file with strict SHA-256 deduplication.
+        """Submits a receipt file with strict SHA-256 deduplication and provider-scoped tx deduplication.
 
         Does NOT automatically mark the order as paid.
         """
@@ -641,6 +658,7 @@ class ReceiptRepository:
                 f"Receipt file size ({len(file_bytes)} bytes) exceeds 10MB limit."
             )
 
+        norm_provider = provider_name.strip() if provider_name and provider_name.strip() else "MANUAL"
         file_sha256 = compute_receipt_sha256(file_bytes)
         norm_tx_id = provider_tx_id.strip() if provider_tx_id and provider_tx_id.strip() else None
 
@@ -662,32 +680,37 @@ class ReceiptRepository:
                 f"Duplicate receipt: exact file already uploaded for order {existing['order_id']}."
             )
 
-        # Check provider transaction ID if present
+        # Check provider transaction ID scoped to provider_name if present
         if norm_tx_id:
-            cur.execute("SELECT id, order_id FROM payment_receipts WHERE provider_tx_id = ?", (norm_tx_id,))
+            cur.execute(
+                "SELECT id, order_id FROM payment_receipts WHERE provider_name = ? AND provider_tx_id = ?",
+                (norm_provider, norm_tx_id),
+            )
             existing_tx = cur.fetchone()
             if existing_tx:
                 raise DuplicateReceiptError(
-                    f"Duplicate payment identifier: provider tx {norm_tx_id} already attached to order {existing_tx['order_id']}."
+                    f"Duplicate payment identifier: provider '{norm_provider}' tx '{norm_tx_id}' already attached to order {existing_tx['order_id']}."
                 )
 
         try:
             cur.execute(
                 """
                 INSERT INTO payment_receipts (
-                    order_id, user_id, file_sha256, file_size_bytes, provider_tx_id, review_status
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    order_id, user_id, file_sha256, file_size_bytes, provider_name, provider_tx_id, review_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
                     user_id,
                     file_sha256,
                     len(file_bytes),
+                    norm_provider,
                     norm_tx_id,
                     ReceiptReviewStatus.PENDING_REVIEW.value,
                 ),
             )
             receipt_id = cur.lastrowid
+            self.conn.commit()
             return self.get_receipt(receipt_id)
         except sqlite3.IntegrityError as e:
             raise DuplicateReceiptError(f"Database constraint violation on receipt submission: {str(e)}")
@@ -709,6 +732,7 @@ class ReceiptRepository:
         )
         if cur.rowcount == 0:
             raise NotFoundError(f"Receipt {receipt_id} not found.")
+        self.conn.commit()
         return self.get_receipt(receipt_id)
 
     def get_receipt(self, receipt_id: int) -> PaymentReceipt:
@@ -723,6 +747,7 @@ class ReceiptRepository:
             user_id=row["user_id"],
             file_sha256=row["file_sha256"],
             file_size_bytes=row["file_size_bytes"],
+            provider_name=row["provider_name"] if "provider_name" in row.keys() else "LEGACY_UNSPECIFIED",
             provider_tx_id=row["provider_tx_id"],
             review_status=ReceiptReviewStatus(row["review_status"]),
             reviewer_notes=row["reviewer_notes"],

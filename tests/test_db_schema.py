@@ -49,13 +49,48 @@ class TestDatabaseSchemaAndMigrations(unittest.TestCase):
         """Verify migrations run and are tracked in schema_migrations table."""
         applied = run_migrations(self.conn)
         self.assertIn(1, applied)
+        self.assertIn(2, applied)
 
         history = get_applied_migrations(self.conn)
         self.assertIn(1, history)
+        self.assertIn(2, history)
 
         # Idempotency check: running again applies 0 new migrations
         applied_again = run_migrations(self.conn)
         self.assertEqual(len(applied_again), 0)
+
+    def test_migration_failure_rolls_back_atomically(self):
+        """If any statement in a migration fails, all preceding changes must be rolled back."""
+        from pathlib import Path
+        mig_temp_dir = tempfile.TemporaryDirectory()
+        try:
+            mig_path = Path(mig_temp_dir.name)
+            # Create a multi-statement migration where the last statement is deliberately invalid
+            bad_migration_file = mig_path / "003_failing_migration.sql"
+            with open(bad_migration_file, "w", encoding="utf-8") as f:
+                f.write(
+                    "CREATE TABLE atomic_canary_tbl (id INTEGER PRIMARY KEY);\n"
+                    "INSERT INTO atomic_canary_tbl VALUES (1);\n"
+                    "CRATE TABEL broken_syntax_error (id INTEGER);\n"
+                )
+
+            # Apply migrations pointing to the temp dir
+            run_migrations(self.conn) # apply 001 and 002 first
+            with self.assertRaises(RuntimeError) as cm:
+                run_migrations(self.conn, migrations_dir=mig_path)
+
+            self.assertIn("Migration 3_failing_migration failed", str(cm.exception))
+
+            # Verify atomic rollback: atomic_canary_tbl must NOT exist!
+            cur = self.conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='atomic_canary_tbl'")
+            self.assertIsNone(cur.fetchone())
+
+            # Verify version 3 was NOT recorded in schema_migrations
+            cur.execute("SELECT version FROM schema_migrations WHERE version = 3")
+            self.assertIsNone(cur.fetchone())
+        finally:
+            mig_temp_dir.cleanup()
 
     def test_foreign_key_enforcement(self):
         """Verify foreign key constraint violations are rejected."""
@@ -152,6 +187,21 @@ class TestDatabaseSchemaAndMigrations(unittest.TestCase):
         repo.update_product_status(fixed_prod.id, ProductStatus.APPROVED)
         updated = repo.get_product(fixed_prod.id)
         self.assertEqual(updated.status, ProductStatus.APPROVED)
+
+    def test_fixed_product_create_approval_bypass_rejected(self):
+        """Directly creating a fixed product with status=APPROVED while approval_status=DRAFT must be rejected."""
+        run_migrations(self.conn)
+        repo = CatalogRepository(self.conn)
+
+        with self.assertRaises(ValidationError) as cm:
+            repo.create_fixed_product(
+                display_name="Bypass Account",
+                price_rub_kopecks=10000,
+                delivery_method=DeliveryMethod.MANUAL_REVIEW,
+                approval_status=ApprovalStatus.DRAFT,
+                status=ProductStatus.APPROVED,
+            )
+        self.assertIn("approval_status must be APPROVED", str(cm.exception))
 
 
 if __name__ == "__main__":

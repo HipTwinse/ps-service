@@ -213,6 +213,7 @@ class PaymentReceipt:
     user_id: int
     file_sha256: str
     file_size_bytes: int
+    provider_name: str
     provider_tx_id: Optional[str]
     review_status: ReceiptReviewStatus
     reviewer_notes: Optional[str]

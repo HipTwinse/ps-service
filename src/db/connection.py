@@ -112,18 +112,75 @@ def backup_database(source_conn: sqlite3.Connection, backup_path: str | Path) ->
 
 
 def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
-    """Restores a database from a backup file to target location.
+    """Restores a database from a backup file to target location atomically.
+
+    Guarantees:
+    1. Restores into a temporary file in the same directory/filesystem.
+    2. Runs PRAGMA integrity_check on the restored temporary database.
+    3. Closes all connections before swapping files.
+    4. Performs atomic os.replace only after successful verification.
+    5. Cleans up temporary files on error; never leaves corrupted target.
+    6. Safely unlinks obsolete WAL sidecar files.
 
     Args:
         backup_path: Existing backup file path.
         target_path: Destination path for the restored database.
+
+    Raises:
+        FileNotFoundError: If backup_path does not exist.
+        sqlite3.DatabaseError: If backup file is corrupted or integrity check fails.
     """
-    src_conn = sqlite3.connect(str(backup_path))
-    dest_conn = get_connection(target_path, enable_wal=True)
+    import time
+
+    backup_file = Path(backup_path).resolve()
+    target_file = Path(target_path).resolve()
+
+    if not backup_file.exists():
+        raise FileNotFoundError(f"Backup file not found: {backup_file}")
+
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = target_file.parent / f"{target_file.name}.restore_tmp_{os.getpid()}_{int(time.time() * 1000)}"
+
+    src_conn = sqlite3.connect(str(backup_file))
     try:
-        src_conn.backup(dest_conn)
-        if dest_conn.in_transaction:
-            dest_conn.commit()
+        dest_conn = sqlite3.connect(str(temp_file))
+        try:
+            src_conn.backup(dest_conn)
+            if dest_conn.in_transaction:
+                dest_conn.commit()
+
+            cur = dest_conn.cursor()
+            cur.execute("PRAGMA integrity_check;")
+            res = cur.fetchone()[0]
+            if res != "ok":
+                raise sqlite3.DatabaseError(f"Restored database integrity check failed: {res}")
+        finally:
+            dest_conn.close()
+    except Exception:
+        if temp_file.exists():
+            try:
+                temp_file.unlink()
+            except OSError:
+                pass
+        raise
     finally:
         src_conn.close()
-        dest_conn.close()
+
+    try:
+        os.replace(temp_file, target_file)
+        # Clean up stale WAL sidecars from previous database instance
+        for suffix in ("-wal", "-shm"):
+            wal_sidecar = target_file.parent / f"{target_file.name}{suffix}"
+            if wal_sidecar.exists():
+                try:
+                    wal_sidecar.unlink()
+                except OSError:
+                    pass
+    except Exception:
+        if temp_file.exists():
+            try:
+                temp_file.unlink()
+            except OSError:
+                pass
+        raise
+

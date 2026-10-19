@@ -81,18 +81,27 @@ def run_migrations(
         with open(file_path, "r", encoding="utf-8") as f:
             sql_script = f.read()
 
-        # Execute migration within an isolated transaction
-        conn.execute("BEGIN IMMEDIATE")
+        # In Python's sqlite3, executescript() issues an implicit COMMIT before running.
+        # To guarantee that the migration script and its schema_migrations record are
+        # executed within a single, strictly atomic transaction without naive ';' splitting,
+        # we encapsulate the script and the audit record inside BEGIN IMMEDIATE ... COMMIT.
+        escaped_name = name.replace("'", "''")
+        wrapped_script = (
+            f"BEGIN IMMEDIATE;\n"
+            f"{sql_script}\n"
+            f"INSERT INTO schema_migrations (version, name) VALUES ({version}, '{escaped_name}');\n"
+            f"COMMIT;\n"
+        )
+
         try:
-            conn.executescript(sql_script)
-            conn.execute(
-                "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
-                (version, name),
-            )
-            conn.commit()
+            conn.executescript(wrapped_script)
             newly_applied.append(version)
         except Exception as e:
-            conn.rollback()
+            if conn.in_transaction:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             raise RuntimeError(
                 f"Migration {version}_{name} failed: {str(e)}"
             ) from e

@@ -1,6 +1,7 @@
 """Unit tests for SQLite online backup and restore utilities."""
 
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -102,6 +103,51 @@ class TestDatabaseBackupAndRestore(unittest.TestCase):
             self.assertEqual(items[0].unit_price_minor, 80000)
         finally:
             restored_conn.close()
+
+    def test_restore_from_corrupted_backup_does_not_create_target(self):
+        """A corrupted backup file must raise an error and not leave a target file."""
+        corrupt_file = os.path.join(self.temp_dir.name, "corrupt.bak")
+        with open(corrupt_file, "wb") as f:
+            f.write(b"NOT A VALID SQLITE DATABASE HEADER BYTES")
+
+        target_never_existed = os.path.join(self.temp_dir.name, "never_created.db")
+        with self.assertRaises(sqlite3.DatabaseError):
+            restore_database(corrupt_file, target_never_existed)
+
+        self.assertFalse(os.path.exists(target_never_existed))
+
+    def test_restore_from_corrupted_backup_preserves_existing_target(self):
+        """A corrupted backup file must not overwrite or damage an existing database."""
+        # 1. Create a valid backup and restore it
+        backup_database(self.conn, self.backup_path)
+        restore_database(self.backup_path, self.restored_path)
+        self.assertTrue(os.path.exists(self.restored_path))
+
+        # 2. Try to restore corrupted file on top of the valid database
+        corrupt_file = os.path.join(self.temp_dir.name, "corrupt.bak")
+        with open(corrupt_file, "wb") as f:
+            f.write(b"CORRUPT DATA INVALID HEADER")
+
+        with self.assertRaises(sqlite3.DatabaseError):
+            restore_database(corrupt_file, self.restored_path)
+
+        # 3. Existing target must still be 100% valid and contain original data!
+        restored_conn = create_connection(self.restored_path)
+        try:
+            cur = restored_conn.cursor()
+            cur.execute("PRAGMA integrity_check;")
+            self.assertEqual(cur.fetchone()[0], "ok")
+
+            restored_user_repo = UserRepository(restored_conn)
+            user = restored_user_repo.get_user(self.user.id)
+            self.assertEqual(user.external_id, "tg_backup_test")
+        finally:
+            restored_conn.close()
+
+    def test_restore_missing_backup_raises_filenotfound(self):
+        """Restoring from a non-existent backup file raises FileNotFoundError."""
+        with self.assertRaises(FileNotFoundError):
+            restore_database("non_existent_file_path_123.bak", self.restored_path)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from src.db.connection import (
     restore_database,
 )
 from src.db.crypto import (
+    CryptoConfigurationError,
     FernetCipher,
     compute_fingerprint,
     compute_receipt_sha256,
@@ -62,9 +63,12 @@ __all__ = [
     "run_migrations",
     "get_applied_migrations",
     # Crypto
+    "CryptoConfigurationError",
     "FernetCipher",
     "compute_fingerprint",
     "compute_receipt_sha256",
+    "encrypt_payload",
+    "decrypt_payload",
     # Enums & Models
     "ProductType",
     "ProductStatus",

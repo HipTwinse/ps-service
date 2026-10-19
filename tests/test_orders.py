@@ -171,6 +171,60 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
                 ],
             )
 
+    def test_order_creation_blocked_for_fixed_product_with_unapproved_supply(self):
+        """Even if products.status is somehow APPROVED, order creation must directly reject unapproved supply."""
+        # Create unapproved fixed product
+        unapproved_fp = self.catalog_repo.create_fixed_product(
+            display_name="Unapproved Accounts",
+            price_rub_kopecks=50000,
+            delivery_method=DeliveryMethod.MANUAL_REVIEW,
+            approval_status=ApprovalStatus.DRAFT,
+            status=ProductStatus.DRAFT,
+        )
+
+        # Directly simulate malicious/buggy DB update that bypassed catalog and set status=APPROVED
+        self.conn.execute("UPDATE products SET status = 'APPROVED' WHERE id = ?", (unapproved_fp.id,))
+        self.conn.commit()
+
+        # OrderRepository MUST block this order directly!
+        with self.assertRaises(ValidationError) as cm:
+            self.order_repo.create_order(
+                user_id=self.user.id,
+                total_amount_minor=50000,
+                currency="RUB",
+                items=[
+                    {
+                        "product_id": unapproved_fp.id,
+                        "product_type_snapshot": "FIXED_PRODUCT",
+                        "quantity": 1,
+                        "unit_price_minor": 50000,
+                        "metadata_json": None,
+                    }
+                ],
+            )
+        self.assertIn("does not have an approved supply method", str(cm.exception))
+
+        # Now approve the supply method
+        self.catalog_repo.update_fixed_product_approval(unapproved_fp.id, ApprovalStatus.APPROVED)
+        self.conn.commit()
+
+        # Now ordering must succeed!
+        valid_order = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=50000,
+            currency="RUB",
+            items=[
+                {
+                    "product_id": unapproved_fp.id,
+                    "product_type_snapshot": "FIXED_PRODUCT",
+                    "quantity": 1,
+                    "unit_price_minor": 50000,
+                    "metadata_json": None,
+                }
+            ],
+        )
+        self.assertEqual(valid_order.status, OrderStatus.PENDING_PAYMENT)
+
     def test_order_state_machine_transitions(self):
         """Verify valid transitions flow smoothly and illegal transitions are rejected."""
         order = self.order_repo.create_order(
