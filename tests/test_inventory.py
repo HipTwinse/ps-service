@@ -30,6 +30,7 @@ class TestInventoryManagement(unittest.TestCase):
     """Tests for inventory import, encryption, reservation, release, and concurrency safety."""
 
     def setUp(self):
+        os.environ["APP_ENV"] = "test"
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.temp_dir.name, "test_inv.db")
         self.conn = create_connection(self.db_path)

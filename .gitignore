@@ -9,3 +9,9 @@ build/
 *.egg-info/
 .venv/
 venv/
+scratch/
+PROJECT_FOR_CHATGPT.txt
+*.db
+*.db-wal
+*.db-shm
+*.restore_tmp_*

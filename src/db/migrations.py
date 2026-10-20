@@ -59,7 +59,15 @@ def run_migrations(
     conn: sqlite3.Connection,
     migrations_dir: Path = MIGRATIONS_DIR,
 ) -> List[int]:
-    """Applies all pending migrations in order inside individual transactions.
+    """Applies all pending migrations in order inside individual strictly atomic transactions.
+
+    Guarantees:
+    1. Schema modifications and the corresponding schema_migrations record run in ONE atomic transaction.
+    2. Encapsulates the entire migration script and migration audit record inside a single
+       `BEGIN IMMEDIATE; ... COMMIT;` block executed via `executescript()`.
+    3. Does not use naive `;` splitting, protecting triggers and complex multi-statement SQL.
+    4. If any statement or version recording fails, rolls back completely: neither schema
+       modifications nor the version record persist.
 
     Args:
         conn: Target sqlite3.Connection.
@@ -81,27 +89,22 @@ def run_migrations(
         with open(file_path, "r", encoding="utf-8") as f:
             sql_script = f.read()
 
-        # In Python's sqlite3, executescript() issues an implicit COMMIT before running.
-        # To guarantee that the migration script and its schema_migrations record are
-        # executed within a single, strictly atomic transaction without naive ';' splitting,
-        # we encapsulate the script and the audit record inside BEGIN IMMEDIATE ... COMMIT.
         escaped_name = name.replace("'", "''")
         wrapped_script = (
-            f"BEGIN IMMEDIATE;\n"
+            "BEGIN IMMEDIATE;\n"
             f"{sql_script}\n"
             f"INSERT INTO schema_migrations (version, name) VALUES ({version}, '{escaped_name}');\n"
-            f"COMMIT;\n"
+            "COMMIT;\n"
         )
 
         try:
             conn.executescript(wrapped_script)
             newly_applied.append(version)
         except Exception as e:
-            if conn.in_transaction:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
+            try:
+                conn.execute("ROLLBACK;")
+            except Exception:
+                pass
             raise RuntimeError(
                 f"Migration {version}_{name} failed: {str(e)}"
             ) from e

@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator, Optional
@@ -112,15 +113,22 @@ def backup_database(source_conn: sqlite3.Connection, backup_path: str | Path) ->
 
 
 def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
-    """Restores a database from a backup file to target location atomically.
+    """Restores a database from a backup file to target location atomically and safely.
+
+    OPERATIONAL REQUIREMENT (MANDATORY DOWNTIME):
+    All database connections to `target_path` must be completely stopped and closed
+    before invoking restore_database. Restoring while service operations or active
+    connections are writing to the database is strictly prohibited.
 
     Guarantees:
-    1. Restores into a temporary file in the same directory/filesystem.
-    2. Runs PRAGMA integrity_check on the restored temporary database.
-    3. Closes all connections before swapping files.
-    4. Performs atomic os.replace only after successful verification.
-    5. Cleans up temporary files on error; never leaves corrupted target.
-    6. Safely unlinks obsolete WAL sidecar files.
+    1. Rejects restore if target database has active connections holding write locks.
+    2. Restores into an isolated temporary file in the same directory/filesystem.
+    3. Runs PRAGMA integrity_check on the restored temporary database before swapping.
+    4. Closes all restore connection handles prior to file operations.
+    5. Removes stale WAL sidecar files (-wal, -shm) BEFORE swapping; if sidecars
+       cannot be removed, restoration aborts immediately with an error (never ignored).
+    6. Performs atomic `os.replace` only after integrity verification and sidecar cleanup.
+    7. Cleans up temporary files on any failure; never leaves corrupted target.
 
     Args:
         backup_path: Existing backup file path.
@@ -128,15 +136,28 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
 
     Raises:
         FileNotFoundError: If backup_path does not exist.
+        RuntimeError: If target is in active use or sidecars cannot be unlinked.
         sqlite3.DatabaseError: If backup file is corrupted or integrity check fails.
     """
-    import time
-
     backup_file = Path(backup_path).resolve()
     target_file = Path(target_path).resolve()
 
     if not backup_file.exists():
         raise FileNotFoundError(f"Backup file not found: {backup_file}")
+
+    # Guard: check if target file exists and has active locks
+    if target_file.exists():
+        try:
+            test_conn = sqlite3.connect(str(target_file), timeout=0.1)
+            try:
+                test_conn.execute("BEGIN EXCLUSIVE;")
+                test_conn.execute("COMMIT;")
+            finally:
+                test_conn.close()
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+            raise RuntimeError(
+                f"Cannot restore database: target database '{target_file}' is in use or locked by an active connection. Stop all operations before restoration: {e}"
+            ) from e
 
     target_file.parent.mkdir(parents=True, exist_ok=True)
     temp_file = target_file.parent / f"{target_file.name}.restore_tmp_{os.getpid()}_{int(time.time() * 1000)}"
@@ -167,14 +188,17 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
         src_conn.close()
 
     try:
-        # Remove stale WAL sidecars BEFORE swapping target file, so old WAL frames are never applied to the restored database
+        # Remove stale WAL sidecars BEFORE swapping target file.
+        # If removing a sidecar fails, ABORT immediately to prevent replaying old WAL frames onto restored database.
         for suffix in ("-wal", "-shm"):
             wal_sidecar = target_file.parent / f"{target_file.name}{suffix}"
             if wal_sidecar.exists():
                 try:
                     wal_sidecar.unlink()
-                except OSError:
-                    pass
+                except OSError as e:
+                    raise RuntimeError(
+                        f"Failed to remove stale WAL sidecar '{wal_sidecar}': {e}. Aborting restore to prevent corruption."
+                    ) from e
 
         os.replace(temp_file, target_file)
     except Exception:
@@ -184,4 +208,3 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
             except OSError:
                 pass
         raise
-

@@ -13,6 +13,7 @@ from src.db.connection import (
 from src.db.crypto import (
     CryptoConfigurationError,
     FernetCipher,
+    canonicalize_code,
     compute_fingerprint,
     compute_receipt_sha256,
     decrypt_payload,
@@ -65,6 +66,7 @@ __all__ = [
     # Crypto
     "CryptoConfigurationError",
     "FernetCipher",
+    "canonicalize_code",
     "compute_fingerprint",
     "compute_receipt_sha256",
     "encrypt_payload",

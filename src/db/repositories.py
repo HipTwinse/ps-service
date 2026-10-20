@@ -6,7 +6,13 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from src.db.crypto import compute_fingerprint, compute_receipt_sha256, decrypt_payload, encrypt_payload
+from src.db.crypto import (
+    canonicalize_code,
+    compute_fingerprint,
+    compute_receipt_sha256,
+    decrypt_payload,
+    encrypt_payload,
+)
 from src.db.models import (
     ALLOWED_ORDER_TRANSITIONS,
     ApprovalStatus,
@@ -53,6 +59,8 @@ class CatalogRepository:
             raise ValidationError(f"Invalid region '{region}'. Must be 'TR' or 'US'.")
         if currency not in ("TRY", "USD"):
             raise ValidationError(f"Invalid currency '{currency}'. Must be 'TRY' or 'USD'.")
+        if not display_name or not display_name.strip():
+            raise ValidationError("display_name cannot be empty.")
 
         cur = self.conn.cursor()
         cur.execute(
@@ -60,7 +68,7 @@ class CatalogRepository:
             INSERT INTO products (product_type, display_name, status)
             VALUES (?, ?, ?)
             """,
-            (ProductType.VOUCHER.value, display_name, status.value),
+            (ProductType.VOUCHER.value, display_name.strip(), status.value),
         )
         product_id = cur.lastrowid
         cur.execute(
@@ -68,7 +76,7 @@ class CatalogRepository:
             INSERT INTO voucher_details (product_id, region, currency)
             VALUES (?, ?, ?)
             """,
-            (product_id, region, currency),
+            (product_id, region.strip().upper(), currency.strip().upper()),
         )
         return self.get_product(product_id)
 
@@ -86,6 +94,10 @@ class CatalogRepository:
         if cost_rub_kopecks < 0:
             raise ValidationError("cost_rub_kopecks cannot be negative.")
 
+        product = self.get_product(product_id)
+        if product.product_type != ProductType.VOUCHER:
+            raise ValidationError(f"Product {product_id} is not of type VOUCHER.")
+
         cur = self.conn.cursor()
         try:
             cur.execute(
@@ -96,8 +108,8 @@ class CatalogRepository:
                 """,
                 (
                     product_id,
-                    region,
-                    currency,
+                    region.strip().upper(),
+                    currency.strip().upper(),
                     face_value_minor,
                     cost_rub_kopecks,
                     1 if is_active else 0,
@@ -239,6 +251,46 @@ class CatalogRepository:
             """,
             (approval_status.value, product_id),
         )
+        # If approval is revoked, ensure product status is demoted to DRAFT
+        if approval_status != ApprovalStatus.APPROVED:
+            self.conn.execute(
+                "UPDATE products SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?",
+                (ProductStatus.DRAFT.value, product_id, ProductStatus.APPROVED.value),
+            )
+        self.conn.commit()
+
+    def update_fixed_product_supply_method(
+        self, product_id: int, new_supply_method: str
+    ) -> None:
+        """Updates the supply method of a fixed product.
+
+        SECURITY INVARIANT:
+        Modifying the supply method immediately revokes any previous approval.
+        Resets approval_status to DRAFT and resets products.status to DRAFT.
+        """
+        if not new_supply_method or not new_supply_method.strip():
+            raise ValidationError("supply_method cannot be empty.")
+
+        cur = self.conn.cursor()
+        cur.execute("SELECT product_id FROM fixed_product_details WHERE product_id = ?", (product_id,))
+        if not cur.fetchone():
+            raise NotFoundError(f"Fixed product {product_id} not found.")
+
+        # Update supply method and demote approval to DRAFT
+        cur.execute(
+            """
+            UPDATE fixed_product_details
+            SET supply_method = ?, approval_status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE product_id = ?
+            """,
+            (new_supply_method.strip(), ApprovalStatus.DRAFT.value, product_id),
+        )
+        # Demote product status to DRAFT so it cannot be sold without re-approval
+        cur.execute(
+            "UPDATE products SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (ProductStatus.DRAFT.value, product_id),
+        )
+        self.conn.commit()
 
 
 class UserRepository:
@@ -326,8 +378,8 @@ class InventoryRepository:
     ) -> Dict[str, int]:
         """Safely imports a batch of inventory codes.
 
-        Encrypts sensitive payloads, computes unique fingerprints, and rejects duplicates.
-        Does NOT log any plaintext codes.
+        Canonicalizes codes, encrypts sensitive payloads, computes unique fingerprints,
+        and rejects duplicates. Does NOT log any plaintext codes.
         """
         cur = self.conn.cursor()
         cur.execute("SELECT id FROM products WHERE id = ?", (product_id,))
@@ -344,7 +396,7 @@ class InventoryRepository:
         rejected = 0
 
         for raw_code in raw_codes:
-            code_str = raw_code.strip() if raw_code else ""
+            code_str = canonicalize_code(raw_code)
             if not code_str:
                 rejected += 1
                 continue
@@ -400,7 +452,7 @@ class InventoryRepository:
     def migrate_legacy_fingerprints(self, pepper: Optional[bytes] = None) -> int:
         """Scans and upgrades any existing items with legacy unsalted SHA-256 fingerprints to HMAC-SHA256.
 
-        Preserves all encrypted payloads, keeps records intact, and executes atomically.
+        Canonicalizes raw codes, preserves all encrypted payloads, keeps records intact, and executes atomically.
         """
         cur = self.conn.cursor()
         cur.execute("SELECT id, encrypted_payload, fingerprint FROM inventory_items")
@@ -408,8 +460,9 @@ class InventoryRepository:
         upgraded = 0
         for row in rows:
             raw_code = decrypt_payload(row["encrypted_payload"])
-            legacy_sha = hashlib.sha256(raw_code.strip().encode("utf-8")).hexdigest()
-            new_hmac = compute_fingerprint(raw_code, pepper=pepper)
+            clean_code = canonicalize_code(raw_code)
+            legacy_sha = hashlib.sha256(clean_code.encode("utf-8")).hexdigest()
+            new_hmac = compute_fingerprint(clean_code, pepper=pepper)
             if row["fingerprint"] == legacy_sha and row["fingerprint"] != new_hmac:
                 cur.execute(
                     "UPDATE inventory_items SET fingerprint = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -418,6 +471,25 @@ class InventoryRepository:
                 upgraded += 1
         self.conn.commit()
         return upgraded
+
+    def rotate_fingerprint_pepper(self, new_pepper: bytes, old_pepper: Optional[bytes] = None) -> int:
+        """Rotates inventory HMAC fingerprints when FINGERPRINT_PEPPER is rotated."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, encrypted_payload, fingerprint FROM inventory_items")
+        rows = cur.fetchall()
+        rotated = 0
+        for row in rows:
+            raw_code = decrypt_payload(row["encrypted_payload"])
+            clean_code = canonicalize_code(raw_code)
+            new_hmac = compute_fingerprint(clean_code, pepper=new_pepper)
+            if row["fingerprint"] != new_hmac:
+                cur.execute(
+                    "UPDATE inventory_items SET fingerprint = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (new_hmac, row["id"]),
+                )
+                rotated += 1
+        self.conn.commit()
+        return rotated
 
     def reserve_items_for_order(
         self,
@@ -434,7 +506,6 @@ class InventoryRepository:
             raise ValidationError("Quantity to reserve must be strictly positive.")
 
         cur = self.conn.cursor()
-        # Find candidate available items
         if denomination_id is not None:
             cur.execute(
                 """
@@ -454,15 +525,14 @@ class InventoryRepository:
                 (product_id, quantity),
             )
 
-        candidate_rows = cur.fetchall()
-        if len(candidate_rows) < quantity:
+        candidates = [row["id"] for row in cur.fetchall()]
+        if len(candidates) < quantity:
             raise InsufficientInventoryError(
-                f"Required {quantity} items, but only {len(candidate_rows)} available."
+                f"Requested {quantity} units for product {product_id}, but only {len(candidates)} available."
             )
 
-        reserved_ids = []
-        for row in candidate_rows:
-            item_id = row["id"]
+        reserved_ids: List[int] = []
+        for item_id in candidates:
             cur.execute(
                 """
                 UPDATE inventory_items
@@ -471,19 +541,32 @@ class InventoryRepository:
                 """,
                 (order_id, item_id),
             )
-            if cur.rowcount == 0:
-                # Concurrent transaction won the race for this item
-                raise InsufficientInventoryError(
-                    f"Concurrency conflict: inventory item {item_id} is no longer available."
-                )
-            reserved_ids.append(item_id)
+            if cur.rowcount == 1:
+                reserved_ids.append(item_id)
 
+        if len(reserved_ids) < quantity:
+            if reserved_ids:
+                placeholders = ",".join("?" for _ in reserved_ids)
+                cur.execute(
+                    f"""
+                    UPDATE inventory_items
+                    SET status = 'AVAILABLE', reserved_order_id = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders})
+                    """,
+                    tuple(reserved_ids),
+                )
+                self.conn.commit()
+            raise InsufficientInventoryError(
+                f"Concurrency conflict: requested {quantity} units, successfully locked {len(reserved_ids)}."
+            )
+
+        self.conn.commit()
         return reserved_ids
 
     def release_order_reservations(self, order_id: int) -> int:
-        """Releases all reserved items for an order back to AVAILABLE.
+        """Releases reserved inventory items back to AVAILABLE status if an order is cancelled or expires.
 
-        Invariant: NEVER releases items that have already been marked SOLD.
+        Invariant: NEVER reverts SOLD items to AVAILABLE.
         """
         cur = self.conn.cursor()
         cur.execute(
@@ -494,10 +577,12 @@ class InventoryRepository:
             """,
             (order_id,),
         )
-        return cur.rowcount
+        count = cur.rowcount
+        self.conn.commit()
+        return count
 
     def finalize_order_sale(self, order_id: int) -> int:
-        """Transitions reserved inventory items to SOLD upon successful payment/completion."""
+        """Transitions reserved inventory items to permanently SOLD state upon successful order completion."""
         cur = self.conn.cursor()
         cur.execute(
             """
@@ -507,13 +592,12 @@ class InventoryRepository:
             """,
             (order_id,),
         )
-        return cur.rowcount
+        count = cur.rowcount
+        self.conn.commit()
+        return count
 
     def get_revealed_code(self, item_id: int) -> str:
-        """Decrypts and reveals the stored payload for delivery.
-
-        Must NEVER be printed in debug logs.
-        """
+        """Reveals the decrypted code for an inventory item (for authorized fulfillment only)."""
         cur = self.conn.cursor()
         cur.execute("SELECT encrypted_payload FROM inventory_items WHERE id = ?", (item_id,))
         row = cur.fetchone()
@@ -535,7 +619,10 @@ class OrderRepository:
         currency: str,
         items: Sequence[Dict[str, Any]],
     ) -> Order:
-        """Creates an order and preserves historical price snapshots on all items."""
+        """Creates an order and preserves historical price snapshots on all items.
+
+        Atomic and transaction-safe: validates user and all items before insertion.
+        """
         if total_amount_minor <= 0:
             raise ValidationError("total_amount_minor must be strictly positive.")
         if not items:
@@ -550,15 +637,8 @@ class OrderRepository:
         if user_row["status"] == UserStatus.BLOCKED.value:
             raise ValidationError("Cannot create order for blocked user.")
 
-        cur.execute(
-            """
-            INSERT INTO orders (user_id, status, total_amount_minor, currency)
-            VALUES (?, ?, ?, ?)
-            """,
-            (user_id, OrderStatus.PENDING_PAYMENT.value, total_amount_minor, currency),
-        )
-        order_id = cur.lastrowid
-
+        # Pre-validate all items before inserting anything into orders or order_items
+        validated_items = []
         for item in items:
             prod_id = item["product_id"]
             qty = item["quantity"]
@@ -568,6 +648,8 @@ class OrderRepository:
 
             if qty <= 0:
                 raise ValidationError("Item quantity must be strictly positive.")
+            if unit_price <= 0:
+                raise ValidationError("Unit price must be strictly positive.")
 
             # Validate product exists and is approved for sale
             cur.execute("SELECT id, status, product_type FROM products WHERE id = ?", (prod_id,))
@@ -589,47 +671,78 @@ class OrderRepository:
                         f"Fixed product '{prod_id}' does not have an approved supply method."
                     )
 
+            validated_items.append((prod_id, prod_type, qty, unit_price, meta_json))
+
+        try:
             cur.execute(
                 """
-                INSERT INTO order_items (
-                    order_id, product_id, product_type_snapshot, quantity, unit_price_minor, currency, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO orders (user_id, status, total_amount_minor, currency)
+                VALUES (?, ?, ?, ?)
                 """,
-                (order_id, prod_id, prod_type, qty, unit_price, currency, meta_json),
+                (user_id, OrderStatus.PENDING_PAYMENT.value, total_amount_minor, currency),
             )
+            order_id = cur.lastrowid
 
-        return self.get_order(order_id)
+            for prod_id, prod_type, qty, unit_price, meta_json in validated_items:
+                cur.execute(
+                    """
+                    INSERT INTO order_items (
+                        order_id, product_id, product_type_snapshot, quantity, unit_price_minor, currency, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (order_id, prod_id, prod_type, qty, unit_price, currency, meta_json),
+                )
+            self.conn.commit()
+            return self.get_order(order_id)
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def transition_order_status(
         self,
         order_id: int,
-        new_status: OrderStatus,
-        paid_at: Optional[datetime] = None,
+        target_status: OrderStatus,
+        notes: Optional[str] = None,
     ) -> Order:
-        """Transitions order status enforcing strict lifecycle state machine rules."""
+        """Transitions order status enforcing strict state machine transitions and audit logging."""
         order = self.get_order(order_id)
         current_status = order.status
 
-        allowed = ALLOWED_ORDER_TRANSITIONS.get(current_status, set())
-        if new_status not in allowed:
+        allowed_targets = ALLOWED_ORDER_TRANSITIONS.get(current_status, set())
+        if target_status not in allowed_targets:
             raise InvalidStateTransitionError(
-                f"Cannot transition order {order_id} from {current_status.value} to {new_status.value}."
+                f"Cannot transition order {order_id} from {current_status.value} to {target_status.value}."
             )
 
         cur = self.conn.cursor()
-        paid_at_str = None
-        if new_status == OrderStatus.PAID:
-            dt = paid_at if paid_at is not None else datetime.now(timezone.utc)
-            paid_at_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-
+        if target_status == OrderStatus.PAID:
+            cur.execute(
+                """
+                UPDATE orders
+                SET status = ?, paid_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (target_status.value, order_id),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE orders
+                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (target_status.value, order_id),
+            )
+        details = json.dumps({"notes": notes, "from_status": current_status.value, "to_status": target_status.value}) if notes else None
         cur.execute(
             """
-            UPDATE orders
-            SET status = ?, paid_at = COALESCE(?, paid_at), updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            INSERT INTO audit_events (
+                event_type, entity_type, entity_id, details_json
+            ) VALUES (?, ?, ?, ?)
             """,
-            (new_status.value, paid_at_str, order_id),
+            ("ORDER_STATUS_TRANSITION", "ORDER", order_id, details),
         )
+        self.conn.commit()
         return self.get_order(order_id)
 
     def get_order(self, order_id: int) -> Order:
@@ -638,6 +751,7 @@ class OrderRepository:
         row = cur.fetchone()
         if not row:
             raise NotFoundError(f"Order {order_id} not found.")
+
         return Order(
             id=row["id"],
             user_id=row["user_id"],
@@ -651,7 +765,7 @@ class OrderRepository:
 
     def get_order_items(self, order_id: int) -> List[OrderItem]:
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM order_items WHERE order_id = ?", (order_id,))
+        cur.execute("SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC", (order_id,))
         return [
             OrderItem(
                 id=row["id"],
@@ -669,9 +783,9 @@ class OrderRepository:
 
 
 class ReceiptRepository:
-    """Manages payment receipt submission, SHA-256 deduplication, and manual review."""
+    """Manages payment receipt upload, deduplication, and manual operator review."""
 
-    MAX_RECEIPT_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+    MAX_RECEIPT_SIZE_BYTES = 10 * 1024 * 1024  # 10MB limit
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
@@ -686,6 +800,7 @@ class ReceiptRepository:
     ) -> PaymentReceipt:
         """Submits a receipt file with strict SHA-256 deduplication and provider-scoped tx deduplication.
 
+        Canonicalizes provider_name, preserves binary receipt hashes, and scopes provider transaction IDs.
         Does NOT automatically mark the order as paid.
         """
         if not file_bytes:
@@ -695,7 +810,7 @@ class ReceiptRepository:
                 f"Receipt file size ({len(file_bytes)} bytes) exceeds 10MB limit."
             )
 
-        norm_provider = provider_name.strip() if provider_name and provider_name.strip() else "MANUAL"
+        norm_provider = provider_name.strip().upper() if provider_name and provider_name.strip() else "MANUAL"
         file_sha256 = compute_receipt_sha256(file_bytes)
         norm_tx_id = provider_tx_id.strip() if provider_tx_id and provider_tx_id.strip() else None
 
@@ -750,7 +865,11 @@ class ReceiptRepository:
             self.conn.commit()
             return self.get_receipt(receipt_id)
         except sqlite3.IntegrityError as e:
-            raise DuplicateReceiptError(f"Database constraint violation on receipt submission: {str(e)}")
+            self.conn.rollback()
+            raise DuplicateReceiptError(f"Database constraint violation on receipt submission: {str(e)}") from e
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def update_review_status(
         self,
@@ -768,9 +887,11 @@ class ReceiptRepository:
             (review_status.value, reviewer_notes, receipt_id),
         )
         if cur.rowcount == 0:
-            raise NotFoundError(f"Receipt {receipt_id} not found.")
+            raise NotFoundError(f"Payment receipt {receipt_id} not found.")
         self.conn.commit()
         return self.get_receipt(receipt_id)
+
+    review_receipt = update_review_status
 
     def get_receipt(self, receipt_id: int) -> PaymentReceipt:
         cur = self.conn.cursor()

@@ -1,0 +1,153 @@
+"""Tests for provider-scoped receipts, catalog supply method revocation, and atomic order creation."""
+
+import os
+import sqlite3
+import tempfile
+import unittest
+
+from src.db.connection import create_connection
+from src.db.migrations import run_migrations
+from src.db.models import (
+    ApprovalStatus,
+    DeliveryMethod,
+    DuplicateReceiptError,
+    OrderStatus,
+    ProductStatus,
+    ValidationError,
+)
+from src.db.repositories import (
+    CatalogRepository,
+    OrderRepository,
+    ReceiptRepository,
+    UserRepository,
+)
+
+
+class TestReceiptsAndCatalogRemediation(unittest.TestCase):
+    """P1 remediation tests for provider-scoped receipts and catalog approval invariants."""
+
+    def setUp(self):
+        os.environ["APP_ENV"] = "test"
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "test_remed.db")
+        self.conn = create_connection(self.db_path)
+        run_migrations(self.conn)
+
+        self.catalog_repo = CatalogRepository(self.conn)
+        self.user_repo = UserRepository(self.conn)
+        self.order_repo = OrderRepository(self.conn)
+        self.receipt_repo = ReceiptRepository(self.conn)
+
+        self.user, _ = self.user_repo.get_or_create_user("tg_user_1", "gamer_1")
+
+    def tearDown(self):
+        self.conn.close()
+        self.temp_dir.cleanup()
+
+    def test_canonical_provider_name_and_scoped_tx_deduplication(self):
+        """Provider name is canonicalized to uppercase stripped string and scoped correctly."""
+        voucher_prod = self.catalog_repo.create_voucher_product("TR Card", "TR", "TRY", ProductStatus.APPROVED)
+        order1 = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=1000,
+            currency="RUB",
+            items=[{"product_id": voucher_prod.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000}],
+        )
+        order2 = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=1000,
+            currency="RUB",
+            items=[{"product_id": voucher_prod.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000}],
+        )
+
+        # Submit receipt with whitespace and lower-case provider
+        rec1 = self.receipt_repo.submit_receipt(
+            order_id=order1.id,
+            user_id=self.user.id,
+            file_bytes=b"Receipt file A",
+            provider_name="  sber  ",
+            provider_tx_id="TX_COMMON_123",
+        )
+        self.assertEqual(rec1.provider_name, "SBER")
+
+        # Submitting duplicate under different provider (TINKOFF) succeeds
+        rec2 = self.receipt_repo.submit_receipt(
+            order_id=order2.id,
+            user_id=self.user.id,
+            file_bytes=b"Receipt file B",
+            provider_name="tinkoff",
+            provider_tx_id="TX_COMMON_123",
+        )
+        self.assertEqual(rec2.provider_name, "TINKOFF")
+
+        # Submitting duplicate under same provider (even with lower-case or spaces) must be rejected
+        with self.assertRaises(DuplicateReceiptError):
+            self.receipt_repo.submit_receipt(
+                order_id=order2.id,
+                user_id=self.user.id,
+                file_bytes=b"Receipt file C",
+                provider_name="SBER",
+                provider_tx_id="TX_COMMON_123",
+            )
+
+    def test_modifying_supply_method_revokes_approval_and_product_status(self):
+        """Updating supply method immediately demotes approval_status and products.status to DRAFT."""
+        prod = self.catalog_repo.create_fixed_product(
+            display_name="PS Plus 12M",
+            price_rub_kopecks=500000,
+            delivery_method=DeliveryMethod.OFFICIAL_ACTIVATION,
+            supply_method="MANUAL_SELLER_A",
+            approval_status=ApprovalStatus.APPROVED,
+            status=ProductStatus.APPROVED,
+        )
+        self.assertEqual(self.catalog_repo.get_product(prod.id).status, ProductStatus.APPROVED)
+
+        # Modify supply method to new vendor
+        self.catalog_repo.update_fixed_product_supply_method(prod.id, "AUTOMATED_API_VENDOR_B")
+
+        # Must be revoked to DRAFT
+        updated_prod = self.catalog_repo.get_product(prod.id)
+        self.assertEqual(updated_prod.status, ProductStatus.DRAFT)
+
+        cur = self.conn.cursor()
+        cur.execute("SELECT approval_status, supply_method FROM fixed_product_details WHERE product_id = ?", (prod.id,))
+        details = cur.fetchone()
+        self.assertEqual(details["approval_status"], "DRAFT")
+        self.assertEqual(details["supply_method"], "AUTOMATED_API_VENDOR_B")
+
+    def test_atomic_order_creation_rejects_unapproved_item_without_orphan_records(self):
+        """If any item in an order is unapproved, the entire order is rejected and NO records created."""
+        valid_prod = self.catalog_repo.create_voucher_product("TR Card", "TR", "TRY", ProductStatus.APPROVED)
+        unapproved_prod = self.catalog_repo.create_fixed_product(
+            display_name="Unapproved Sub",
+            price_rub_kopecks=100000,
+            delivery_method=DeliveryMethod.OFFICIAL_ACTIVATION,
+            supply_method="UNTESTED",
+            approval_status=ApprovalStatus.DRAFT,
+            status=ProductStatus.DRAFT,
+        )
+
+        items = [
+            {"product_id": valid_prod.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000},
+            {"product_id": unapproved_prod.id, "product_type_snapshot": "FIXED_PRODUCT", "quantity": 1, "unit_price_minor": 100000},
+        ]
+
+        with self.assertRaises(ValidationError) as cm:
+            self.order_repo.create_order(
+                user_id=self.user.id,
+                total_amount_minor=101000,
+                currency="RUB",
+                items=items,
+            )
+        self.assertIn("not approved for sale", str(cm.exception))
+
+        # Invariant: NO orphan records created in orders or order_items
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM orders")
+        self.assertEqual(cur.fetchone()[0], 0)
+        cur.execute("SELECT COUNT(*) FROM order_items")
+        self.assertEqual(cur.fetchone()[0], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
