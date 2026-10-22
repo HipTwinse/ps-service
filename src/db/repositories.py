@@ -78,6 +78,7 @@ class CatalogRepository:
             """,
             (product_id, region.strip().upper(), currency.strip().upper()),
         )
+        self.conn.commit()
         return self.get_product(product_id)
 
     def add_voucher_denomination(
@@ -116,6 +117,7 @@ class CatalogRepository:
                 ),
             )
             denom_id = cur.lastrowid
+            self.conn.commit()
             return self.get_denomination(denom_id)
         except sqlite3.IntegrityError as e:
             raise ConflictError(
@@ -165,6 +167,7 @@ class CatalogRepository:
                 duration_days,
             ),
         )
+        self.conn.commit()
         return self.get_product(product_id)
 
     def get_product(self, product_id: int) -> Product:
@@ -321,6 +324,7 @@ class UserRepository:
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
             )
+            self.conn.commit()
             return user, False
 
         # Create fresh user
@@ -339,6 +343,7 @@ class UserRepository:
             created_at=new_row["created_at"],
             updated_at=new_row["updated_at"],
         )
+        self.conn.commit()
         return user, True
 
     def get_user(self, user_id: int) -> User:
@@ -361,6 +366,7 @@ class UserRepository:
             "UPDATE users SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (status.value, user_id),
         )
+        self.conn.commit()
 
 
 class InventoryRepository:
@@ -454,42 +460,82 @@ class InventoryRepository:
 
         Canonicalizes raw codes, preserves all encrypted payloads, keeps records intact, and executes atomically.
         """
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN IMMEDIATE;")
+
         cur = self.conn.cursor()
-        cur.execute("SELECT id, encrypted_payload, fingerprint FROM inventory_items")
-        rows = cur.fetchall()
-        upgraded = 0
-        for row in rows:
-            raw_code = decrypt_payload(row["encrypted_payload"])
-            clean_code = canonicalize_code(raw_code)
-            legacy_sha = hashlib.sha256(clean_code.encode("utf-8")).hexdigest()
-            new_hmac = compute_fingerprint(clean_code, pepper=pepper)
-            if row["fingerprint"] == legacy_sha and row["fingerprint"] != new_hmac:
-                cur.execute(
-                    "UPDATE inventory_items SET fingerprint = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (new_hmac, row["id"]),
-                )
-                upgraded += 1
-        self.conn.commit()
-        return upgraded
+        try:
+            cur.execute("SELECT id, encrypted_payload, fingerprint FROM inventory_items")
+            rows = cur.fetchall()
+            upgraded = 0
+            for row in rows:
+                raw_code = decrypt_payload(row["encrypted_payload"])
+                clean_code = canonicalize_code(raw_code)
+                legacy_sha = hashlib.sha256(clean_code.encode("utf-8")).hexdigest()
+                new_hmac = compute_fingerprint(clean_code, pepper=pepper)
+                if row["fingerprint"] == legacy_sha and row["fingerprint"] != new_hmac:
+                    cur.execute(
+                        "UPDATE inventory_items SET fingerprint = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (new_hmac, row["id"]),
+                    )
+                    upgraded += 1
+            self.conn.commit()
+            return upgraded
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
 
     def rotate_fingerprint_pepper(self, new_pepper: bytes, old_pepper: Optional[bytes] = None) -> int:
-        """Rotates inventory HMAC fingerprints when FINGERPRINT_PEPPER is rotated."""
+        """Rotates inventory HMAC fingerprints when FINGERPRINT_PEPPER is rotated.
+
+        OPERATIONAL PROCEDURE FOR PEPPER ROTATION:
+        1. Acquisition & Concurrency Pause: rotate_fingerprint_pepper automatically executes
+           under an IMMEDIATE transaction lock (BEGIN IMMEDIATE) to pause and block concurrent
+           inventory imports and writes.
+        2. Recalculation: Decrypts each canonical inventory item payload and recalculates
+           fingerprints using `new_pepper`.
+        3. Atomic Commitment: All fingerprint updates are committed in a single transaction.
+           On ANY error during rotation, the entire transaction is rolled back immediately,
+           leaving all fingerprints in their consistent pre-rotation state.
+        4. Secret Switching: After this method returns successfully, update the application's
+           environment variable / secret store `FINGERPRINT_PEPPER` to `new_pepper` before resuming
+           new import operations.
+
+        Args:
+            new_pepper: New HMAC secret key bytes.
+            old_pepper: Optional previous pepper for validation.
+
+        Returns:
+            Number of rotated inventory items.
+        """
+        if not new_pepper or not isinstance(new_pepper, bytes):
+            raise ValueError("new_pepper must be non-empty bytes.")
+
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN IMMEDIATE;")
+
         cur = self.conn.cursor()
-        cur.execute("SELECT id, encrypted_payload, fingerprint FROM inventory_items")
-        rows = cur.fetchall()
-        rotated = 0
-        for row in rows:
-            raw_code = decrypt_payload(row["encrypted_payload"])
-            clean_code = canonicalize_code(raw_code)
-            new_hmac = compute_fingerprint(clean_code, pepper=new_pepper)
-            if row["fingerprint"] != new_hmac:
-                cur.execute(
-                    "UPDATE inventory_items SET fingerprint = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (new_hmac, row["id"]),
-                )
-                rotated += 1
-        self.conn.commit()
-        return rotated
+        try:
+            cur.execute("SELECT id, encrypted_payload, fingerprint FROM inventory_items")
+            rows = cur.fetchall()
+            rotated = 0
+            for row in rows:
+                raw_code = decrypt_payload(row["encrypted_payload"])
+                clean_code = canonicalize_code(raw_code)
+                new_hmac = compute_fingerprint(clean_code, pepper=new_pepper)
+                if row["fingerprint"] != new_hmac:
+                    cur.execute(
+                        "UPDATE inventory_items SET fingerprint = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (new_hmac, row["id"]),
+                    )
+                    rotated += 1
+            self.conn.commit()
+            return rotated
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
 
     def reserve_items_for_order(
         self,
@@ -621,65 +667,97 @@ class OrderRepository:
     ) -> Order:
         """Creates an order and preserves historical price snapshots on all items.
 
-        Atomic and transaction-safe: validates user and all items before insertion.
+        Atomic and transaction-safe:
+        - Acquires an IMMEDIATE transaction lock (BEGIN IMMEDIATE) prior to reading user,
+          product status, and approval status to eliminate race conditions between validation and insertion.
+        - Strictly verifies that total_amount_minor matches sum of (quantity * unit_price_minor).
+        - Verifies that currency is consistent across order and all item snapshots.
+        - Completely rolls back on any error without leaving orphan records.
         """
         if total_amount_minor <= 0:
             raise ValidationError("total_amount_minor must be strictly positive.")
         if not items:
             raise ValidationError("Order must contain at least one order item.")
 
-        cur = self.conn.cursor()
-        # Verify user
-        cur.execute("SELECT id, status FROM users WHERE id = ?", (user_id,))
-        user_row = cur.fetchone()
-        if not user_row:
-            raise NotFoundError(f"User {user_id} not found.")
-        if user_row["status"] == UserStatus.BLOCKED.value:
-            raise ValidationError("Cannot create order for blocked user.")
+        currency_norm = currency.strip().upper() if currency else ""
+        if not currency_norm:
+            raise ValidationError("Order currency must not be empty.")
 
-        # Pre-validate all items before inserting anything into orders or order_items
-        validated_items = []
+        # Verify mathematical consistency between total_amount_minor and item prices/quantities/currency
+        computed_total = 0
         for item in items:
-            prod_id = item["product_id"]
-            qty = item["quantity"]
-            unit_price = item["unit_price_minor"]
-            prod_type = item["product_type_snapshot"]
-            meta_json = item.get("metadata_json")
+            qty = item.get("quantity")
+            unit_price = item.get("unit_price_minor")
+            item_curr = item.get("currency")
 
-            if qty <= 0:
-                raise ValidationError("Item quantity must be strictly positive.")
-            if unit_price <= 0:
-                raise ValidationError("Unit price must be strictly positive.")
-
-            # Validate product exists and is approved for sale
-            cur.execute("SELECT id, status, product_type FROM products WHERE id = ?", (prod_id,))
-            prod_row = cur.fetchone()
-            if not prod_row:
-                raise NotFoundError(f"Product {prod_id} not found.")
-            if prod_row["status"] != ProductStatus.APPROVED.value:
-                raise ValidationError(f"Product '{prod_id}' is not approved for sale.")
-
-            # Defense-in-depth: For FIXED_PRODUCT, verify approval_status directly
-            if prod_row["product_type"] == ProductType.FIXED_PRODUCT.value:
-                cur.execute(
-                    "SELECT approval_status FROM fixed_product_details WHERE product_id = ?",
-                    (prod_id,),
+            if not isinstance(qty, int) or qty <= 0:
+                raise ValidationError("Item quantity must be a strictly positive integer.")
+            if not isinstance(unit_price, int) or unit_price <= 0:
+                raise ValidationError("Unit price must be a strictly positive integer.")
+            if item_curr is not None and item_curr.strip().upper() != currency_norm:
+                raise ValidationError(
+                    f"Item currency '{item_curr}' does not match order currency '{currency_norm}'."
                 )
-                fp_row = cur.fetchone()
-                if not fp_row or fp_row["approval_status"] != ApprovalStatus.APPROVED.value:
-                    raise ValidationError(
-                        f"Fixed product '{prod_id}' does not have an approved supply method."
-                    )
 
-            validated_items.append((prod_id, prod_type, qty, unit_price, meta_json))
+            computed_total += qty * unit_price
 
+        if total_amount_minor != computed_total:
+            raise ValidationError(
+                f"Order total_amount_minor ({total_amount_minor}) does not match sum of items ({computed_total})."
+            )
+
+        # Acquire write lock immediately to prevent concurrent status/approval revocation during order creation
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN IMMEDIATE;")
+
+        cur = self.conn.cursor()
         try:
+            # 1. Verify user exists and is not blocked
+            cur.execute("SELECT id, status FROM users WHERE id = ?", (user_id,))
+            user_row = cur.fetchone()
+            if not user_row:
+                raise NotFoundError(f"User {user_id} not found.")
+            if user_row["status"] == UserStatus.BLOCKED.value:
+                raise ValidationError("Cannot create order for blocked user.")
+
+            # 2. Validate all products and supply approvals under active lock
+            validated_items = []
+            for item in items:
+                prod_id = item["product_id"]
+                qty = item["quantity"]
+                unit_price = item["unit_price_minor"]
+                prod_type = item["product_type_snapshot"]
+                meta_json = item.get("metadata_json")
+
+                # Validate product exists and is approved for sale
+                cur.execute("SELECT id, status, product_type FROM products WHERE id = ?", (prod_id,))
+                prod_row = cur.fetchone()
+                if not prod_row:
+                    raise NotFoundError(f"Product {prod_id} not found.")
+                if prod_row["status"] != ProductStatus.APPROVED.value:
+                    raise ValidationError(f"Product '{prod_id}' is not approved for sale.")
+
+                # Defense-in-depth: For FIXED_PRODUCT, verify approval_status directly
+                if prod_row["product_type"] == ProductType.FIXED_PRODUCT.value:
+                    cur.execute(
+                        "SELECT approval_status FROM fixed_product_details WHERE product_id = ?",
+                        (prod_id,),
+                    )
+                    fp_row = cur.fetchone()
+                    if not fp_row or fp_row["approval_status"] != ApprovalStatus.APPROVED.value:
+                        raise ValidationError(
+                            f"Fixed product '{prod_id}' does not have an approved supply method."
+                        )
+
+                validated_items.append((prod_id, prod_type, qty, unit_price, meta_json))
+
+            # 3. Insert order and order items
             cur.execute(
                 """
                 INSERT INTO orders (user_id, status, total_amount_minor, currency)
                 VALUES (?, ?, ?, ?)
                 """,
-                (user_id, OrderStatus.PENDING_PAYMENT.value, total_amount_minor, currency),
+                (user_id, OrderStatus.PENDING_PAYMENT.value, total_amount_minor, currency_norm),
             )
             order_id = cur.lastrowid
 
@@ -690,12 +768,14 @@ class OrderRepository:
                         order_id, product_id, product_type_snapshot, quantity, unit_price_minor, currency, metadata_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (order_id, prod_id, prod_type, qty, unit_price, currency, meta_json),
+                    (order_id, prod_id, prod_type, qty, unit_price, currency_norm, meta_json),
                 )
+
             self.conn.commit()
             return self.get_order(order_id)
         except Exception:
-            self.conn.rollback()
+            if self.conn.in_transaction:
+                self.conn.rollback()
             raise
 
     def transition_order_status(

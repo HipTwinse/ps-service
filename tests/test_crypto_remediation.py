@@ -33,6 +33,46 @@ class TestCryptoRemediation(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self.orig_env)
 
+    def test_production_env_with_allow_dev_fallback_unconditionally_forbids_fallback(self):
+        """ENV=production with ALLOW_DEV_FALLBACK_KEY=1 must NEVER allow fallback keys or pepper."""
+        os.environ["ENV"] = "production"
+        os.environ["ALLOW_DEV_FALLBACK_KEY"] = "1"
+        os.environ.pop("APP_ENV", None)
+        os.environ.pop("INVENTORY_ENCRYPTION_KEY", None)
+        os.environ.pop("FINGERPRINT_PEPPER", None)
+        os.environ.pop("INVENTORY_FINGERPRINT_PEPPER", None)
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_encryption_key()
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_fingerprint_pepper()
+
+    def test_app_env_production_with_allow_dev_fallback_unconditionally_forbids_fallback(self):
+        """APP_ENV=production with ALLOW_DEV_FALLBACK_KEY=1 must NEVER allow fallback keys or pepper."""
+        os.environ["APP_ENV"] = "production"
+        os.environ["ALLOW_DEV_FALLBACK_KEY"] = "1"
+        os.environ.pop("ENV", None)
+        os.environ.pop("INVENTORY_ENCRYPTION_KEY", None)
+        os.environ.pop("FINGERPRINT_PEPPER", None)
+        os.environ.pop("INVENTORY_FINGERPRINT_PEPPER", None)
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_encryption_key()
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_fingerprint_pepper()
+
+    def test_explicitly_allowed_test_environment_permits_fallback(self):
+        """Explicitly allowed test environment (APP_ENV=test or ENV=dev) permits fallback."""
+        os.environ["APP_ENV"] = "test"
+        os.environ.pop("ENV", None)
+        os.environ.pop("INVENTORY_ENCRYPTION_KEY", None)
+        os.environ.pop("FINGERPRINT_PEPPER", None)
+
+        self.assertIsNotNone(get_encryption_key())
+        self.assertIsNotNone(get_fingerprint_pepper())
+
     def test_production_missing_secrets_aborts_safely(self):
         """In production environment without secrets, safe failure occurs."""
         os.environ["ENV"] = "production"
@@ -131,6 +171,79 @@ class TestCryptoRemediation(unittest.TestCase):
 
             # Idempotency: rotating again with same new_pepper modifies 0 rows
             self.assertEqual(inv_repo.rotate_fingerprint_pepper(new_pepper=new_pepper), 0)
+            conn.close()
+
+    def test_rotate_fingerprint_pepper_error_mid_rotation_rolls_back_atomically(self):
+        """If an error occurs mid-rotation, transaction rolls back and all fingerprints remain unchanged."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "test_rot_err.db")
+            conn = create_connection(db_path)
+            run_migrations(conn)
+
+            cat_repo = CatalogRepository(conn)
+            prod = cat_repo.create_voucher_product("TR Card", "TR", "TRY", ProductStatus.APPROVED)
+            denom = cat_repo.add_voucher_denomination(prod.id, "TR", "TRY", 1000, 3000)
+            inv_repo = InventoryRepository(conn)
+
+            codes = ["ROT-ITEM-1", "ROT-ITEM-2", "ROT-ITEM-3"]
+            inv_repo.import_items(prod.id, codes, InventoryType.VOUCHER_CODE, denom.id)
+
+            cur = conn.cursor()
+            cur.execute("SELECT id, fingerprint FROM inventory_items ORDER BY id ASC")
+            original_fps = {row["id"]: row["fingerprint"] for row in cur.fetchall()}
+
+            new_pepper = b"fresh_secret_pepper_12345"
+
+            # Mock compute_fingerprint to fail on the second item
+            real_compute = compute_fingerprint
+            call_count = 0
+
+            def faulty_compute(code, pepper=None):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 2:
+                    raise RuntimeError("Simulated transient failure on second item")
+                return real_compute(code, pepper=pepper)
+
+            from unittest.mock import patch
+            with patch("src.db.repositories.compute_fingerprint", side_effect=faulty_compute):
+                with self.assertRaises(RuntimeError):
+                    inv_repo.rotate_fingerprint_pepper(new_pepper=new_pepper)
+
+            # Confirm ALL fingerprints remain in their exact pre-rotation state
+            cur.execute("SELECT id, fingerprint FROM inventory_items ORDER BY id ASC")
+            current_fps = {row["id"]: row["fingerprint"] for row in cur.fetchall()}
+            self.assertEqual(current_fps, original_fps)
+            conn.close()
+
+    def test_deduplication_works_correctly_after_pepper_rotation(self):
+        """After successful pepper rotation, importing identical code with new pepper is properly deduplicated."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "test_rot_dedup.db")
+            conn = create_connection(db_path)
+            run_migrations(conn)
+
+            cat_repo = CatalogRepository(conn)
+            prod = cat_repo.create_voucher_product("TR Card", "TR", "TRY", ProductStatus.APPROVED)
+            denom = cat_repo.add_voucher_denomination(prod.id, "TR", "TRY", 1000, 3000)
+            inv_repo = InventoryRepository(conn)
+
+            test_code = "DEDUP-PEPPER-TEST-CODE"
+            # 1. Import with initial default pepper
+            r1 = inv_repo.import_items(prod.id, [test_code], InventoryType.VOUCHER_CODE, denom.id)
+            self.assertEqual(r1["accepted"], 1)
+
+            # 2. Rotate to new pepper
+            new_pepper = b"brand_new_rotated_pepper_key_7777"
+            inv_repo.rotate_fingerprint_pepper(new_pepper=new_pepper)
+
+            # 3. Simulate environment secret switch to new_pepper
+            os.environ["FINGERPRINT_PEPPER"] = new_pepper.decode("utf-8")
+
+            # 4. Attempt to import the exact same code under new pepper
+            r2 = inv_repo.import_items(prod.id, [test_code], InventoryType.VOUCHER_CODE, denom.id)
+            self.assertEqual(r2["accepted"], 0)
+            self.assertEqual(r2["duplicates"], 1)
             conn.close()
 
 

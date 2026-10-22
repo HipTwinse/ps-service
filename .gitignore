@@ -15,3 +15,5 @@ PROJECT_FOR_CHATGPT.txt
 *.db-wal
 *.db-shm
 *.restore_tmp_*
+AUDIT_REPORT*.txt
+life-os/

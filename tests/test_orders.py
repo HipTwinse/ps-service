@@ -269,5 +269,147 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
             self.order_repo.transition_order_status(order.id, OrderStatus.PENDING_PAYMENT)
 
 
+    def test_order_creation_rejects_amount_mismatch_with_items(self):
+        """Order creation must reject total_amount_minor that does not equal sum(quantity * unit_price)."""
+        items = [
+            {
+                "product_id": self.voucher_prod.id,
+                "product_type_snapshot": "VOUCHER",
+                "quantity": 2,
+                "unit_price_minor": 32000,
+                "metadata_json": None,
+            }
+        ]
+        # Actual sum is 64000, passing 50000 must fail
+        with self.assertRaises(ValidationError) as cm:
+            self.order_repo.create_order(
+                user_id=self.user.id,
+                total_amount_minor=50000,
+                currency="RUB",
+                items=items,
+            )
+        self.assertIn("does not match sum of items", str(cm.exception))
+
+    def test_order_creation_rejects_currency_mismatch_with_items(self):
+        """Order creation must reject item currencies that do not match the order currency."""
+        items = [
+            {
+                "product_id": self.voucher_prod.id,
+                "product_type_snapshot": "VOUCHER",
+                "quantity": 1,
+                "unit_price_minor": 32000,
+                "currency": "TRY",
+                "metadata_json": None,
+            }
+        ]
+        with self.assertRaises(ValidationError) as cm:
+            self.order_repo.create_order(
+                user_id=self.user.id,
+                total_amount_minor=32000,
+                currency="RUB",
+                items=items,
+            )
+        self.assertIn("does not match order currency", str(cm.exception))
+
+    def test_concurrent_two_connections_approval_revocation_race(self):
+        """Concurrent two-connection test: approval revocation before or during order creation protects consistency."""
+        if self.conn.in_transaction:
+            self.conn.commit()
+
+        conn2 = create_connection(self.db_path, timeout_seconds=0.1)
+        try:
+            # Scenario 1: conn2 revokes approval before order creation
+            conn2.execute(
+                "UPDATE fixed_product_details SET approval_status = 'DRAFT' WHERE product_id = ?",
+                (self.fixed_prod.id,),
+            )
+            conn2.commit()
+
+            items = [
+                {
+                    "product_id": self.fixed_prod.id,
+                    "product_type_snapshot": "FIXED_PRODUCT",
+                    "quantity": 1,
+                    "unit_price_minor": 14900,
+                    "currency": "RUB",
+                    "metadata_json": None,
+                }
+            ]
+
+            with self.assertRaises(ValidationError) as cm:
+                self.order_repo.create_order(
+                    user_id=self.user.id,
+                    total_amount_minor=14900,
+                    currency="RUB",
+                    items=items,
+                )
+            self.assertIn("does not have an approved supply method", str(cm.exception))
+
+            # Verify no orphan order or order_items created
+            cur = self.conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM orders")
+            self.assertEqual(cur.fetchone()[0], 0)
+            cur.execute("SELECT COUNT(*) FROM order_items")
+            self.assertEqual(cur.fetchone()[0], 0)
+
+            # Re-approve fixed product
+            conn2.execute(
+                "UPDATE fixed_product_details SET approval_status = 'APPROVED' WHERE product_id = ?",
+                (self.fixed_prod.id,),
+            )
+            conn2.commit()
+
+            # Scenario 2: conn1 begins immediate order creation; conn2 cannot modify concurrently
+            self.conn.execute("BEGIN IMMEDIATE;")
+            import sqlite3
+            with self.assertRaises(sqlite3.OperationalError):
+                conn2.execute(
+                    "UPDATE fixed_product_details SET approval_status = 'DRAFT' WHERE product_id = ?",
+                    (self.fixed_prod.id,),
+                )
+            self.conn.rollback()
+        finally:
+            conn2.close()
+
+    def test_concurrent_two_connections_user_blocked_race(self):
+        """Concurrent two-connection test: blocking user on conn2 prevents order creation on conn1."""
+        if self.conn.in_transaction:
+            self.conn.commit()
+
+        conn2 = create_connection(self.db_path, timeout_seconds=0.1)
+        try:
+            conn2.execute(
+                "UPDATE users SET status = 'BLOCKED' WHERE id = ?",
+                (self.user.id,),
+            )
+            conn2.commit()
+
+            items = [
+                {
+                    "product_id": self.voucher_prod.id,
+                    "product_type_snapshot": "VOUCHER",
+                    "quantity": 1,
+                    "unit_price_minor": 32000,
+                    "currency": "RUB",
+                    "metadata_json": None,
+                }
+            ]
+
+            with self.assertRaises(ValidationError) as cm:
+                self.order_repo.create_order(
+                    user_id=self.user.id,
+                    total_amount_minor=32000,
+                    currency="RUB",
+                    items=items,
+                )
+            self.assertIn("Cannot create order for blocked user", str(cm.exception))
+
+            # Restore user status
+            conn2.execute("UPDATE users SET status = 'ACTIVE' WHERE id = ?", (self.user.id,))
+            conn2.commit()
+        finally:
+            conn2.close()
+
+
 if __name__ == "__main__":
     unittest.main()

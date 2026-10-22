@@ -24,21 +24,28 @@ class CryptoConfigurationError(ValueError):
 _DEV_FALLBACK_KEY = b"k9ZJ9Xm7h2Fp0Wd3VqYl5T8N1aZb6C4D7E9G2I0O3R8="
 _DEV_FALLBACK_PEPPER = b"ps_fingerprint_pepper_dev_secret_key_88291"
 
+_PRODUCTION_ENVS = {"production", "prod"}
 _ALLOWED_DEV_ENVS = {"test", "testing", "dev", "development"}
 
 
 def is_dev_or_test_environment() -> bool:
-    """Checks whether the execution context is an explicitly permitted dev/test environment."""
+    """Checks whether the execution context is an explicitly permitted dev/test environment.
+
+    Production environments (ENV or APP_ENV set to 'production' or 'prod') strictly and
+    unconditionally forbid fallback secrets under all circumstances, even if
+    ALLOW_DEV_FALLBACK_KEY is set.
+    """
+    env = os.environ.get("ENV", "").strip().lower()
+    app_env = os.environ.get("APP_ENV", "").strip().lower()
+
+    # Any production designation strictly and unconditionally overrides everything
+    if env in _PRODUCTION_ENVS or app_env in _PRODUCTION_ENVS:
+        return False
+
+    # ALLOW_DEV_FALLBACK_KEY is only recognized in non-production environments
     if os.environ.get("ALLOW_DEV_FALLBACK_KEY") == "1":
         return True
-    # Any production designation strictly overrides test/dev
-    if (
-        os.environ.get("ENV", "").strip().lower() == "production"
-        or os.environ.get("APP_ENV", "").strip().lower() == "production"
-    ):
-        return False
-    app_env = os.environ.get("APP_ENV", "").strip().lower()
-    env = os.environ.get("ENV", "").strip().lower()
+
     return app_env in _ALLOWED_DEV_ENVS or env in _ALLOWED_DEV_ENVS
 
 
