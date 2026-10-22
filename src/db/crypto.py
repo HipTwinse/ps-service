@@ -31,9 +31,13 @@ _ALLOWED_DEV_ENVS = {"test", "testing", "dev", "development"}
 def is_dev_or_test_environment() -> bool:
     """Checks whether the execution context is an explicitly permitted dev/test environment.
 
-    Production environments (ENV or APP_ENV set to 'production' or 'prod') strictly and
-    unconditionally forbid fallback secrets under all circumstances, even if
-    ALLOW_DEV_FALLBACK_KEY is set.
+    Security Policy:
+    1. Production designations ('production', 'prod') strictly and unconditionally
+       forbid fallback secrets under all circumstances.
+    2. Fallback secrets are ONLY permitted in explicitly designated dev/test environments
+       (ENV or APP_ENV in {'test', 'testing', 'dev', 'development'}).
+    3. Undefined, staging, or unknown environments NEVER permit fallback secrets,
+       even if ALLOW_DEV_FALLBACK_KEY is set.
     """
     env = os.environ.get("ENV", "").strip().lower()
     app_env = os.environ.get("APP_ENV", "").strip().lower()
@@ -42,10 +46,7 @@ def is_dev_or_test_environment() -> bool:
     if env in _PRODUCTION_ENVS or app_env in _PRODUCTION_ENVS:
         return False
 
-    # ALLOW_DEV_FALLBACK_KEY is only recognized in non-production environments
-    if os.environ.get("ALLOW_DEV_FALLBACK_KEY") == "1":
-        return True
-
+    # Fallback is strictly restricted to explicitly designated test/dev environments
     return app_env in _ALLOWED_DEV_ENVS or env in _ALLOWED_DEV_ENVS
 
 

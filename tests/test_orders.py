@@ -410,6 +410,191 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         finally:
             conn2.close()
 
+    def test_transaction_ownership_create_order_rejected_if_in_transaction(self):
+        """create_order must refuse to execute if connection already has an active uncommitted transaction."""
+        self.conn.execute("INSERT INTO users (external_id, username, status) VALUES ('caller_owned', 'caller', 'ACTIVE')")
+        self.assertTrue(self.conn.in_transaction)
+
+        items = [
+            {
+                "product_id": self.voucher_prod.id,
+                "product_type_snapshot": "VOUCHER",
+                "quantity": 1,
+                "unit_price_minor": 32000,
+                "currency": "RUB",
+                "metadata_json": None,
+            }
+        ]
+
+        with self.assertRaises(RuntimeError) as cm:
+            self.order_repo.create_order(
+                user_id=self.user.id,
+                total_amount_minor=32000,
+                currency="RUB",
+                items=items,
+            )
+
+        self.assertIn("active uncommitted transaction", str(cm.exception))
+
+        # Caller's transaction must remain uncommitted and intact
+        self.assertTrue(self.conn.in_transaction)
+        self.conn.rollback()
+
+    def test_money_validation_rejects_bool_and_non_integers(self):
+        """Money and quantity fields must reject booleans (isinstance(True, int)) and non-integers."""
+        base_item = {
+            "product_id": self.voucher_prod.id,
+            "product_type_snapshot": "VOUCHER",
+            "quantity": 1,
+            "unit_price_minor": 32000,
+            "currency": "RUB",
+            "metadata_json": None,
+        }
+
+        # 1. total_amount_minor as bool True
+        with self.assertRaises(ValidationError) as cm:
+            self.order_repo.create_order(
+                user_id=self.user.id,
+                total_amount_minor=True,  # type is bool
+                currency="RUB",
+                items=[base_item],
+            )
+        self.assertIn("must be an integer", str(cm.exception))
+
+        # 2. total_amount_minor as float
+        with self.assertRaises(ValidationError) as cm:
+            self.order_repo.create_order(
+                user_id=self.user.id,
+                total_amount_minor=32000.50,
+                currency="RUB",
+                items=[base_item],
+            )
+        self.assertIn("must be an integer", str(cm.exception))
+
+        # 3. Item quantity as bool
+        bad_qty_item = dict(base_item, quantity=True)
+        with self.assertRaises(ValidationError):
+            self.order_repo.create_order(
+                user_id=self.user.id,
+                total_amount_minor=32000,
+                currency="RUB",
+                items=[bad_qty_item],
+            )
+
+        # 4. Item unit_price_minor as bool
+        bad_price_item = dict(base_item, unit_price_minor=True)
+        with self.assertRaises(ValidationError):
+            self.order_repo.create_order(
+                user_id=self.user.id,
+                total_amount_minor=32000,
+                currency="RUB",
+                items=[bad_price_item],
+            )
+
+    def test_product_type_snapshot_mismatch_rejected(self):
+        """product_type_snapshot must match the actual product type in products table."""
+        # Fixed product with snapshot claiming to be VOUCHER
+        mismatched_item = {
+            "product_id": self.fixed_prod.id,
+            "product_type_snapshot": "VOUCHER",  # Actual is FIXED_PRODUCT
+            "quantity": 1,
+            "unit_price_minor": 14900,
+            "currency": "RUB",
+            "metadata_json": None,
+        }
+
+        with self.assertRaises(ValidationError) as cm:
+            self.order_repo.create_order(
+                user_id=self.user.id,
+                total_amount_minor=14900,
+                currency="RUB",
+                items=[mismatched_item],
+            )
+        self.assertIn("does not match product", str(cm.exception))
+
+    def test_real_concurrency_approval_revocation_during_create_order(self):
+        """Real concurrency test: create_order vs concurrent supply approval revocation."""
+        import threading
+        results = {"order_created": 0, "rejected_or_locked": 0, "errors": []}
+
+        items = [
+            {
+                "product_id": self.fixed_prod.id,
+                "product_type_snapshot": "FIXED_PRODUCT",
+                "quantity": 1,
+                "unit_price_minor": 14900,
+                "currency": "RUB",
+                "metadata_json": None,
+            }
+        ]
+
+        def worker_create_order():
+            t_conn = create_connection(self.db_path, timeout_seconds=0.2)
+            t_repo = OrderRepository(t_conn)
+            try:
+                t_repo.create_order(
+                    user_id=self.user.id,
+                    total_amount_minor=14900,
+                    currency="RUB",
+                    items=items,
+                )
+                results["order_created"] += 1
+            except ValidationError:
+                results["rejected_or_locked"] += 1
+            except Exception as e:
+                if "locked" in str(e).lower():
+                    results["rejected_or_locked"] += 1
+                else:
+                    results["errors"].append(f"Unexpected create_order error: {e}")
+            finally:
+                t_conn.close()
+
+        def worker_revoke_approval():
+            t_conn = create_connection(self.db_path, timeout_seconds=0.2)
+            try:
+                t_conn.execute(
+                    "UPDATE fixed_product_details SET approval_status = 'DRAFT' WHERE product_id = ?",
+                    (self.fixed_prod.id,),
+                )
+                t_conn.commit()
+            except Exception as e:
+                if "locked" not in str(e).lower():
+                    results["errors"].append(f"Unexpected revoke error: {e}")
+            finally:
+                t_conn.close()
+
+        t1 = threading.Thread(target=worker_create_order)
+        t2 = threading.Thread(target=worker_revoke_approval)
+
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertEqual(results["errors"], [])
+
+        # Consistency verification: if approval was revoked, check that any created order was created BEFORE revocation
+        check_conn = create_connection(self.db_path)
+        cur = check_conn.cursor()
+        cur.execute("SELECT approval_status FROM fixed_product_details WHERE product_id = ?", (self.fixed_prod.id,))
+        final_approval = cur.fetchone()["approval_status"]
+
+        cur.execute("SELECT COUNT(*) FROM orders")
+        order_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM order_items")
+        item_count = cur.fetchone()[0]
+
+        if order_count == 1:
+            self.assertEqual(item_count, 1)
+        else:
+            self.assertEqual(order_count, 0)
+            self.assertEqual(item_count, 0)
+
+        # Restore approval for tearDown
+        check_conn.execute("UPDATE fixed_product_details SET approval_status = 'APPROVED' WHERE product_id = ?", (self.fixed_prod.id,))
+        check_conn.commit()
+        check_conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

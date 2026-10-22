@@ -42,6 +42,22 @@ from src.db.models import (
 )
 
 
+def _validate_int_minor(val: Any, name: str, allow_zero: bool = False) -> int:
+    """Strictly validates an integer minor amount (kopecks, cents, units).
+
+    Rejects booleans (type(True) is bool), floats, None, strings, and invalid amounts.
+    """
+    if type(val) is not int:
+        raise ValidationError(f"{name} must be an integer (got {type(val).__name__}: {val!r}).")
+    if allow_zero:
+        if val < 0:
+            raise ValidationError(f"{name} cannot be negative (got {val}).")
+    else:
+        if val <= 0:
+            raise ValidationError(f"{name} must be strictly positive (got {val}).")
+    return val
+
+
 class CatalogRepository:
     """Manages the polymorphic product catalog and denominations."""
 
@@ -90,10 +106,8 @@ class CatalogRepository:
         cost_rub_kopecks: int,
         is_active: bool = True,
     ) -> VoucherDenomination:
-        if face_value_minor <= 0:
-            raise ValidationError("face_value_minor must be strictly positive.")
-        if cost_rub_kopecks < 0:
-            raise ValidationError("cost_rub_kopecks cannot be negative.")
+        face_value_minor = _validate_int_minor(face_value_minor, "face_value_minor")
+        cost_rub_kopecks = _validate_int_minor(cost_rub_kopecks, "cost_rub_kopecks", allow_zero=True)
 
         product = self.get_product(product_id)
         if product.product_type != ProductType.VOUCHER:
@@ -134,8 +148,7 @@ class CatalogRepository:
         approval_status: ApprovalStatus = ApprovalStatus.DRAFT,
         status: ProductStatus = ProductStatus.DRAFT,
     ) -> Product:
-        if price_rub_kopecks <= 0:
-            raise ValidationError("price_rub_kopecks must be strictly positive.")
+        price_rub_kopecks = _validate_int_minor(price_rub_kopecks, "price_rub_kopecks")
         if duration_days is not None and duration_days <= 0:
             raise ValidationError("duration_days must be strictly positive if provided.")
         if status == ProductStatus.APPROVED and approval_status != ApprovalStatus.APPROVED:
@@ -460,8 +473,13 @@ class InventoryRepository:
 
         Canonicalizes raw codes, preserves all encrypted payloads, keeps records intact, and executes atomically.
         """
-        if not self.conn.in_transaction:
-            self.conn.execute("BEGIN IMMEDIATE;")
+        if self.conn.in_transaction:
+            raise RuntimeError(
+                "Cannot execute migrate_legacy_fingerprints: connection already has an active uncommitted transaction. "
+                "This method requires its own exclusive IMMEDIATE transaction boundary."
+            )
+
+        self.conn.execute("BEGIN IMMEDIATE;")
 
         cur = self.conn.cursor()
         try:
@@ -482,25 +500,46 @@ class InventoryRepository:
             self.conn.commit()
             return upgraded
         except Exception:
-            if self.conn.in_transaction:
-                self.conn.rollback()
+            self.conn.rollback()
             raise
 
     def rotate_fingerprint_pepper(self, new_pepper: bytes, old_pepper: Optional[bytes] = None) -> int:
         """Rotates inventory HMAC fingerprints when FINGERPRINT_PEPPER is rotated.
 
-        OPERATIONAL PROCEDURE FOR PEPPER ROTATION:
-        1. Acquisition & Concurrency Pause: rotate_fingerprint_pepper automatically executes
-           under an IMMEDIATE transaction lock (BEGIN IMMEDIATE) to pause and block concurrent
-           inventory imports and writes.
-        2. Recalculation: Decrypts each canonical inventory item payload and recalculates
-           fingerprints using `new_pepper`.
-        3. Atomic Commitment: All fingerprint updates are committed in a single transaction.
-           On ANY error during rotation, the entire transaction is rolled back immediately,
-           leaving all fingerprints in their consistent pre-rotation state.
-        4. Secret Switching: After this method returns successfully, update the application's
-           environment variable / secret store `FINGERPRINT_PEPPER` to `new_pepper` before resuming
-           new import operations.
+        RUNBOOK: OPERATIONAL PROCEDURE FOR PEPPER ROTATION
+        ===================================================
+        Phase 1: Operational Shutdown & Writer Quiesce (MANDATORY)
+          All background workers, bots, payment listeners, and inventory import tasks MUST be
+          stopped prior to initiating rotation.
+          NOTE: BEGIN IMMEDIATE holds an exclusive write lock during transaction execution,
+          but once the transaction commits, locks are released. Without shutting down writers,
+          a writer could insert a code using the old pepper before application instances are updated.
+
+        Phase 2: Database Recalculation (Atomic)
+          rotate_fingerprint_pepper(new_pepper) executes under BEGIN IMMEDIATE.
+          It decrypts each payload using the persistent encryption key, computes the new
+          HMAC-SHA256 fingerprint with new_pepper, and updates the database.
+          If any error occurs mid-rotation, the entire transaction is rolled back immediately;
+          all fingerprints remain consistent under old_pepper.
+
+        Phase 3: Control Duplicate Verification (Canary Check)
+          Before restarting writers, verify that re-checking a known canary code with new_pepper
+          matches the updated database fingerprints (e.g. via canary duplicate lookup).
+
+        Phase 4: Secret Switching & Multi-Instance Rollout
+          Update the FINGERPRINT_PEPPER environment variable / secret across all application instances.
+
+        Phase 5: Recovery Runbook (Failure Scenarios)
+          - Failure during Phase 2 (DB rotation error):
+            Transaction rolled back automatically. No DB changes persisted. Continue with old_pepper.
+          - Failure during Phase 4 (DB committed new pepper, but instance crashes or fails rollout):
+            Because payloads are encrypted under the invariant Fernet key, no data is lost.
+            If an instance still runs with old_pepper, duplicate lookups will not find matches.
+            Remediation: complete rollout of new_pepper to all instances.
+            If emergency abort is required: invoke rotate_fingerprint_pepper(old_pepper) to roll back DB.
+
+        Phase 6: Writer Resumption
+          Restart application workers and resume inventory import traffic.
 
         Args:
             new_pepper: New HMAC secret key bytes.
@@ -512,8 +551,13 @@ class InventoryRepository:
         if not new_pepper or not isinstance(new_pepper, bytes):
             raise ValueError("new_pepper must be non-empty bytes.")
 
-        if not self.conn.in_transaction:
-            self.conn.execute("BEGIN IMMEDIATE;")
+        if self.conn.in_transaction:
+            raise RuntimeError(
+                "Cannot execute rotate_fingerprint_pepper: connection already has an active uncommitted transaction. "
+                "This method requires its own exclusive IMMEDIATE transaction boundary."
+            )
+
+        self.conn.execute("BEGIN IMMEDIATE;")
 
         cur = self.conn.cursor()
         try:
@@ -533,8 +577,7 @@ class InventoryRepository:
             self.conn.commit()
             return rotated
         except Exception:
-            if self.conn.in_transaction:
-                self.conn.rollback()
+            self.conn.rollback()
             raise
 
     def reserve_items_for_order(
@@ -674,8 +717,7 @@ class OrderRepository:
         - Verifies that currency is consistent across order and all item snapshots.
         - Completely rolls back on any error without leaving orphan records.
         """
-        if total_amount_minor <= 0:
-            raise ValidationError("total_amount_minor must be strictly positive.")
+        total_amount_minor = _validate_int_minor(total_amount_minor, "total_amount_minor")
         if not items:
             raise ValidationError("Order must contain at least one order item.")
 
@@ -686,14 +728,10 @@ class OrderRepository:
         # Verify mathematical consistency between total_amount_minor and item prices/quantities/currency
         computed_total = 0
         for item in items:
-            qty = item.get("quantity")
-            unit_price = item.get("unit_price_minor")
+            qty = _validate_int_minor(item.get("quantity"), "Item quantity")
+            unit_price = _validate_int_minor(item.get("unit_price_minor"), "Unit price")
             item_curr = item.get("currency")
 
-            if not isinstance(qty, int) or qty <= 0:
-                raise ValidationError("Item quantity must be a strictly positive integer.")
-            if not isinstance(unit_price, int) or unit_price <= 0:
-                raise ValidationError("Unit price must be a strictly positive integer.")
             if item_curr is not None and item_curr.strip().upper() != currency_norm:
                 raise ValidationError(
                     f"Item currency '{item_curr}' does not match order currency '{currency_norm}'."
@@ -706,9 +744,14 @@ class OrderRepository:
                 f"Order total_amount_minor ({total_amount_minor}) does not match sum of items ({computed_total})."
             )
 
-        # Acquire write lock immediately to prevent concurrent status/approval revocation during order creation
-        if not self.conn.in_transaction:
-            self.conn.execute("BEGIN IMMEDIATE;")
+        # Enforce transaction boundary ownership: caller cannot have uncommitted open transaction
+        if self.conn.in_transaction:
+            raise RuntimeError(
+                "Cannot execute create_order: connection already has an active uncommitted transaction. "
+                "create_order manages its own exclusive BEGIN IMMEDIATE transaction boundary."
+            )
+
+        self.conn.execute("BEGIN IMMEDIATE;")
 
         cur = self.conn.cursor()
         try:
@@ -720,7 +763,7 @@ class OrderRepository:
             if user_row["status"] == UserStatus.BLOCKED.value:
                 raise ValidationError("Cannot create order for blocked user.")
 
-            # 2. Validate all products and supply approvals under active lock
+            # 2. Validate all products, product types, and supply approvals under active lock
             validated_items = []
             for item in items:
                 prod_id = item["product_id"]
@@ -736,6 +779,12 @@ class OrderRepository:
                     raise NotFoundError(f"Product {prod_id} not found.")
                 if prod_row["status"] != ProductStatus.APPROVED.value:
                     raise ValidationError(f"Product '{prod_id}' is not approved for sale.")
+
+                # Validate product_type_snapshot matches actual product type
+                if prod_type != prod_row["product_type"]:
+                    raise ValidationError(
+                        f"Item product_type_snapshot '{prod_type}' does not match product {prod_id} type '{prod_row['product_type']}'."
+                    )
 
                 # Defense-in-depth: For FIXED_PRODUCT, verify approval_status directly
                 if prod_row["product_type"] == ProductType.FIXED_PRODUCT.value:
@@ -774,8 +823,7 @@ class OrderRepository:
             self.conn.commit()
             return self.get_order(order_id)
         except Exception:
-            if self.conn.in_transaction:
-                self.conn.rollback()
+            self.conn.rollback()
             raise
 
     def transition_order_status(

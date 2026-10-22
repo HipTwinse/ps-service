@@ -212,6 +212,106 @@ class TestRestoreSafetyRemediation(unittest.TestCase):
         self.assertIn("ExistingIntactUser", names)
         check_conn.close()
 
+    def test_rollback_failure_on_restoring_main_db_raises_critical_error(self):
+        """If restoring main DB file during rollback fails, a CRITICAL error is raised."""
+        import shutil
+        orig_copy2 = shutil.copy2
+
+        def failing_copy2(src, dst):
+            if "orig_bak" in str(src) and str(dst).endswith("live.db"):
+                raise OSError("Disk hardware failure during rollback copy")
+            return orig_copy2(src, dst)
+
+        with patch("os.replace", side_effect=OSError("Replace failed")), \
+             patch("shutil.copy2", side_effect=failing_copy2):
+            with self.assertRaises(RuntimeError) as cm:
+                restore_database(self.backup_path, self.live_db_path)
+
+            self.assertIn("CRITICAL RESTORE FAILURE", str(cm.exception))
+            self.assertIn("live.db", str(cm.exception))
+
+    def test_rollback_failure_on_restoring_wal_raises_critical_error(self):
+        """If restoring WAL sidecar during rollback fails, a CRITICAL error is raised."""
+        import shutil
+        orig_copy2 = shutil.copy2
+        wal_path = self.live_db_path.parent / f"{self.live_db_path.name}-wal"
+
+        def failing_copy2(src, dst):
+            # If target DB is being staged into safety copy, create wal_path so it gets staged too
+            if ".orig_bak_" in str(dst) and str(src).endswith("live.db"):
+                wal_path.write_bytes(b"dummy wal data to ensure staging")
+            # Fail when restoring WAL from safety backup during rollback
+            if "orig_bak" in str(src) and str(dst).endswith("-wal"):
+                raise OSError("Simulated permission error restoring WAL during rollback")
+            return orig_copy2(src, dst)
+
+        with patch("os.replace", side_effect=OSError("Replace failed")), \
+             patch("shutil.copy2", side_effect=failing_copy2):
+            with self.assertRaises(RuntimeError) as cm:
+                restore_database(self.backup_path, self.live_db_path)
+
+            self.assertIn("CRITICAL RESTORE FAILURE", str(cm.exception))
+            self.assertIn("-wal", str(cm.exception))
+
+    def test_staging_copy_failure_cleans_up_partial_backups_and_preserves_target(self):
+        """If staging copy fails, partial backup files are cleaned up and target remains intact."""
+        import shutil
+        orig_copy2 = shutil.copy2
+        wal_path = self.live_db_path.parent / f"{self.live_db_path.name}-wal"
+        call_count = 0
+
+        def fail_on_second_copy(src, dst):
+            nonlocal call_count
+            call_count += 1
+            # On first copy (target DB), create wal_path so second copy (wal_path) will run
+            if call_count == 1:
+                wal_path.write_bytes(b"dummy wal data for partial staging test")
+                return orig_copy2(src, dst)
+            if call_count >= 2:
+                raise OSError("Out of disk space during safety staging")
+            return orig_copy2(src, dst)
+
+        with patch("shutil.copy2", side_effect=fail_on_second_copy):
+            with self.assertRaises(RuntimeError) as cm:
+                restore_database(self.backup_path, self.live_db_path)
+
+            self.assertIn("Failed to create safety backup of target database", str(cm.exception))
+
+        # Partial backups must be cleaned up
+        partial_backups = list(self.live_db_path.parent.glob("*.orig_bak_*"))
+        self.assertEqual(partial_backups, [])
+
+        # Target DB preserved
+        check_conn = create_connection(self.live_db_path)
+        cur = check_conn.cursor()
+        cur.execute("PRAGMA integrity_check;")
+        self.assertEqual(cur.fetchone()[0], "ok")
+        check_conn.close()
+
+    def test_blocked_or_busy_wal_checkpoint_aborts_restore(self):
+        """If wal_checkpoint returns busy=1, restore aborts with RuntimeError."""
+        real_connect = sqlite3.connect
+
+        class FakeCursor:
+            def fetchone(self):
+                return (1, 5, 2)  # busy=1
+
+        class FakeConn:
+            def __init__(self, *args, **kwargs):
+                self._conn = real_connect(*args, **kwargs)
+            def execute(self, sql, *args):
+                if "wal_checkpoint" in sql:
+                    return FakeCursor()
+                return self._conn.execute(sql, *args)
+            def close(self):
+                self._conn.close()
+
+        with patch("sqlite3.connect", side_effect=lambda *a, **kw: FakeConn(*a, **kw)):
+            with self.assertRaises(RuntimeError) as cm:
+                restore_database(self.backup_path, self.live_db_path)
+
+            self.assertIn("WAL checkpoint was blocked or busy", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

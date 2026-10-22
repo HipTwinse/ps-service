@@ -152,6 +152,7 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
 
     # Guard: check if target file exists and verify no open connections exist.
     # Note: PRAGMA locking_mode=EXCLUSIVE + BEGIN EXCLUSIVE detects ANY open connection (even idle).
+    # Mandatory operational rule: service and all writers must be stopped; lock probe is defense-in-depth only.
     if target_file.exists():
         try:
             test_conn = sqlite3.connect(str(target_file), timeout=0.1)
@@ -160,7 +161,12 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
                 test_conn.execute("BEGIN EXCLUSIVE;")
                 test_conn.execute("COMMIT;")
                 # Safely checkpoint any pending WAL frames into main file
-                test_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                cp_row = test_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
+                if cp_row is not None and cp_row[0] != 0:
+                    raise RuntimeError(
+                        f"Target database WAL checkpoint was blocked or busy (busy={cp_row[0]}). "
+                        f"Active writers or readers are present."
+                    )
             finally:
                 test_conn.close()
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
@@ -203,14 +209,30 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
     shm_sidecar = target_file.parent / f"{target_file.name}-shm"
 
     if target_file.exists():
-        for p in (target_file, wal_sidecar, shm_sidecar):
-            if p.exists():
-                bak = target_file.parent / f"{p.name}.orig_bak_{os.getpid()}_{int(time.time() * 1000)}"
+        try:
+            for p in (target_file, wal_sidecar, shm_sidecar):
+                if p.exists():
+                    bak = target_file.parent / f"{p.name}.orig_bak_{os.getpid()}_{int(time.time() * 1000)}"
+                    try:
+                        shutil.copy2(p, bak)
+                        orig_backups[p] = bak
+                    except FileNotFoundError:
+                        pass
+        except Exception as staging_err:
+            # Clean up partial safety backups and temp file on staging failure
+            for bak in orig_backups.values():
                 try:
-                    shutil.copy2(p, bak)
-                    orig_backups[p] = bak
-                except FileNotFoundError:
+                    bak.unlink()
+                except OSError:
                     pass
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
+            raise RuntimeError(
+                f"Failed to create safety backup of target database before restoration: {staging_err}"
+            ) from staging_err
 
     try:
         # Step 1: Remove stale WAL sidecars before swapping target file.
@@ -234,18 +256,31 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
             except OSError:
                 pass
 
-    except Exception:
+    except Exception as primary_err:
         # Failure rollback: restore original target and sidecars if they were modified/removed
+        rollback_errors = []
         for orig_path, bak in orig_backups.items():
             if bak.exists():
                 try:
                     shutil.copy2(bak, orig_path)
-                    bak.unlink()
-                except OSError:
-                    pass
+                    try:
+                        bak.unlink()
+                    except OSError:
+                        pass
+                except Exception as rb_err:
+                    rollback_errors.append(f"Failed to restore '{orig_path.name}' from safety backup: {rb_err}")
+
         if temp_file.exists():
             try:
                 temp_file.unlink()
             except OSError:
                 pass
+
+        if rollback_errors:
+            err_details = "; ".join(rollback_errors)
+            raise RuntimeError(
+                f"CRITICAL RESTORE FAILURE: Primary restore operation failed AND rollback of original files failed. "
+                f"Original target database state could NOT be guaranteed preserved! Rollback errors: {err_details}"
+            ) from primary_err
+
         raise

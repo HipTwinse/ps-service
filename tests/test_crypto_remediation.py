@@ -73,6 +73,34 @@ class TestCryptoRemediation(unittest.TestCase):
         self.assertIsNotNone(get_encryption_key())
         self.assertIsNotNone(get_fingerprint_pepper())
 
+    def test_staging_env_forbids_fallback_even_with_allow_dev_fallback_key(self):
+        """ENV=staging with ALLOW_DEV_FALLBACK_KEY=1 must forbid fallback (not an allowed dev/test env)."""
+        os.environ["ENV"] = "staging"
+        os.environ["ALLOW_DEV_FALLBACK_KEY"] = "1"
+        os.environ.pop("APP_ENV", None)
+        os.environ.pop("INVENTORY_ENCRYPTION_KEY", None)
+        os.environ.pop("FINGERPRINT_PEPPER", None)
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_encryption_key()
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_fingerprint_pepper()
+
+    def test_unset_env_forbids_fallback_even_with_allow_dev_fallback_key(self):
+        """Unset ENV and APP_ENV with ALLOW_DEV_FALLBACK_KEY=1 must forbid fallback."""
+        os.environ.pop("ENV", None)
+        os.environ.pop("APP_ENV", None)
+        os.environ["ALLOW_DEV_FALLBACK_KEY"] = "1"
+        os.environ.pop("INVENTORY_ENCRYPTION_KEY", None)
+        os.environ.pop("FINGERPRINT_PEPPER", None)
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_encryption_key()
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_fingerprint_pepper()
+
     def test_production_missing_secrets_aborts_safely(self):
         """In production environment without secrets, safe failure occurs."""
         os.environ["ENV"] = "production"
@@ -244,6 +272,59 @@ class TestCryptoRemediation(unittest.TestCase):
             r2 = inv_repo.import_items(prod.id, [test_code], InventoryType.VOUCHER_CODE, denom.id)
             self.assertEqual(r2["accepted"], 0)
             self.assertEqual(r2["duplicates"], 1)
+            conn.close()
+
+    def test_rotate_fingerprint_pepper_rejected_if_connection_in_active_transaction(self):
+        """Calling rotate_fingerprint_pepper with uncommitted active transaction must raise RuntimeError."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "test_rot_tx.db")
+            conn = create_connection(db_path)
+            run_migrations(conn)
+
+            # Start an uncommitted transaction
+            conn.execute("INSERT INTO users (external_id, username, status) VALUES ('active_caller', 'caller', 'ACTIVE')")
+            self.assertTrue(conn.in_transaction)
+
+            inv_repo = InventoryRepository(conn)
+            with self.assertRaises(RuntimeError) as cm:
+                inv_repo.rotate_fingerprint_pepper(b"new_pepper_123")
+
+            self.assertIn("active uncommitted transaction", str(cm.exception))
+
+            # Caller's transaction must remain uncommitted and intact
+            self.assertTrue(conn.in_transaction)
+            conn.rollback()
+            conn.close()
+
+    def test_pepper_rotation_failure_recovery_allows_continuation_with_old_pepper(self):
+        """If rotation fails and rolls back, application can safely continue imports with old pepper."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "test_rot_rec.db")
+            conn = create_connection(db_path)
+            run_migrations(conn)
+
+            cat_repo = CatalogRepository(conn)
+            prod = cat_repo.create_voucher_product("TR Card", "TR", "TRY", ProductStatus.APPROVED)
+            denom = cat_repo.add_voucher_denomination(prod.id, "TR", "TRY", 1000, 3000)
+            inv_repo = InventoryRepository(conn)
+
+            # 1. Import baseline item
+            inv_repo.import_items(prod.id, ["INITIAL-CODE-1"], InventoryType.VOUCHER_CODE, denom.id)
+
+            # 2. Simulate failed rotation
+            from unittest.mock import patch
+            with patch("src.db.repositories.compute_fingerprint", side_effect=RuntimeError("Transient failure")):
+                with self.assertRaises(RuntimeError):
+                    inv_repo.rotate_fingerprint_pepper(b"aborted_pepper_secret")
+
+            # 3. Verify recovery: system operates normally with old pepper, detecting duplicates
+            dup_result = inv_repo.import_items(prod.id, ["INITIAL-CODE-1"], InventoryType.VOUCHER_CODE, denom.id)
+            self.assertEqual(dup_result["accepted"], 0)
+            self.assertEqual(dup_result["duplicates"], 1)
+
+            # 4. Verify fresh imports work with old pepper
+            new_result = inv_repo.import_items(prod.id, ["NEW-CODE-AFTER-FAIL"], InventoryType.VOUCHER_CODE, denom.id)
+            self.assertEqual(new_result["accepted"], 1)
             conn.close()
 
 
