@@ -255,6 +255,7 @@ class CatalogRepository:
             "UPDATE products SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (new_status.value, product_id),
         )
+        self.conn.commit()
 
     def update_fixed_product_approval(
         self, product_id: int, approval_status: ApprovalStatus
@@ -831,10 +832,11 @@ class OrderRepository:
         order_id: int,
         target_status: OrderStatus,
         notes: Optional[str] = None,
+        expected_current_status: Optional[OrderStatus] = None,
     ) -> Order:
         """Transitions order status enforcing strict state machine transitions and audit logging."""
         order = self.get_order(order_id)
-        current_status = order.status
+        current_status = expected_current_status if expected_current_status is not None else order.status
 
         allowed_targets = ALLOWED_ORDER_TRANSITIONS.get(current_status, set())
         if target_status not in allowed_targets:
@@ -843,35 +845,46 @@ class OrderRepository:
             )
 
         cur = self.conn.cursor()
-        if target_status == OrderStatus.PAID:
+        try:
+            if target_status == OrderStatus.PAID:
+                cur.execute(
+                    """
+                    UPDATE orders
+                    SET status = ?, paid_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = ?
+                    """,
+                    (target_status.value, order_id, current_status.value),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE orders
+                    SET status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = ?
+                    """,
+                    (target_status.value, order_id, current_status.value),
+                )
+
+            if cur.rowcount == 0:
+                raise ConflictError(
+                    f"Concurrent state modification on order {order_id}: order is no longer in expected state '{current_status.value}'."
+                )
+
+            details = json.dumps({"notes": notes, "from_status": current_status.value, "to_status": target_status.value}) if notes else None
             cur.execute(
                 """
-                UPDATE orders
-                SET status = ?, paid_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                INSERT INTO audit_events (
+                    event_type, entity_type, entity_id, details_json
+                ) VALUES (?, ?, ?, ?)
                 """,
-                (target_status.value, order_id),
+                ("ORDER_STATUS_TRANSITION", "ORDER", order_id, details),
             )
-        else:
-            cur.execute(
-                """
-                UPDATE orders
-                SET status = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (target_status.value, order_id),
-            )
-        details = json.dumps({"notes": notes, "from_status": current_status.value, "to_status": target_status.value}) if notes else None
-        cur.execute(
-            """
-            INSERT INTO audit_events (
-                event_type, entity_type, entity_id, details_json
-            ) VALUES (?, ?, ?, ?)
-            """,
-            ("ORDER_STATUS_TRANSITION", "ORDER", order_id, details),
-        )
-        self.conn.commit()
-        return self.get_order(order_id)
+            self.conn.commit()
+            return self.get_order(order_id)
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
 
     def get_order(self, order_id: int) -> Order:
         cur = self.conn.cursor()

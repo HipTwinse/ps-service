@@ -96,12 +96,18 @@ def transaction(conn: sqlite3.Connection, mode: str = "IMMEDIATE") -> Generator[
 def backup_database(source_conn: sqlite3.Connection, backup_path: str | Path) -> None:
     """Safely creates a consistent online backup of the SQLite database.
 
+    Enforces strict transaction ownership: raises RuntimeError if source_conn has an
+    active uncommitted transaction to avoid committing or interrupting caller transactions.
+
     Args:
         source_conn: Source database connection.
         backup_path: Destination path for the backup file.
     """
     if source_conn.in_transaction:
-        source_conn.commit()
+        raise RuntimeError(
+            "Cannot backup database while connection has an active uncommitted transaction. "
+            "Commit or rollback caller transaction before initiating backup."
+        )
 
     backup_file = Path(backup_path)
     backup_file.parent.mkdir(parents=True, exist_ok=True)

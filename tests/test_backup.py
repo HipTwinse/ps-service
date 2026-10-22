@@ -149,6 +149,21 @@ class TestDatabaseBackupAndRestore(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             restore_database("non_existent_file_path_123.bak", self.restored_path)
 
+    def test_backup_database_rejected_if_in_active_transaction(self):
+        """backup_database must refuse to execute and raise RuntimeError if connection has an active uncommitted transaction."""
+        self.conn.execute("INSERT INTO users (external_id, username, status) VALUES ('pending_backup_user', 'caller', 'ACTIVE');")
+        self.assertTrue(self.conn.in_transaction)
+
+        target_backup = os.path.join(self.temp_dir.name, "should_fail_backup.db")
+        with self.assertRaises(RuntimeError) as cm:
+            backup_database(self.conn, target_backup)
+
+        self.assertIn("active uncommitted transaction", str(cm.exception))
+
+        # Caller's transaction must remain uncommitted and intact
+        self.assertTrue(self.conn.in_transaction)
+        self.conn.rollback()
+
 
 if __name__ == "__main__":
     unittest.main()

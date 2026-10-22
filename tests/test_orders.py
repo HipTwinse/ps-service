@@ -8,6 +8,7 @@ from src.db.connection import create_connection
 from src.db.migrations import run_migrations
 from src.db.models import (
     ApprovalStatus,
+    ConflictError,
     DeliveryMethod,
     InvalidStateTransitionError,
     NotFoundError,
@@ -594,6 +595,54 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         check_conn.execute("UPDATE fixed_product_details SET approval_status = 'APPROVED' WHERE product_id = ?", (self.fixed_prod.id,))
         check_conn.commit()
         check_conn.close()
+
+    def test_transition_order_status_optimistic_locking_concurrency(self):
+        """Optimistic locking prevents lost updates when order status is concurrently changed."""
+        order = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=14900,
+            currency="RUB",
+            items=[
+                {
+                    "product_id": self.fixed_prod.id,
+                    "product_type_snapshot": "FIXED_PRODUCT",
+                    "quantity": 1,
+                    "unit_price_minor": 14900,
+                    "currency": "RUB",
+                    "metadata_json": None,
+                }
+            ],
+        )
+        self.assertEqual(order.status, OrderStatus.PENDING_PAYMENT)
+
+        # Transition order to PAYMENT_REVIEW
+        order = self.order_repo.transition_order_status(order.id, OrderStatus.PAYMENT_REVIEW, notes="Receipt submitted")
+        self.assertEqual(order.status, OrderStatus.PAYMENT_REVIEW)
+
+        conn2 = create_connection(self.db_path)
+        try:
+            repo2 = OrderRepository(conn2)
+
+            # Actor 1 confirms payment: PAYMENT_REVIEW -> PAID
+            self.order_repo.transition_order_status(order.id, OrderStatus.PAID, notes="Payment confirmed")
+
+            # Actor 2 attempts to cancel assuming order is still in PAYMENT_REVIEW
+            # With optimistic locking, rowcount is 0 because status was concurrently changed to PAID -> ConflictError
+            with self.assertRaises(ConflictError) as cm:
+                repo2.transition_order_status(
+                    order.id,
+                    OrderStatus.CANCELLED,
+                    notes="User cancellation",
+                    expected_current_status=OrderStatus.PAYMENT_REVIEW,
+                )
+
+            self.assertIn("Concurrent state modification", str(cm.exception))
+
+            # Verify final status remains PAID and was not overwritten by CANCELLED
+            final_order = self.order_repo.get_order(order.id)
+            self.assertEqual(final_order.status, OrderStatus.PAID)
+        finally:
+            conn2.close()
 
 
 if __name__ == "__main__":

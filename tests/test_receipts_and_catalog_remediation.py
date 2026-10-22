@@ -148,6 +148,31 @@ class TestReceiptsAndCatalogRemediation(unittest.TestCase):
         cur.execute("SELECT COUNT(*) FROM order_items")
         self.assertEqual(cur.fetchone()[0], 0)
 
+    def test_update_product_status_commits_transaction(self):
+        """update_product_status must commit its transaction and not leave connection in open transaction."""
+        prod = self.catalog_repo.create_fixed_product(
+            display_name="PS Plus Essential",
+            price_rub_kopecks=250000,
+            delivery_method=DeliveryMethod.OFFICIAL_ACTIVATION,
+            supply_method="APPROVED_SUPPLIER",
+            approval_status=ApprovalStatus.APPROVED,
+            status=ProductStatus.DRAFT,
+        )
+
+        self.catalog_repo.update_product_status(prod.id, ProductStatus.APPROVED)
+
+        # Invariant: connection must NOT have an open uncommitted transaction
+        self.assertFalse(self.conn.in_transaction)
+
+        # Subsequent transactional operations (such as create_order) must succeed without transaction conflict
+        order = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=250000,
+            currency="RUB",
+            items=[{"product_id": prod.id, "product_type_snapshot": "FIXED_PRODUCT", "quantity": 1, "unit_price_minor": 250000}],
+        )
+        self.assertIsNotNone(order)
+
 
 if __name__ == "__main__":
     unittest.main()
