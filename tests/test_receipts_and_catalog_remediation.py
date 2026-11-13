@@ -13,6 +13,7 @@ from src.db.models import (
     DuplicateReceiptError,
     OrderStatus,
     ProductStatus,
+    ReceiptReviewStatus,
     ValidationError,
 )
 from src.db.repositories import (
@@ -172,6 +173,105 @@ class TestReceiptsAndCatalogRemediation(unittest.TestCase):
             items=[{"product_id": prod.id, "product_type_snapshot": "FIXED_PRODUCT", "quantity": 1, "unit_price_minor": 250000}],
         )
         self.assertIsNotNone(order)
+
+    def test_strict_typing_catalog_repository(self):
+        """CatalogRepository methods must enforce strict typing (reject bool, float, str, None, and non-positive values)."""
+        # 1. get_product(product_id)
+        for bad_id in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.catalog_repo.get_product(bad_id)
+
+        # 2. update_product_status(product_id, ...)
+        for bad_id in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.catalog_repo.update_product_status(bad_id, ProductStatus.APPROVED)
+
+        # 3. create_fixed_product(price_rub_kopecks, duration_days)
+        for bad_price in (True, False, 100.5, "100", None, 0, -50):
+            with self.assertRaises(ValidationError):
+                self.catalog_repo.create_fixed_product(
+                    display_name="Test Prod",
+                    price_rub_kopecks=bad_price,
+                    delivery_method=DeliveryMethod.MANUAL_REVIEW,
+                    supply_method="VENDOR_A",
+                )
+
+        for bad_days in (True, False, 10.5, "10", 0, -5):
+            with self.assertRaises(ValidationError):
+                self.catalog_repo.create_fixed_product(
+                    display_name="Test Prod",
+                    price_rub_kopecks=1000,
+                    delivery_method=DeliveryMethod.MANUAL_REVIEW,
+                    supply_method="VENDOR_A",
+                    duration_days=bad_days,
+                )
+
+        # 4. update_fixed_product_supply_method(product_id, ...)
+        for bad_id in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.catalog_repo.update_fixed_product_supply_method(bad_id, "VENDOR_B")
+
+        # 5. add_voucher_denomination(product_id, region, currency, face_value_minor, cost_rub_kopecks)
+        prod = self.catalog_repo.create_voucher_product("TR Card", "TR", "TRY", ProductStatus.APPROVED)
+
+        for bad_id in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.catalog_repo.add_voucher_denomination(bad_id, "TR", "TRY", 100, 200)
+
+        for bad_denom in (True, False, 100.5, "100", None, 0, -10):
+            with self.assertRaises(ValidationError):
+                self.catalog_repo.add_voucher_denomination(prod.id, "TR", "TRY", bad_denom, 200)
+
+        for bad_price in (True, False, 200.5, "200", None, -10):
+            with self.assertRaises(ValidationError):
+                self.catalog_repo.add_voucher_denomination(prod.id, "TR", "TRY", 100, bad_price)
+
+    def test_strict_typing_receipt_repository(self):
+        """ReceiptRepository methods must enforce strict typing."""
+        voucher_prod = self.catalog_repo.create_voucher_product("TR Card", "TR", "TRY", ProductStatus.APPROVED)
+        order = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=1000,
+            currency="RUB",
+            items=[{"product_id": voucher_prod.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000}],
+        )
+
+        # 1. submit_receipt(order_id, user_id, ...)
+        for bad_oid in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.receipt_repo.submit_receipt(
+                    order_id=bad_oid,
+                    user_id=self.user.id,
+                    file_bytes=b"dummy",
+                )
+
+        for bad_uid in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.receipt_repo.submit_receipt(
+                    order_id=order.id,
+                    user_id=bad_uid,
+                    file_bytes=b"dummy",
+                )
+
+        receipt = self.receipt_repo.submit_receipt(
+            order_id=order.id,
+            user_id=self.user.id,
+            file_bytes=b"valid receipt file",
+            provider_name="SBER",
+        )
+
+        # 2. get_receipt(receipt_id)
+        for bad_rid in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.receipt_repo.get_receipt(bad_rid)
+
+        # 3. update_review_status(receipt_id, review_status)
+        for bad_rid in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.receipt_repo.update_review_status(
+                    receipt_id=bad_rid,
+                    review_status=ReceiptReviewStatus.ACCEPTED,
+                )
 
 
 if __name__ == "__main__":

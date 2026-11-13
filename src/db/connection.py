@@ -130,7 +130,7 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
     during restoration is strictly prohibited.
 
     Guarantees:
-    1. Rejects restore immediately if target database has ANY active connection (idle or active).
+    1. Best-effort lock probing and checkpoint validation detect active locks and dirty WAL frames.
     2. Restores into an isolated temporary file in the same directory/filesystem.
     3. Runs PRAGMA integrity_check on the restored temporary database before touching the target.
     4. Preserves safety copies of the original target and all its sidecars (-wal, -shm) before
@@ -156,9 +156,11 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
     if not backup_file.exists():
         raise FileNotFoundError(f"Backup file not found: {backup_file}")
 
-    # Guard: check if target file exists and verify no open connections exist.
-    # Note: PRAGMA locking_mode=EXCLUSIVE + BEGIN EXCLUSIVE detects ANY open connection (even idle).
-    # Mandatory operational rule: service and all writers must be stopped; lock probe is defense-in-depth only.
+    # Guard: check if target file exists and verify no active write locks or dirty WAL frames exist.
+    # Note: PRAGMA locking_mode=EXCLUSIVE + BEGIN EXCLUSIVE and PRAGMA wal_checkpoint(TRUNCATE)
+    # are defense-in-depth probes. SQLite does NOT guarantee cross-process detection of idle connections
+    # or prevent newly opened connections once the probe closes.
+    # Mandatory operational rule: service and all writers/readers MUST be stopped prior to restoration.
     if target_file.exists():
         try:
             test_conn = sqlite3.connect(str(target_file), timeout=0.1)
@@ -166,12 +168,21 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
                 test_conn.execute("PRAGMA locking_mode = EXCLUSIVE;")
                 test_conn.execute("BEGIN EXCLUSIVE;")
                 test_conn.execute("COMMIT;")
-                # Safely checkpoint any pending WAL frames into main file
+                # Safely checkpoint any pending WAL frames into main file and verify all frames backfilled
                 cp_row = test_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
-                if cp_row is not None and cp_row[0] != 0:
+                if cp_row is None:
+                    raise RuntimeError("Target database WAL checkpoint failed: no result returned.")
+
+                busy, log_frames, checkpointed_frames = cp_row[0], cp_row[1], cp_row[2]
+                if busy != 0:
                     raise RuntimeError(
-                        f"Target database WAL checkpoint was blocked or busy (busy={cp_row[0]}). "
+                        f"Target database WAL checkpoint was blocked or busy (busy={busy}, log={log_frames}, checkpointed={checkpointed_frames}). "
                         f"Active writers or readers are present."
+                    )
+                if log_frames != checkpointed_frames:
+                    raise RuntimeError(
+                        f"Target database WAL checkpoint was incomplete: only {checkpointed_frames} of {log_frames} frames were checkpointed (busy={busy}). "
+                        f"Active readers or uncheckpointed transactions are present."
                     )
             finally:
                 test_conn.close()
@@ -265,14 +276,12 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
     except Exception as primary_err:
         # Failure rollback: restore original target and sidecars if they were modified/removed
         rollback_errors = []
+        # Phase 1: Copy all safety backups back to their original paths.
+        # DO NOT delete any safety backup until all files have been successfully restored!
         for orig_path, bak in orig_backups.items():
             if bak.exists():
                 try:
                     shutil.copy2(bak, orig_path)
-                    try:
-                        bak.unlink()
-                    except OSError:
-                        pass
                 except Exception as rb_err:
                     rollback_errors.append(f"Failed to restore '{orig_path.name}' from safety backup: {rb_err}")
 
@@ -283,10 +292,20 @@ def restore_database(backup_path: str | Path, target_path: str | Path) -> None:
                 pass
 
         if rollback_errors:
+            # Leave all available safety backup copies on disk for manual operator recovery!
             err_details = "; ".join(rollback_errors)
             raise RuntimeError(
                 f"CRITICAL RESTORE FAILURE: Primary restore operation failed AND rollback of original files failed. "
-                f"Original target database state could NOT be guaranteed preserved! Rollback errors: {err_details}"
+                f"Original target database state could NOT be guaranteed preserved! "
+                f"Safety backups have been retained on disk for manual recovery. Rollback errors: {err_details}"
             ) from primary_err
+
+        # Phase 2: All original files were successfully restored without error.
+        # Now it is safe to clean up the safety backups.
+        for bak in orig_backups.values():
+            try:
+                bak.unlink()
+            except OSError:
+                pass
 
         raise

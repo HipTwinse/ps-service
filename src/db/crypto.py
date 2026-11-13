@@ -32,22 +32,25 @@ def is_dev_or_test_environment() -> bool:
     """Checks whether the execution context is an explicitly permitted dev/test environment.
 
     Security Policy:
-    1. Production designations ('production', 'prod') strictly and unconditionally
-       forbid fallback secrets under all circumstances.
-    2. Fallback secrets are ONLY permitted in explicitly designated dev/test environments
-       (ENV or APP_ENV in {'test', 'testing', 'dev', 'development'}).
-    3. Undefined, staging, or unknown environments NEVER permit fallback secrets,
-       even if ALLOW_DEV_FALLBACK_KEY is set.
+    1. At least one environment variable (ENV or APP_ENV) must be explicitly set and non-empty.
+    2. All explicitly specified environment variables (ENV and/or APP_ENV) must strictly belong to _ALLOWED_DEV_ENVS.
+    3. If any specified environment variable is outside _ALLOWED_DEV_ENVS (e.g. production, staging, unknown),
+       fallback secrets are unconditionally forbidden.
+    4. If neither variable is set or both are empty, fallback secrets are forbidden.
     """
-    env = os.environ.get("ENV", "").strip().lower()
-    app_env = os.environ.get("APP_ENV", "").strip().lower()
+    raw_env = os.environ.get("ENV")
+    raw_app_env = os.environ.get("APP_ENV")
 
-    # Any production designation strictly and unconditionally overrides everything
-    if env in _PRODUCTION_ENVS or app_env in _PRODUCTION_ENVS:
+    specified_envs = []
+    if raw_env is not None and raw_env.strip():
+        specified_envs.append(raw_env.strip().lower())
+    if raw_app_env is not None and raw_app_env.strip():
+        specified_envs.append(raw_app_env.strip().lower())
+
+    if not specified_envs:
         return False
 
-    # Fallback is strictly restricted to explicitly designated test/dev environments
-    return app_env in _ALLOWED_DEV_ENVS or env in _ALLOWED_DEV_ENVS
+    return all(e in _ALLOWED_DEV_ENVS for e in specified_envs)
 
 
 def canonicalize_code(code: str) -> str:

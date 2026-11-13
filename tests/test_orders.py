@@ -441,6 +441,90 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         self.assertTrue(self.conn.in_transaction)
         self.conn.rollback()
 
+    def test_transaction_ownership_transition_order_status_rejected_if_in_transaction(self):
+        """transition_order_status must refuse to execute if connection already has an active uncommitted transaction."""
+        order = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=14900,
+            currency="RUB",
+            items=[
+                {
+                    "product_id": self.fixed_prod.id,
+                    "product_type_snapshot": "FIXED_PRODUCT",
+                    "quantity": 1,
+                    "unit_price_minor": 14900,
+                    "currency": "RUB",
+                    "metadata_json": None,
+                }
+            ],
+        )
+
+        # 1. Caller starts an uncommitted transaction
+        self.conn.execute("INSERT INTO users (external_id, username, status) VALUES ('caller_in_tx', 'caller_tx', 'ACTIVE')")
+        self.assertTrue(self.conn.in_transaction)
+
+        # 2. Calling transition_order_status must be rejected BEFORE any SQL is executed
+        with self.assertRaises(RuntimeError) as cm:
+            self.order_repo.transition_order_status(order.id, OrderStatus.PAYMENT_REVIEW)
+
+        self.assertIn("active uncommitted transaction", str(cm.exception))
+
+        # 3. Caller's uncommitted transaction MUST remain active and uncommitted
+        self.assertTrue(self.conn.in_transaction)
+
+        # 4. Caller's uncommitted data is preserved and can be committed by caller
+        self.conn.commit()
+        self.assertFalse(self.conn.in_transaction)
+
+        # Verify caller's inserted user exists
+        cur = self.conn.cursor()
+        cur.execute("SELECT id FROM users WHERE external_id = 'caller_in_tx'")
+        self.assertIsNotNone(cur.fetchone())
+
+        # Verify order was NOT transitioned (remains PENDING_PAYMENT)
+        self.assertEqual(self.order_repo.get_order(order.id).status, OrderStatus.PENDING_PAYMENT)
+
+    def test_transaction_ownership_transition_order_status_conflict_scenario_preserves_caller_tx(self):
+        """If caller is in transaction, transition_order_status rejects before ConflictError without touching caller tx."""
+        order = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=14900,
+            currency="RUB",
+            items=[
+                {
+                    "product_id": self.fixed_prod.id,
+                    "product_type_snapshot": "FIXED_PRODUCT",
+                    "quantity": 1,
+                    "unit_price_minor": 14900,
+                    "currency": "RUB",
+                    "metadata_json": None,
+                }
+            ],
+        )
+
+        # Caller starts an uncommitted transaction
+        self.conn.execute("INSERT INTO users (external_id, username, status) VALUES ('caller_conflict_tx', 'caller_c', 'ACTIVE')")
+        self.assertTrue(self.conn.in_transaction)
+
+        # Attempt transition expecting obsolete state
+        with self.assertRaises(RuntimeError) as cm:
+            self.order_repo.transition_order_status(
+                order.id,
+                OrderStatus.PAID,
+                expected_current_status=OrderStatus.PAYMENT_REVIEW,
+            )
+
+        self.assertIn("active uncommitted transaction", str(cm.exception))
+        self.assertTrue(self.conn.in_transaction)
+
+        # Caller rolls back their own transaction safely
+        self.conn.rollback()
+        self.assertFalse(self.conn.in_transaction)
+
+        cur = self.conn.cursor()
+        cur.execute("SELECT id FROM users WHERE external_id = 'caller_conflict_tx'")
+        self.assertIsNone(cur.fetchone())
+
     def test_money_validation_rejects_bool_and_non_integers(self):
         """Money and quantity fields must reject booleans (isinstance(True, int)) and non-integers."""
         base_item = {
@@ -513,10 +597,103 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
             )
         self.assertIn("does not match product", str(cm.exception))
 
+    def test_strict_typing_order_repository_methods(self):
+        """OrderRepository methods must enforce strict typing (reject bool, float, str, None, and non-positive values)."""
+        base_item = {
+            "product_id": self.fixed_prod.id,
+            "product_type_snapshot": "FIXED_PRODUCT",
+            "quantity": 1,
+            "unit_price_minor": 14900,
+            "currency": "RUB",
+            "metadata_json": None,
+        }
+
+        # 1. user_id validation
+        for bad_user_id in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.order_repo.create_order(
+                    user_id=bad_user_id,
+                    total_amount_minor=14900,
+                    currency="RUB",
+                    items=[base_item],
+                )
+
+        # 2. total_amount_minor validation
+        for bad_total in (True, False, 14900.5, "14900", None, 0, -500):
+            with self.assertRaises(ValidationError):
+                self.order_repo.create_order(
+                    user_id=self.user.id,
+                    total_amount_minor=bad_total,
+                    currency="RUB",
+                    items=[base_item],
+                )
+
+        # 3. item product_id validation
+        for bad_pid in (True, False, 2.5, "2", None, 0, -10):
+            bad_item = dict(base_item, product_id=bad_pid)
+            with self.assertRaises(ValidationError):
+                self.order_repo.create_order(
+                    user_id=self.user.id,
+                    total_amount_minor=14900,
+                    currency="RUB",
+                    items=[bad_item],
+                )
+
+        # 4. item quantity validation
+        for bad_qty in (True, False, 1.5, "1", None, 0, -1):
+            bad_item = dict(base_item, quantity=bad_qty)
+            with self.assertRaises(ValidationError):
+                self.order_repo.create_order(
+                    user_id=self.user.id,
+                    total_amount_minor=14900,
+                    currency="RUB",
+                    items=[bad_item],
+                )
+
+        # 5. item unit_price_minor validation
+        for bad_price in (True, False, 14900.5, "14900", None, 0, -100):
+            bad_item = dict(base_item, unit_price_minor=bad_price)
+            with self.assertRaises(ValidationError):
+                self.order_repo.create_order(
+                    user_id=self.user.id,
+                    total_amount_minor=14900,
+                    currency="RUB",
+                    items=[bad_item],
+                )
+
+        # Create valid order for testing get_order, transition_order_status, list_orders_by_user
+        valid_order = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=14900,
+            currency="RUB",
+            items=[base_item],
+        )
+
+        # 6. get_order(order_id)
+        for bad_oid in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.order_repo.get_order(bad_oid)
+
+        # 7. transition_order_status(order_id, ...)
+        for bad_oid in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.order_repo.transition_order_status(bad_oid, OrderStatus.PAYMENT_REVIEW)
+
+        # 8. get_order_items(order_id)
+        for bad_oid in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.order_repo.get_order_items(bad_oid)
+
     def test_real_concurrency_approval_revocation_during_create_order(self):
-        """Real concurrency test: create_order vs concurrent supply approval revocation."""
+        """Deterministic concurrency test for create_order vs supply approval revocation.
+
+        Covers both interleaved scenarios deterministically using threading.Event:
+        - Scenario 1: create_order acquires write lock first -> order is created successfully -> revocation commits.
+        - Scenario 2: revocation commits first -> create_order is rejected specifically with ValidationError (missing approval).
+        Neither scenario permits 'database is locked' to count as a pass.
+        Zero orphan orders or orphan order items allowed.
+        """
         import threading
-        results = {"order_created": 0, "rejected_or_locked": 0, "errors": []}
 
         items = [
             {
@@ -529,72 +706,148 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
             }
         ]
 
-        def worker_create_order():
-            t_conn = create_connection(self.db_path, timeout_seconds=0.2)
-            t_repo = OrderRepository(t_conn)
+        # --- SCENARIO 1: create_order acquires write lock first ---
+        # Ensure product is APPROVED
+        setup_conn = create_connection(self.db_path)
+        setup_conn.execute("UPDATE fixed_product_details SET approval_status = 'APPROVED' WHERE product_id = ?", (self.fixed_prod.id,))
+        setup_conn.commit()
+        setup_conn.close()
+
+        sc1_events = {
+            "order_in_tx": threading.Event(),
+            "revoke_attempted": threading.Event(),
+        }
+        sc1_results = {"order_created": False, "revoke_ok": False, "errors": []}
+
+        def sc1_worker_create():
+            conn = create_connection(self.db_path, timeout_seconds=5.0)
+            repo = OrderRepository(conn)
             try:
-                t_repo.create_order(
+                # We start create_order, but we can hook into sqlite connection trace or run normally
+                # Since create_order uses BEGIN IMMEDIATE, it acquires the write lock right away.
+                order = repo.create_order(
                     user_id=self.user.id,
                     total_amount_minor=14900,
                     currency="RUB",
                     items=items,
                 )
-                results["order_created"] += 1
-            except ValidationError:
-                results["rejected_or_locked"] += 1
+                sc1_results["order_created"] = True
+                sc1_events["order_in_tx"].set()
             except Exception as e:
-                if "locked" in str(e).lower():
-                    results["rejected_or_locked"] += 1
-                else:
-                    results["errors"].append(f"Unexpected create_order error: {e}")
+                sc1_results["errors"].append(f"SC1 create_order error: {e}")
             finally:
-                t_conn.close()
+                conn.close()
 
-        def worker_revoke_approval():
-            t_conn = create_connection(self.db_path, timeout_seconds=0.2)
+        def sc1_worker_revoke():
+            # Wait until order is created, then revoke approval
+            sc1_events["order_in_tx"].wait(timeout=5.0)
+            conn = create_connection(self.db_path, timeout_seconds=5.0)
             try:
-                t_conn.execute(
+                conn.execute(
                     "UPDATE fixed_product_details SET approval_status = 'DRAFT' WHERE product_id = ?",
                     (self.fixed_prod.id,),
                 )
-                t_conn.commit()
+                conn.commit()
+                sc1_results["revoke_ok"] = True
             except Exception as e:
-                if "locked" not in str(e).lower():
-                    results["errors"].append(f"Unexpected revoke error: {e}")
+                sc1_results["errors"].append(f"SC1 revoke error: {e}")
             finally:
-                t_conn.close()
+                conn.close()
 
-        t1 = threading.Thread(target=worker_create_order)
-        t2 = threading.Thread(target=worker_revoke_approval)
-
+        t1 = threading.Thread(target=sc1_worker_create)
+        t2 = threading.Thread(target=sc1_worker_revoke)
         t1.start()
         t2.start()
-        t1.join()
-        t2.join()
+        t1.join(timeout=10.0)
+        t2.join(timeout=10.0)
 
-        self.assertEqual(results["errors"], [])
+        self.assertEqual(sc1_results["errors"], [], f"Scenario 1 encountered unexpected errors: {sc1_results['errors']}")
+        self.assertTrue(sc1_results["order_created"], "Scenario 1: order should be successfully created")
+        self.assertTrue(sc1_results["revoke_ok"], "Scenario 1: revocation should succeed after order creation")
 
-        # Consistency verification: if approval was revoked, check that any created order was created BEFORE revocation
-        check_conn = create_connection(self.db_path)
-        cur = check_conn.cursor()
-        cur.execute("SELECT approval_status FROM fixed_product_details WHERE product_id = ?", (self.fixed_prod.id,))
-        final_approval = cur.fetchone()["approval_status"]
-
+        # Verify DB state after Scenario 1
+        verify_conn = create_connection(self.db_path)
+        cur = verify_conn.cursor()
         cur.execute("SELECT COUNT(*) FROM orders")
-        order_count = cur.fetchone()[0]
+        sc1_order_count = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM order_items")
-        item_count = cur.fetchone()[0]
+        sc1_item_count = cur.fetchone()[0]
+        self.assertEqual(sc1_order_count, 1)
+        self.assertEqual(sc1_item_count, 1)
 
-        if order_count == 1:
-            self.assertEqual(item_count, 1)
-        else:
-            self.assertEqual(order_count, 0)
-            self.assertEqual(item_count, 0)
+        # Clean up orders before Scenario 2
+        verify_conn.execute("DELETE FROM order_items")
+        verify_conn.execute("DELETE FROM orders")
+        verify_conn.commit()
+
+        # --- SCENARIO 2: Revocation commits BEFORE create_order executes ---
+        # Revocation commits first -> approval is DRAFT -> create_order MUST raise ValidationError specifically
+        sc2_events = {
+            "revoked": threading.Event(),
+        }
+        sc2_results = {"order_validation_error": False, "revoke_ok": False, "errors": []}
+
+        def sc2_worker_revoke():
+            conn = create_connection(self.db_path, timeout_seconds=5.0)
+            try:
+                conn.execute(
+                    "UPDATE fixed_product_details SET approval_status = 'DRAFT' WHERE product_id = ?",
+                    (self.fixed_prod.id,),
+                )
+                conn.commit()
+                sc2_results["revoke_ok"] = True
+                sc2_events["revoked"].set()
+            except Exception as e:
+                sc2_results["errors"].append(f"SC2 revoke error: {e}")
+            finally:
+                conn.close()
+
+        def sc2_worker_create():
+            sc2_events["revoked"].wait(timeout=5.0)
+            conn = create_connection(self.db_path, timeout_seconds=5.0)
+            repo = OrderRepository(conn)
+            try:
+                repo.create_order(
+                    user_id=self.user.id,
+                    total_amount_minor=14900,
+                    currency="RUB",
+                    items=items,
+                )
+                sc2_results["errors"].append("SC2: create_order unexpectedly succeeded after revocation")
+            except ValidationError as ve:
+                if "approved" in str(ve).lower():
+                    sc2_results["order_validation_error"] = True
+                else:
+                    sc2_results["errors"].append(f"SC2: Unexpected ValidationError message: {ve}")
+            except Exception as e:
+                # "database is locked" is strictly forbidden from counting as a pass
+                sc2_results["errors"].append(f"SC2: Unexpected create_order exception (not ValidationError): {e}")
+            finally:
+                conn.close()
+
+        t3 = threading.Thread(target=sc2_worker_revoke)
+        t4 = threading.Thread(target=sc2_worker_create)
+        t3.start()
+        t4.start()
+        t3.join(timeout=10.0)
+        t4.join(timeout=10.0)
+
+        self.assertEqual(sc2_results["errors"], [], f"Scenario 2 encountered unexpected errors: {sc2_results['errors']}")
+        self.assertTrue(sc2_results["revoke_ok"], "Scenario 2: revocation should succeed")
+        self.assertTrue(sc2_results["order_validation_error"], "Scenario 2: create_order must fail with ValidationError('not approved for sale')")
+
+        # Verify DB state after Scenario 2: exactly 0 orders, 0 order items, no orphans
+        cur.execute("SELECT COUNT(*) FROM orders")
+        sc2_order_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM order_items")
+        sc2_item_count = cur.fetchone()[0]
+        self.assertEqual(sc2_order_count, 0)
+        self.assertEqual(sc2_item_count, 0)
 
         # Restore approval for tearDown
-        check_conn.execute("UPDATE fixed_product_details SET approval_status = 'APPROVED' WHERE product_id = ?", (self.fixed_prod.id,))
-        check_conn.commit()
-        check_conn.close()
+        verify_conn.execute("UPDATE fixed_product_details SET approval_status = 'APPROVED' WHERE product_id = ?", (self.fixed_prod.id,))
+        verify_conn.commit()
+        verify_conn.close()
 
     def test_transition_order_status_optimistic_locking_concurrency(self):
         """Optimistic locking prevents lost updates when order status is concurrently changed."""

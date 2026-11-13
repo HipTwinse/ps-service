@@ -42,20 +42,26 @@ from src.db.models import (
 )
 
 
-def _validate_int_minor(val: Any, name: str, allow_zero: bool = False) -> int:
-    """Strictly validates an integer minor amount (kopecks, cents, units).
+def _validate_int(val: Any, name: str, allow_zero: bool = False, min_value: Optional[int] = None) -> int:
+    """Strictly validates an integer value.
 
-    Rejects booleans (type(True) is bool), floats, None, strings, and invalid amounts.
+    Rejects booleans (type(True) is bool), floats, None, strings, and out-of-range values.
     """
     if type(val) is not int:
         raise ValidationError(f"{name} must be an integer (got {type(val).__name__}: {val!r}).")
-    if allow_zero:
+    if min_value is not None:
+        if val < min_value:
+            raise ValidationError(f"{name} must be >= {min_value} (got {val}).")
+    elif allow_zero:
         if val < 0:
             raise ValidationError(f"{name} cannot be negative (got {val}).")
     else:
         if val <= 0:
             raise ValidationError(f"{name} must be strictly positive (got {val}).")
     return val
+
+
+_validate_int_minor = _validate_int
 
 
 class CatalogRepository:
@@ -106,8 +112,11 @@ class CatalogRepository:
         cost_rub_kopecks: int,
         is_active: bool = True,
     ) -> VoucherDenomination:
-        face_value_minor = _validate_int_minor(face_value_minor, "face_value_minor")
-        cost_rub_kopecks = _validate_int_minor(cost_rub_kopecks, "cost_rub_kopecks", allow_zero=True)
+        product_id = _validate_int(product_id, "product_id")
+        face_value_minor = _validate_int(face_value_minor, "face_value_minor")
+        cost_rub_kopecks = _validate_int(cost_rub_kopecks, "cost_rub_kopecks", allow_zero=True)
+        if type(is_active) is not bool:
+            raise ValidationError(f"is_active must be a boolean (got {type(is_active).__name__}: {is_active!r}).")
 
         product = self.get_product(product_id)
         if product.product_type != ProductType.VOUCHER:
@@ -148,9 +157,9 @@ class CatalogRepository:
         approval_status: ApprovalStatus = ApprovalStatus.DRAFT,
         status: ProductStatus = ProductStatus.DRAFT,
     ) -> Product:
-        price_rub_kopecks = _validate_int_minor(price_rub_kopecks, "price_rub_kopecks")
-        if duration_days is not None and duration_days <= 0:
-            raise ValidationError("duration_days must be strictly positive if provided.")
+        price_rub_kopecks = _validate_int(price_rub_kopecks, "price_rub_kopecks")
+        if duration_days is not None:
+            duration_days = _validate_int(duration_days, "duration_days")
         if status == ProductStatus.APPROVED and approval_status != ApprovalStatus.APPROVED:
             raise ValidationError(
                 "Cannot create active FIXED_PRODUCT without approved supply method (approval_status must be APPROVED)."
@@ -184,6 +193,7 @@ class CatalogRepository:
         return self.get_product(product_id)
 
     def get_product(self, product_id: int) -> Product:
+        product_id = _validate_int(product_id, "product_id")
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM products WHERE id = ?", (product_id,))
         row = cur.fetchone()
@@ -199,6 +209,7 @@ class CatalogRepository:
         )
 
     def get_denomination(self, denomination_id: int) -> VoucherDenomination:
+        denomination_id = _validate_int(denomination_id, "denomination_id")
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM voucher_denominations WHERE id = ?", (denomination_id,))
         row = cur.fetchone()
@@ -242,6 +253,7 @@ class CatalogRepository:
         ]
 
     def update_product_status(self, product_id: int, new_status: ProductStatus) -> None:
+        product_id = _validate_int(product_id, "product_id")
         # Check approval before activating fixed-price products
         product = self.get_product(product_id)
         if product.product_type == ProductType.FIXED_PRODUCT and new_status == ProductStatus.APPROVED:
@@ -260,6 +272,7 @@ class CatalogRepository:
     def update_fixed_product_approval(
         self, product_id: int, approval_status: ApprovalStatus
     ) -> None:
+        product_id = _validate_int(product_id, "product_id")
         self.conn.execute(
             """
             UPDATE fixed_product_details
@@ -279,6 +292,7 @@ class CatalogRepository:
     def update_fixed_product_supply_method(
         self, product_id: int, new_supply_method: str
     ) -> None:
+        product_id = _validate_int(product_id, "product_id")
         """Updates the supply method of a fixed product.
 
         SECURITY INVARIANT:
@@ -361,6 +375,7 @@ class UserRepository:
         return user, True
 
     def get_user(self, user_id: int) -> User:
+        user_id = _validate_int(user_id, "user_id")
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
         row = cur.fetchone()
@@ -376,6 +391,7 @@ class UserRepository:
         )
 
     def update_user_status(self, user_id: int, status: UserStatus) -> None:
+        user_id = _validate_int(user_id, "user_id")
         self.conn.execute(
             "UPDATE users SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (status.value, user_id),
@@ -401,6 +417,10 @@ class InventoryRepository:
         Canonicalizes codes, encrypts sensitive payloads, computes unique fingerprints,
         and rejects duplicates. Does NOT log any plaintext codes.
         """
+        product_id = _validate_int(product_id, "product_id")
+        if denomination_id is not None:
+            denomination_id = _validate_int(denomination_id, "denomination_id")
+
         cur = self.conn.cursor()
         cur.execute("SELECT id FROM products WHERE id = ?", (product_id,))
         if not cur.fetchone():
@@ -592,8 +612,11 @@ class InventoryRepository:
 
         Uses conditional updates to guarantee concurrency safety.
         """
-        if quantity <= 0:
-            raise ValidationError("Quantity to reserve must be strictly positive.")
+        order_id = _validate_int(order_id, "order_id")
+        product_id = _validate_int(product_id, "product_id")
+        quantity = _validate_int(quantity, "quantity")
+        if denomination_id is not None:
+            denomination_id = _validate_int(denomination_id, "denomination_id")
 
         cur = self.conn.cursor()
         if denomination_id is not None:
@@ -658,6 +681,7 @@ class InventoryRepository:
 
         Invariant: NEVER reverts SOLD items to AVAILABLE.
         """
+        order_id = _validate_int(order_id, "order_id")
         cur = self.conn.cursor()
         cur.execute(
             """
@@ -673,6 +697,7 @@ class InventoryRepository:
 
     def finalize_order_sale(self, order_id: int) -> int:
         """Transitions reserved inventory items to permanently SOLD state upon successful order completion."""
+        order_id = _validate_int(order_id, "order_id")
         cur = self.conn.cursor()
         cur.execute(
             """
@@ -688,6 +713,7 @@ class InventoryRepository:
 
     def get_revealed_code(self, item_id: int) -> str:
         """Reveals the decrypted code for an inventory item (for authorized fulfillment only)."""
+        item_id = _validate_int(item_id, "item_id")
         cur = self.conn.cursor()
         cur.execute("SELECT encrypted_payload FROM inventory_items WHERE id = ?", (item_id,))
         row = cur.fetchone()
@@ -718,7 +744,8 @@ class OrderRepository:
         - Verifies that currency is consistent across order and all item snapshots.
         - Completely rolls back on any error without leaving orphan records.
         """
-        total_amount_minor = _validate_int_minor(total_amount_minor, "total_amount_minor")
+        user_id = _validate_int(user_id, "user_id")
+        total_amount_minor = _validate_int(total_amount_minor, "total_amount_minor")
         if not items:
             raise ValidationError("Order must contain at least one order item.")
 
@@ -729,8 +756,8 @@ class OrderRepository:
         # Verify mathematical consistency between total_amount_minor and item prices/quantities/currency
         computed_total = 0
         for item in items:
-            qty = _validate_int_minor(item.get("quantity"), "Item quantity")
-            unit_price = _validate_int_minor(item.get("unit_price_minor"), "Unit price")
+            qty = _validate_int(item.get("quantity"), "Item quantity")
+            unit_price = _validate_int(item.get("unit_price_minor"), "Unit price")
             item_curr = item.get("currency")
 
             if item_curr is not None and item_curr.strip().upper() != currency_norm:
@@ -767,10 +794,10 @@ class OrderRepository:
             # 2. Validate all products, product types, and supply approvals under active lock
             validated_items = []
             for item in items:
-                prod_id = item["product_id"]
-                qty = item["quantity"]
-                unit_price = item["unit_price_minor"]
-                prod_type = item["product_type_snapshot"]
+                prod_id = _validate_int(item.get("product_id"), "Product id")
+                qty = _validate_int(item.get("quantity"), "Item quantity")
+                unit_price = _validate_int(item.get("unit_price_minor"), "Unit price")
+                prod_type = item.get("product_type_snapshot")
                 meta_json = item.get("metadata_json")
 
                 # Validate product exists and is approved for sale
@@ -835,17 +862,27 @@ class OrderRepository:
         expected_current_status: Optional[OrderStatus] = None,
     ) -> Order:
         """Transitions order status enforcing strict state machine transitions and audit logging."""
-        order = self.get_order(order_id)
-        current_status = expected_current_status if expected_current_status is not None else order.status
+        order_id = _validate_int(order_id, "order_id")
 
-        allowed_targets = ALLOWED_ORDER_TRANSITIONS.get(current_status, set())
-        if target_status not in allowed_targets:
-            raise InvalidStateTransitionError(
-                f"Cannot transition order {order_id} from {current_status.value} to {target_status.value}."
+        # Enforce transaction boundary ownership: caller cannot have uncommitted open transaction
+        if self.conn.in_transaction:
+            raise RuntimeError(
+                "Cannot execute transition_order_status: connection already has an active uncommitted transaction. "
+                "transition_order_status manages its own exclusive BEGIN IMMEDIATE transaction boundary."
             )
 
+        self.conn.execute("BEGIN IMMEDIATE;")
         cur = self.conn.cursor()
         try:
+            order = self.get_order(order_id)
+            current_status = expected_current_status if expected_current_status is not None else order.status
+
+            allowed_targets = ALLOWED_ORDER_TRANSITIONS.get(current_status, set())
+            if target_status not in allowed_targets:
+                raise InvalidStateTransitionError(
+                    f"Cannot transition order {order_id} from {current_status.value} to {target_status.value}."
+                )
+
             if target_status == OrderStatus.PAID:
                 cur.execute(
                     """
@@ -882,11 +919,11 @@ class OrderRepository:
             self.conn.commit()
             return self.get_order(order_id)
         except Exception:
-            if self.conn.in_transaction:
-                self.conn.rollback()
+            self.conn.rollback()
             raise
 
     def get_order(self, order_id: int) -> Order:
+        order_id = _validate_int(order_id, "order_id")
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
         row = cur.fetchone()
@@ -905,6 +942,7 @@ class OrderRepository:
         )
 
     def get_order_items(self, order_id: int) -> List[OrderItem]:
+        order_id = _validate_int(order_id, "order_id")
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC", (order_id,))
         return [
@@ -944,6 +982,9 @@ class ReceiptRepository:
         Canonicalizes provider_name, preserves binary receipt hashes, and scopes provider transaction IDs.
         Does NOT automatically mark the order as paid.
         """
+        order_id = _validate_int(order_id, "order_id")
+        user_id = _validate_int(user_id, "user_id")
+
         if not file_bytes:
             raise ValidationError("Receipt file cannot be empty.")
         if len(file_bytes) > self.MAX_RECEIPT_SIZE_BYTES:
@@ -1018,6 +1059,7 @@ class ReceiptRepository:
         review_status: ReceiptReviewStatus,
         reviewer_notes: Optional[str] = None,
     ) -> PaymentReceipt:
+        receipt_id = _validate_int(receipt_id, "receipt_id")
         cur = self.conn.cursor()
         cur.execute(
             """
@@ -1035,6 +1077,7 @@ class ReceiptRepository:
     review_receipt = update_review_status
 
     def get_receipt(self, receipt_id: int) -> PaymentReceipt:
+        receipt_id = _validate_int(receipt_id, "receipt_id")
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt_id,))
         row = cur.fetchone()

@@ -273,6 +273,75 @@ class TestInventoryManagement(unittest.TestCase):
             code = self.inv_repo.get_revealed_code(row["id"])
             self.assertEqual(row["fingerprint"], compute_fingerprint(code))
 
+    def test_strict_typing_inventory_repository(self):
+        """InventoryRepository methods must enforce strict typing."""
+        # 1. import_items(product_id, denomination_id)
+        for bad_id in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.inv_repo.import_items(
+                    product_id=bad_id,
+                    raw_codes=["CODE-1"],
+                    inventory_type=InventoryType.VOUCHER_CODE,
+                )
+
+        for bad_did in (True, False, 1.5, "1", 0, -1):
+            with self.assertRaises(ValidationError):
+                self.inv_repo.import_items(
+                    product_id=self.product.id,
+                    raw_codes=["CODE-1"],
+                    inventory_type=InventoryType.VOUCHER_CODE,
+                    denomination_id=bad_did,
+                )
+
+        # 2. reserve_items_for_order(order_id, product_id, quantity, denomination_id)
+        for bad_id in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.inv_repo.reserve_items_for_order(
+                    order_id=bad_id,
+                    product_id=self.product.id,
+                    quantity=1,
+                )
+
+        for bad_pid in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.inv_repo.reserve_items_for_order(
+                    order_id=1,
+                    product_id=bad_pid,
+                    quantity=1,
+                )
+
+        for bad_qty in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.inv_repo.reserve_items_for_order(
+                    order_id=1,
+                    product_id=self.product.id,
+                    quantity=bad_qty,
+                )
+
+        for bad_did in (True, False, 1.5, "1", 0, -1):
+            with self.assertRaises(ValidationError):
+                self.inv_repo.reserve_items_for_order(
+                    order_id=1,
+                    product_id=self.product.id,
+                    quantity=1,
+                    denomination_id=bad_did,
+                )
+
+        # 3. release_order_reservations(order_id)
+        for bad_id in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.inv_repo.release_order_reservations(bad_id)
+
+        # 4. finalize_order_sale(order_id)
+        for bad_id in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.inv_repo.finalize_order_sale(bad_id)
+
+        # 5. get_revealed_code(item_id)
+        for bad_id in (True, False, 1.5, "1", None, 0, -1):
+            with self.assertRaises(ValidationError):
+                self.inv_repo.get_revealed_code(bad_id)
+
 
 if __name__ == "__main__":
     unittest.main()

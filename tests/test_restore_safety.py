@@ -253,6 +253,14 @@ class TestRestoreSafetyRemediation(unittest.TestCase):
             self.assertIn("CRITICAL RESTORE FAILURE", str(cm.exception))
             self.assertIn("-wal", str(cm.exception))
 
+            # Safety backups must be preserved on critical rollback failure for manual recovery
+            retained_backups = list(self.live_db_path.parent.glob("*.orig_bak_*"))
+            self.assertGreater(len(retained_backups), 0)
+
+            # Clean up retained backups
+            for b in retained_backups:
+                b.unlink()
+
     def test_staging_copy_failure_cleans_up_partial_backups_and_preserves_target(self):
         """If staging copy fails, partial backup files are cleaned up and target remains intact."""
         import shutil
@@ -311,6 +319,30 @@ class TestRestoreSafetyRemediation(unittest.TestCase):
                 restore_database(self.backup_path, self.live_db_path)
 
             self.assertIn("WAL checkpoint was blocked or busy", str(cm.exception))
+
+    def test_incomplete_wal_checkpoint_aborts_restore(self):
+        """If wal_checkpoint returns (0, 5, 2) [busy=0, log=5, checkpointed=2], restore aborts with RuntimeError."""
+        real_connect = sqlite3.connect
+
+        class FakeCursor:
+            def fetchone(self):
+                return (0, 5, 2)  # busy=0, log=5, checkpointed=2
+
+        class FakeConn:
+            def __init__(self, *args, **kwargs):
+                self._conn = real_connect(*args, **kwargs)
+            def execute(self, sql, *args):
+                if "wal_checkpoint" in sql:
+                    return FakeCursor()
+                return self._conn.execute(sql, *args)
+            def close(self):
+                self._conn.close()
+
+        with patch("sqlite3.connect", side_effect=lambda *a, **kw: FakeConn(*a, **kw)):
+            with self.assertRaises(RuntimeError) as cm:
+                restore_database(self.backup_path, self.live_db_path)
+
+            self.assertIn("incomplete: only 2 of 5 frames were checkpointed", str(cm.exception))
 
 
 if __name__ == "__main__":

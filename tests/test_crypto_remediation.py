@@ -87,6 +87,67 @@ class TestCryptoRemediation(unittest.TestCase):
         with self.assertRaises(CryptoConfigurationError):
             get_fingerprint_pepper()
 
+    def test_conflicting_env_dev_and_app_env_staging_denies_fallback(self):
+        """ENV=dev, APP_ENV=staging must deny fallback because staging is forbidden."""
+        os.environ["ENV"] = "dev"
+        os.environ["APP_ENV"] = "staging"
+        os.environ["ALLOW_DEV_FALLBACK_KEY"] = "1"
+        os.environ.pop("INVENTORY_ENCRYPTION_KEY", None)
+        os.environ.pop("FINGERPRINT_PEPPER", None)
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_encryption_key()
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_fingerprint_pepper()
+
+    def test_conflicting_env_development_and_app_env_unknown_denies_fallback(self):
+        """ENV=development, APP_ENV=unknown must deny fallback because unknown is not allowed."""
+        os.environ["ENV"] = "development"
+        os.environ["APP_ENV"] = "unknown"
+        os.environ["ALLOW_DEV_FALLBACK_KEY"] = "1"
+        os.environ.pop("INVENTORY_ENCRYPTION_KEY", None)
+        os.environ.pop("FINGERPRINT_PEPPER", None)
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_encryption_key()
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_fingerprint_pepper()
+
+    def test_consistent_env_dev_and_app_env_test_allows_fallback(self):
+        """ENV=dev, APP_ENV=test allows fallback because both are allowed dev/test envs."""
+        os.environ["ENV"] = "dev"
+        os.environ["APP_ENV"] = "test"
+        os.environ.pop("INVENTORY_ENCRYPTION_KEY", None)
+        os.environ.pop("FINGERPRINT_PEPPER", None)
+
+        self.assertIsNotNone(get_encryption_key())
+        self.assertIsNotNone(get_fingerprint_pepper())
+
+    def test_only_env_dev_allows_fallback(self):
+        """Only ENV=dev with APP_ENV unset allows fallback."""
+        os.environ["ENV"] = "dev"
+        os.environ.pop("APP_ENV", None)
+        os.environ.pop("INVENTORY_ENCRYPTION_KEY", None)
+        os.environ.pop("FINGERPRINT_PEPPER", None)
+
+        self.assertIsNotNone(get_encryption_key())
+        self.assertIsNotNone(get_fingerprint_pepper())
+
+    def test_both_env_and_app_env_unset_denies_fallback(self):
+        """Both ENV and APP_ENV unset must unconditionally deny fallback."""
+        os.environ.pop("ENV", None)
+        os.environ.pop("APP_ENV", None)
+        os.environ.pop("INVENTORY_ENCRYPTION_KEY", None)
+        os.environ.pop("FINGERPRINT_PEPPER", None)
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_encryption_key()
+
+        with self.assertRaises(CryptoConfigurationError):
+            get_fingerprint_pepper()
+
     def test_unset_env_forbids_fallback_even_with_allow_dev_fallback_key(self):
         """Unset ENV and APP_ENV with ALLOW_DEV_FALLBACK_KEY=1 must forbid fallback."""
         os.environ.pop("ENV", None)
