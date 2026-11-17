@@ -1,5 +1,5 @@
 # 🎮 СЕРВИС ДЛЯ PS: ПОЛНЫЙ КОНТЕКСТ ПРОЕКТА (PROJECT CONTEXT)
-*Дата фиксации: Октябрь 2026 г. | Версия: 1.0 (Подготовка к Фазе 1)*
+*Дата актуализации: Ноябрь 2026 г. | Версия: 2.0 (Phase 1 + Phase 2 Security Gate Remediation)*
 
 ---
 
@@ -65,8 +65,11 @@
 ---
 
 ## 6. ТЕКУЩИЙ СТАТУС И СЛЕДУЮЩИЙ ШАГ
-* **Текущий этап:** **Фаза 1.1 успешно завершена и защищена.** Математический модуль Bounded Knapsack (`src/engine/knapsack.py`) реализован, закрыты все замечания ревизора Аргона (лимит `max_vouchers_per_order <= 6`, `max_allowed_overshoot_minor`, потолки PSN). 25 тестов пройдены со 100% успехом.
-* **Следующий шаг:** Передача отчета в ChatGPT (Product Commander), фиксация `PROJECT STATUS` и получение ТЗ на **Фазу 2: База данных SQLite, буферный склад и антифрод**.
+* **Текущий этап:** **Фаза 1 завершена; Фаза 2 (слой SQLite, миграции, шифрованный инвентарь, заказы, чеки и Security Gate Remediation) реализована и ожидает финального независимого аудита.**
+  - Реализованы: `src/engine/` (`knapsack.py`, `models.py`, `src/calculator.py`), `src/db/` (`connection.py`, `crypto.py`, `migrations.py`, `models.py`, `repositories.py`) и миграции `src/migrations/001_initial_schema.sql`, `002_provider_scoped_receipts.sql`.
+  - Внесены и протестированы доработки Security Gate Phase 2 (`f849bf1`, `507e522`, `c729cd6`, документация для аудита `eb64c96`).
+  - Полный набор из **107 тестов** (`python -m unittest discover -v tests`) проходит локально со статусом `OK` и подключён к GitHub Actions CI (`.github/workflows/ci.yml`). См. также [AUDIT_README.md](AUDIT_README.md).
+* **Следующий шаг:** Получение независимого вердикта **Security Gate Phase 2** (Аргон / ChatGPT) по актуальному состоянию репозитория и результатам CI. Переход к **Фазе 3** (Telegram-бот на `aiogram 3.x`, приём платежей и выдача товаров) строго заблокирован до получения явного вердикта `GO`.
 
 ---
 
