@@ -1,0 +1,8 @@
+# Core cryptographic dependency (Fernet AES-128-CBC + HMAC-SHA256)
+# Tested with cryptography==50.0.2 on Python 3.14.7
+cryptography>=41.0.0
+
+# Note: All Phase 1 (Knapsack Engine) and Phase 2 (SQLite DB, Migrations,
+# Repositories, Backup/Restore) modules use the Python standard library.
+# Phase 3+ dependencies (e.g., aiogram, FastAPI, Playwright) are not yet
+# integrated or installed in the current codebase.

@@ -16,4 +16,15 @@ PROJECT_FOR_CHATGPT.txt
 *.db-shm
 *.restore_tmp_*
 AUDIT_REPORT*.txt
+audit_report*.txt
 life-os/
+.env
+.env.*
+!.env.example
+*.patch
+*.orig_bak_*
+*.bak
+*.log
+*.pem
+*.key
+data/
