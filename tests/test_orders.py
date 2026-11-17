@@ -690,9 +690,12 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
 
         Covers both interleaved scenarios deterministically:
         - Scenario 1: create_order acquires BEGIN IMMEDIATE and actively HOLDS the transaction lock.
-          The second thread attempts to revoke approval while the lock is held (verified via lock probe).
-          Once create_order completes and commits, the revocation proceeds and succeeds.
-          Verified DB state: exactly 1 order, 1 order item, 0 orphan records.
+          While create_order() still holds the transaction (before commit), the second thread
+          starts the real SQL UPDATE that revokes approval (and blocks on SQLite write lock).
+          Only after the real SQL UPDATE has started while create_order() is uncommitted is
+          create_order() allowed to commit. After create_order() commits, the revocation UPDATE
+          acquires the lock and finishes cleanly.
+          Verified DB state: exactly 1 order, 1 order item, approval_status='DRAFT', 0 orphans.
         - Scenario 2: Revocation commits BEFORE create_order executes.
           create_order MUST fail specifically with ValidationError (unapproved supply method).
           'database is locked' is strictly forbidden from counting as a pass.
@@ -712,7 +715,7 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
             }
         ]
 
-        # --- SCENARIO 1: create_order holds write lock, concurrent thread attempts revocation ---
+        # --- SCENARIO 1: create_order holds write lock while real SQL UPDATE revocation starts ---
         # Ensure product is initially APPROVED
         setup_conn = create_connection(self.db_path)
         setup_conn.execute("UPDATE fixed_product_details SET approval_status = 'APPROVED' WHERE product_id = ?", (self.fixed_prod.id,))
@@ -721,20 +724,26 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
 
         sc1_events = {
             "in_transaction": threading.Event(),
+            "revoke_update_started": threading.Event(),
             "allow_commit": threading.Event(),
-            "lock_probed": threading.Event(),
+            "order_committed": threading.Event(),
         }
-        sc1_results = {"order_created": False, "revoke_ok": False, "lock_detected": False, "errors": []}
+        sc1_results = {
+            "order_created": False,
+            "revoke_ok": False,
+            "update_started_before_commit": False,
+            "update_completed_after_commit": False,
+            "errors": [],
+        }
 
         def sc1_worker_create():
             conn = create_connection(self.db_path, timeout_seconds=5.0)
 
             def trace_hook(stmt):
-                # When create_order starts inserting order items (after BEGIN IMMEDIATE and validation),
-                # signal that write lock is actively held and wait until revocation thread attempts write.
+                # When create_order starts inserting order items (after BEGIN IMMEDIATE and validation,
+                # before COMMIT), signal that write lock is actively held and wait until allow_commit.
                 if "INSERT INTO order_items" in stmt and not sc1_events["in_transaction"].is_set():
                     sc1_events["in_transaction"].set()
-                    # Hold the active write lock until the concurrent thread verifies the lock
                     if not sc1_events["allow_commit"].wait(timeout=5.0):
                         sc1_results["errors"].append("SC1 create: timed out waiting for allow_commit signal")
 
@@ -747,56 +756,65 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
                     currency="RUB",
                     items=items,
                 )
+                sc1_events["order_committed"].set()
                 sc1_results["order_created"] = True
             except Exception as e:
                 sc1_results["errors"].append(f"SC1 create_order error: {e}")
             finally:
+                conn.set_trace_callback(None)
                 conn.close()
 
         def sc1_worker_revoke():
-            # 1. Wait until create_order is holding the active IMMEDIATE transaction
-            if not sc1_events["in_transaction"].wait(timeout=5.0):
-                sc1_results["errors"].append("SC1 revoke: timed out waiting for in_transaction signal")
-                return
-
-            # 2. Probe the DB with zero timeout to deterministically prove the DB is actively locked by thread 1
-            probe_conn = create_connection(self.db_path, timeout_seconds=0.01)
-            try:
-                probe_conn.execute("BEGIN IMMEDIATE;")
-                probe_conn.commit()
-                sc1_results["errors"].append("SC1 revoke: DB was NOT locked during create_order transaction!")
-            except sqlite3.OperationalError as oe:
-                if "locked" in str(oe).lower():
-                    sc1_results["lock_detected"] = True
-                else:
-                    sc1_results["errors"].append(f"SC1 revoke probe: unexpected OperationalError: {oe}")
-            except Exception as e:
-                sc1_results["errors"].append(f"SC1 revoke probe: unexpected error: {e}")
-            finally:
-                probe_conn.close()
-
-            # Signal that lock contention was verified; create_order thread can now commit
-            sc1_events["lock_probed"].set()
-            sc1_events["allow_commit"].set()
-
-            # 3. Now perform the revocation with sufficient timeout (will wait for thread 1 lock release)
             conn = create_connection(self.db_path, timeout_seconds=5.0)
+
+            def revoke_trace(stmt):
+                # Fires when SQLite starts stepping the real UPDATE statement (before acquiring write lock)
+                if "UPDATE fixed_product_details" in stmt and not sc1_events["revoke_update_started"].is_set():
+                    sc1_results["update_started_before_commit"] = not sc1_events["order_committed"].is_set()
+                    sc1_events["revoke_update_started"].set()
+
+            conn.set_trace_callback(revoke_trace)
             try:
+                # 1. Wait until create_order is holding the active BEGIN IMMEDIATE transaction
+                if not sc1_events["in_transaction"].wait(timeout=5.0):
+                    sc1_results["errors"].append("SC1 revoke: timed out waiting for in_transaction signal")
+                    return
+
+                # 2. Execute the REAL SQL UPDATE revocation while create_order holds the write lock.
+                # This will trigger revoke_trace and then block in SQLite until create_order commits.
                 conn.execute(
                     "UPDATE fixed_product_details SET approval_status = 'DRAFT' WHERE product_id = ?",
                     (self.fixed_prod.id,),
                 )
+                sc1_results["update_completed_after_commit"] = sc1_events["order_committed"].is_set()
                 conn.commit()
                 sc1_results["revoke_ok"] = True
             except Exception as e:
                 sc1_results["errors"].append(f"SC1 revoke error: {e}")
             finally:
+                conn.set_trace_callback(None)
                 conn.close()
 
         t1 = threading.Thread(target=sc1_worker_create, name="SC1_CreateOrder")
         t2 = threading.Thread(target=sc1_worker_revoke, name="SC1_RevokeApproval")
         t1.start()
         t2.start()
+
+        # Wait until the real SQL UPDATE revocation has actually started while create_order holds the lock
+        self.assertTrue(
+            sc1_events["revoke_update_started"].wait(timeout=5.0),
+            "Scenario 1: real SQL UPDATE revocation did not start in time",
+        )
+        # Briefly yield so the revocation thread deterministically enters SQLite busy wait on the held lock
+        time.sleep(0.05)
+        self.assertEqual(sc1_results["errors"], [], f"Scenario 1 errors before commit: {sc1_results['errors']}")
+        self.assertFalse(sc1_events["order_committed"].is_set(), "Scenario 1: create_order committed prematurely")
+        self.assertFalse(sc1_results["revoke_ok"], "Scenario 1: revoke completed before create_order committed")
+        self.assertTrue(t2.is_alive(), "Scenario 1: revoke thread should be blocked waiting on create_order lock")
+
+        # Only after the real SQL UPDATE has started (and is waiting on the lock), allow create_order to commit
+        sc1_events["allow_commit"].set()
+
         t1.join(timeout=10.0)
         t2.join(timeout=10.0)
 
@@ -805,7 +823,8 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         self.assertFalse(t2.is_alive(), "Scenario 1: revoke thread hung or timed out")
 
         self.assertEqual(sc1_results["errors"], [], f"Scenario 1 encountered unexpected errors: {sc1_results['errors']}")
-        self.assertTrue(sc1_results["lock_detected"], "Scenario 1: concurrent write attempt must detect active lock during create_order")
+        self.assertTrue(sc1_results["update_started_before_commit"], "Scenario 1: real SQL UPDATE must start before create_order commits")
+        self.assertTrue(sc1_results["update_completed_after_commit"], "Scenario 1: real SQL UPDATE must wait until create_order commits")
         self.assertTrue(sc1_results["order_created"], "Scenario 1: order should be successfully created")
         self.assertTrue(sc1_results["revoke_ok"], "Scenario 1: revocation should succeed after order creation commits")
 
