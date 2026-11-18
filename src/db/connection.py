@@ -73,23 +73,42 @@ def get_connection_context(
         conn.close()
 
 
+_VALID_TRANSACTION_MODES = {"DEFERRED", "IMMEDIATE", "EXCLUSIVE"}
+
+
 @contextmanager
 def transaction(conn: sqlite3.Connection, mode: str = "IMMEDIATE") -> Generator[sqlite3.Connection, None, None]:
-    """Context manager for SQLite transactions with explicit locking modes.
+    """Context manager for SQLite transactions with explicit locking modes and strict boundary ownership.
 
     Using mode='IMMEDIATE' acquires a write lock at the start of the transaction,
     preventing concurrent threads/processes from conflicting during two-step checks.
+
+    Enforces exclusive transaction ownership: refuses to start if `conn.in_transaction`
+    is already True so caller-owned transactions are never committed or rolled back.
 
     Args:
         conn: The sqlite3.Connection to manage.
         mode: SQLite transaction mode ('DEFERRED', 'IMMEDIATE', 'EXCLUSIVE').
     """
-    conn.execute(f"BEGIN {mode}")
+    norm_mode = mode.strip().upper() if isinstance(mode, str) else ""
+    if norm_mode not in _VALID_TRANSACTION_MODES:
+        raise ValueError(f"Invalid SQLite transaction mode: {mode!r}")
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Cannot start managed transaction: connection already has an active uncommitted transaction."
+        )
+
+    conn.execute(f"BEGIN {norm_mode};")
     try:
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        if conn.in_transaction:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
         raise
 
 

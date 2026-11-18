@@ -64,9 +64,12 @@ class TestDatabaseSchemaAndMigrations(unittest.TestCase):
         from pathlib import Path
         mig_temp_dir = tempfile.TemporaryDirectory()
         try:
+            # Apply production migrations first, then create next unapplied version as faulty
+            run_migrations(self.conn)
+            next_version = max(get_applied_migrations(self.conn)) + 1
+
             mig_path = Path(mig_temp_dir.name)
-            # Create a multi-statement migration where the last statement is deliberately invalid
-            bad_migration_file = mig_path / "003_failing_migration.sql"
+            bad_migration_file = mig_path / f"{next_version:03d}_failing_migration.sql"
             with open(bad_migration_file, "w", encoding="utf-8") as f:
                 f.write(
                     "CREATE TABLE atomic_canary_tbl (id INTEGER PRIMARY KEY);\n"
@@ -74,20 +77,18 @@ class TestDatabaseSchemaAndMigrations(unittest.TestCase):
                     "CRATE TABEL broken_syntax_error (id INTEGER);\n"
                 )
 
-            # Apply migrations pointing to the temp dir
-            run_migrations(self.conn) # apply 001 and 002 first
             with self.assertRaises(RuntimeError) as cm:
                 run_migrations(self.conn, migrations_dir=mig_path)
 
-            self.assertIn("Migration 3_failing_migration failed", str(cm.exception))
+            self.assertIn(f"Migration {next_version}_failing_migration failed", str(cm.exception))
 
             # Verify atomic rollback: atomic_canary_tbl must NOT exist!
             cur = self.conn.cursor()
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='atomic_canary_tbl'")
             self.assertIsNone(cur.fetchone())
 
-            # Verify version 3 was NOT recorded in schema_migrations
-            cur.execute("SELECT version FROM schema_migrations WHERE version = 3")
+            # Verify next_version was NOT recorded in schema_migrations
+            cur.execute("SELECT version FROM schema_migrations WHERE version = ?", (next_version,))
             self.assertIsNone(cur.fetchone())
         finally:
             mig_temp_dir.cleanup()

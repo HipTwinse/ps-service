@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from src.db.connection import transaction
 from src.db.crypto import (
     canonicalize_code,
     compute_fingerprint,
@@ -15,6 +16,10 @@ from src.db.crypto import (
 )
 from src.db.models import (
     ALLOWED_ORDER_TRANSITIONS,
+    FINALIZABLE_ORDER_STATUSES,
+    RELEASABLE_ORDER_STATUSES,
+    RESERVABLE_ORDER_STATUSES,
+    REVEALABLE_ORDER_STATUSES,
     ApprovalStatus,
     ConflictError,
     DeliveryMethod,
@@ -39,6 +44,7 @@ from src.db.models import (
     ValidationError,
     VoucherDenomination,
     VoucherDetails,
+    validate_inventory_type_for_product,
 )
 
 
@@ -84,23 +90,23 @@ class CatalogRepository:
         if not display_name or not display_name.strip():
             raise ValidationError("display_name cannot be empty.")
 
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO products (product_type, display_name, status)
-            VALUES (?, ?, ?)
-            """,
-            (ProductType.VOUCHER.value, display_name.strip(), status.value),
-        )
-        product_id = cur.lastrowid
-        cur.execute(
-            """
-            INSERT INTO voucher_details (product_id, region, currency)
-            VALUES (?, ?, ?)
-            """,
-            (product_id, region.strip().upper(), currency.strip().upper()),
-        )
-        self.conn.commit()
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO products (product_type, display_name, status)
+                VALUES (?, ?, ?)
+                """,
+                (ProductType.VOUCHER.value, display_name.strip(), status.value),
+            )
+            product_id = cur.lastrowid
+            cur.execute(
+                """
+                INSERT INTO voucher_details (product_id, region, currency)
+                VALUES (?, ?, ?)
+                """,
+                (product_id, region.strip().upper(), currency.strip().upper()),
+            )
         return self.get_product(product_id)
 
     def add_voucher_denomination(
@@ -118,29 +124,29 @@ class CatalogRepository:
         if type(is_active) is not bool:
             raise ValidationError(f"is_active must be a boolean (got {type(is_active).__name__}: {is_active!r}).")
 
-        product = self.get_product(product_id)
-        if product.product_type != ProductType.VOUCHER:
-            raise ValidationError(f"Product {product_id} is not of type VOUCHER.")
-
-        cur = self.conn.cursor()
         try:
-            cur.execute(
-                """
-                INSERT INTO voucher_denominations (
-                    product_id, region, currency, face_value_minor, cost_rub_kopecks, is_active
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    product_id,
-                    region.strip().upper(),
-                    currency.strip().upper(),
-                    face_value_minor,
-                    cost_rub_kopecks,
-                    1 if is_active else 0,
-                ),
-            )
-            denom_id = cur.lastrowid
-            self.conn.commit()
+            with transaction(self.conn, mode="IMMEDIATE"):
+                product = self.get_product(product_id)
+                if product.product_type != ProductType.VOUCHER:
+                    raise ValidationError(f"Product {product_id} is not of type VOUCHER.")
+
+                cur = self.conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO voucher_denominations (
+                        product_id, region, currency, face_value_minor, cost_rub_kopecks, is_active
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        product_id,
+                        region.strip().upper(),
+                        currency.strip().upper(),
+                        face_value_minor,
+                        cost_rub_kopecks,
+                        1 if is_active else 0,
+                    ),
+                )
+                denom_id = cur.lastrowid
             return self.get_denomination(denom_id)
         except sqlite3.IntegrityError as e:
             raise ConflictError(
@@ -165,31 +171,31 @@ class CatalogRepository:
                 "Cannot create active FIXED_PRODUCT without approved supply method (approval_status must be APPROVED)."
             )
 
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO products (product_type, display_name, status)
-            VALUES (?, ?, ?)
-            """,
-            (ProductType.FIXED_PRODUCT.value, display_name, status.value),
-        )
-        product_id = cur.lastrowid
-        cur.execute(
-            """
-            INSERT INTO fixed_product_details (
-                product_id, price_rub_kopecks, delivery_method, supply_method, approval_status, duration_days
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                product_id,
-                price_rub_kopecks,
-                delivery_method.value,
-                supply_method,
-                approval_status.value,
-                duration_days,
-            ),
-        )
-        self.conn.commit()
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO products (product_type, display_name, status)
+                VALUES (?, ?, ?)
+                """,
+                (ProductType.FIXED_PRODUCT.value, display_name, status.value),
+            )
+            product_id = cur.lastrowid
+            cur.execute(
+                """
+                INSERT INTO fixed_product_details (
+                    product_id, price_rub_kopecks, delivery_method, supply_method, approval_status, duration_days
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    product_id,
+                    price_rub_kopecks,
+                    delivery_method.value,
+                    supply_method,
+                    approval_status.value,
+                    duration_days,
+                ),
+            )
         return self.get_product(product_id)
 
     def get_product(self, product_id: int) -> Product:
@@ -254,74 +260,74 @@ class CatalogRepository:
 
     def update_product_status(self, product_id: int, new_status: ProductStatus) -> None:
         product_id = _validate_int(product_id, "product_id")
-        # Check approval before activating fixed-price products
-        product = self.get_product(product_id)
-        if product.product_type == ProductType.FIXED_PRODUCT and new_status == ProductStatus.APPROVED:
-            cur = self.conn.cursor()
-            cur.execute("SELECT approval_status FROM fixed_product_details WHERE product_id = ?", (product_id,))
-            row = cur.fetchone()
-            if not row or row["approval_status"] != ApprovalStatus.APPROVED.value:
-                raise ValidationError("Cannot activate fixed-price product without approved supply method.")
+        with transaction(self.conn, mode="IMMEDIATE"):
+            # Check approval before activating fixed-price products
+            product = self.get_product(product_id)
+            if product.product_type == ProductType.FIXED_PRODUCT and new_status == ProductStatus.APPROVED:
+                cur = self.conn.cursor()
+                cur.execute("SELECT approval_status FROM fixed_product_details WHERE product_id = ?", (product_id,))
+                row = cur.fetchone()
+                if not row or row["approval_status"] != ApprovalStatus.APPROVED.value:
+                    raise ValidationError("Cannot activate fixed-price product without approved supply method.")
 
-        self.conn.execute(
-            "UPDATE products SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (new_status.value, product_id),
-        )
-        self.conn.commit()
+            self.conn.execute(
+                "UPDATE products SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_status.value, product_id),
+            )
 
     def update_fixed_product_approval(
         self, product_id: int, approval_status: ApprovalStatus
     ) -> None:
         product_id = _validate_int(product_id, "product_id")
-        self.conn.execute(
-            """
-            UPDATE fixed_product_details
-            SET approval_status = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE product_id = ?
-            """,
-            (approval_status.value, product_id),
-        )
-        # If approval is revoked, ensure product status is demoted to DRAFT
-        if approval_status != ApprovalStatus.APPROVED:
+        with transaction(self.conn, mode="IMMEDIATE"):
             self.conn.execute(
-                "UPDATE products SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?",
-                (ProductStatus.DRAFT.value, product_id, ProductStatus.APPROVED.value),
+                """
+                UPDATE fixed_product_details
+                SET approval_status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE product_id = ?
+                """,
+                (approval_status.value, product_id),
             )
-        self.conn.commit()
+            # If approval is revoked, ensure product status is demoted to DRAFT
+            if approval_status != ApprovalStatus.APPROVED:
+                self.conn.execute(
+                    "UPDATE products SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?",
+                    (ProductStatus.DRAFT.value, product_id, ProductStatus.APPROVED.value),
+                )
 
     def update_fixed_product_supply_method(
         self, product_id: int, new_supply_method: str
     ) -> None:
-        product_id = _validate_int(product_id, "product_id")
         """Updates the supply method of a fixed product.
 
         SECURITY INVARIANT:
         Modifying the supply method immediately revokes any previous approval.
         Resets approval_status to DRAFT and resets products.status to DRAFT.
         """
+        product_id = _validate_int(product_id, "product_id")
         if not new_supply_method or not new_supply_method.strip():
             raise ValidationError("supply_method cannot be empty.")
 
-        cur = self.conn.cursor()
-        cur.execute("SELECT product_id FROM fixed_product_details WHERE product_id = ?", (product_id,))
-        if not cur.fetchone():
-            raise NotFoundError(f"Fixed product {product_id} not found.")
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
+            cur.execute("SELECT product_id FROM fixed_product_details WHERE product_id = ?", (product_id,))
+            if not cur.fetchone():
+                raise NotFoundError(f"Fixed product {product_id} not found.")
 
-        # Update supply method and demote approval to DRAFT
-        cur.execute(
-            """
-            UPDATE fixed_product_details
-            SET supply_method = ?, approval_status = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE product_id = ?
-            """,
-            (new_supply_method.strip(), ApprovalStatus.DRAFT.value, product_id),
-        )
-        # Demote product status to DRAFT so it cannot be sold without re-approval
-        cur.execute(
-            "UPDATE products SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (ProductStatus.DRAFT.value, product_id),
-        )
-        self.conn.commit()
+            # Update supply method and demote approval to DRAFT
+            cur.execute(
+                """
+                UPDATE fixed_product_details
+                SET supply_method = ?, approval_status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE product_id = ?
+                """,
+                (new_supply_method.strip(), ApprovalStatus.DRAFT.value, product_id),
+            )
+            # Demote product status to DRAFT so it cannot be sold without re-approval
+            cur.execute(
+                "UPDATE products SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (ProductStatus.DRAFT.value, product_id),
+            )
 
 
 class UserRepository:
@@ -334,45 +340,44 @@ class UserRepository:
         if not external_id or not external_id.strip():
             raise ValidationError("external_id cannot be empty.")
 
-        cur = self.conn.cursor()
-        cur.execute("SELECT * FROM users WHERE external_id = ?", (external_id.strip(),))
-        row = cur.fetchone()
-        if row:
-            # Update username if changed
-            if username and row["username"] != username:
-                cur.execute(
-                    "UPDATE users SET username = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (username, row["id"]),
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM users WHERE external_id = ?", (external_id.strip(),))
+            row = cur.fetchone()
+            if row:
+                # Update username if changed
+                if username and row["username"] != username:
+                    cur.execute(
+                        "UPDATE users SET username = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (username, row["id"]),
+                    )
+                user = User(
+                    id=row["id"],
+                    external_id=row["external_id"],
+                    username=username if username else row["username"],
+                    status=UserStatus(row["status"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                 )
-            user = User(
-                id=row["id"],
-                external_id=row["external_id"],
-                username=username if username else row["username"],
-                status=UserStatus(row["status"]),
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-            )
-            self.conn.commit()
-            return user, False
+                return user, False
 
-        # Create fresh user
-        cur.execute(
-            "INSERT INTO users (external_id, username, status) VALUES (?, ?, ?)",
-            (external_id.strip(), username, UserStatus.ACTIVE.value),
-        )
-        user_id = cur.lastrowid
-        cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        new_row = cur.fetchone()
-        user = User(
-            id=new_row["id"],
-            external_id=new_row["external_id"],
-            username=new_row["username"],
-            status=UserStatus(new_row["status"]),
-            created_at=new_row["created_at"],
-            updated_at=new_row["updated_at"],
-        )
-        self.conn.commit()
-        return user, True
+            # Create fresh user
+            cur.execute(
+                "INSERT INTO users (external_id, username, status) VALUES (?, ?, ?)",
+                (external_id.strip(), username, UserStatus.ACTIVE.value),
+            )
+            user_id = cur.lastrowid
+            cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+            new_row = cur.fetchone()
+            user = User(
+                id=new_row["id"],
+                external_id=new_row["external_id"],
+                username=new_row["username"],
+                status=UserStatus(new_row["status"]),
+                created_at=new_row["created_at"],
+                updated_at=new_row["updated_at"],
+            )
+            return user, True
 
     def get_user(self, user_id: int) -> User:
         user_id = _validate_int(user_id, "user_id")
@@ -392,11 +397,11 @@ class UserRepository:
 
     def update_user_status(self, user_id: int, status: UserStatus) -> None:
         user_id = _validate_int(user_id, "user_id")
-        self.conn.execute(
-            "UPDATE users SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (status.value, user_id),
-        )
-        self.conn.commit()
+        with transaction(self.conn, mode="IMMEDIATE"):
+            self.conn.execute(
+                "UPDATE users SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status.value, user_id),
+            )
 
 
 class InventoryRepository:
@@ -412,76 +417,105 @@ class InventoryRepository:
         inventory_type: InventoryType,
         denomination_id: Optional[int] = None,
     ) -> Dict[str, int]:
-        """Safely imports a batch of inventory codes.
+        """Safely imports a batch of inventory codes atomically.
 
-        Canonicalizes codes, encrypts sensitive payloads, computes unique fingerprints,
-        and rejects duplicates. Does NOT log any plaintext codes.
+        Canonicalizes codes, enforces ProductType <-> InventoryType compatibility matrix,
+        verifies denomination ownership (denomination.product_id == product_id),
+        encrypts sensitive payloads, computes unique fingerprints, and rejects duplicates.
+        Any validation or runtime failure rolls back the entire batch (no partial imports).
+        Does NOT log any plaintext codes.
         """
         product_id = _validate_int(product_id, "product_id")
         if denomination_id is not None:
             denomination_id = _validate_int(denomination_id, "denomination_id")
+        if not isinstance(inventory_type, InventoryType):
+            raise ValidationError(f"Invalid inventory_type: {inventory_type!r}")
 
-        cur = self.conn.cursor()
-        cur.execute("SELECT id FROM products WHERE id = ?", (product_id,))
-        if not cur.fetchone():
-            raise NotFoundError(f"Product {product_id} not found.")
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
+            cur.execute("SELECT id, product_type FROM products WHERE id = ?", (product_id,))
+            prod_row = cur.fetchone()
+            if not prod_row:
+                raise NotFoundError(f"Product {product_id} not found.")
 
-        if denomination_id is not None:
-            cur.execute("SELECT id FROM voucher_denominations WHERE id = ?", (denomination_id,))
-            if not cur.fetchone():
-                raise NotFoundError(f"Voucher denomination {denomination_id} not found.")
+            product_type = ProductType(prod_row["product_type"])
+            validate_inventory_type_for_product(product_type, inventory_type)
 
-        accepted = 0
-        duplicates = 0
-        rejected = 0
-
-        for raw_code in raw_codes:
-            code_str = canonicalize_code(raw_code)
-            if not code_str:
-                rejected += 1
-                continue
-
-            fp = compute_fingerprint(code_str)
-            legacy_fp = hashlib.sha256(code_str.encode("utf-8")).hexdigest()
-
-            # Check both modern HMAC fingerprint and legacy SHA-256 fingerprint
-            cur.execute(
-                "SELECT id, fingerprint FROM inventory_items WHERE fingerprint = ? OR fingerprint = ?",
-                (fp, legacy_fp),
-            )
-            existing_row = cur.fetchone()
-            if existing_row:
-                duplicates += 1
-                # Auto-upgrade legacy fingerprint to HMAC if needed
-                if existing_row["fingerprint"] == legacy_fp and fp != legacy_fp:
-                    cur.execute(
-                        "UPDATE inventory_items SET fingerprint = ? WHERE id = ?",
-                        (fp, existing_row["id"]),
-                    )
-                continue
-
-            encrypted = encrypt_payload(code_str)
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO inventory_items (
-                        product_id, denomination_id, inventory_type, encrypted_payload, fingerprint, status
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        product_id,
-                        denomination_id,
-                        inventory_type.value,
-                        encrypted,
-                        fp,
-                        InventoryStatus.AVAILABLE.value,
-                    ),
+            if product_type == ProductType.VOUCHER and denomination_id is None:
+                raise ValidationError(
+                    f"Voucher product {product_id} requires a valid denomination_id."
                 )
-                accepted += 1
-            except sqlite3.IntegrityError:
-                duplicates += 1
 
-        self.conn.commit()
+            if denomination_id is not None:
+                if product_type != ProductType.VOUCHER:
+                    raise ValidationError(
+                        f"denomination_id cannot be specified for product {product_id} of type '{product_type.value}'."
+                    )
+                cur.execute(
+                    "SELECT id, product_id FROM voucher_denominations WHERE id = ?",
+                    (denomination_id,),
+                )
+                denom_row = cur.fetchone()
+                if not denom_row:
+                    raise NotFoundError(f"Voucher denomination {denomination_id} not found.")
+                if denom_row["product_id"] != product_id:
+                    raise ValidationError(
+                        f"Voucher denomination {denomination_id} does not belong to product {product_id}."
+                    )
+
+            accepted = 0
+            duplicates = 0
+            rejected = 0
+
+            for raw_code in raw_codes:
+                code_str = canonicalize_code(raw_code)
+                if not code_str:
+                    rejected += 1
+                    continue
+
+                fp = compute_fingerprint(code_str)
+                legacy_fp = hashlib.sha256(code_str.encode("utf-8")).hexdigest()
+
+                # Check both modern HMAC fingerprint and legacy SHA-256 fingerprint
+                cur.execute(
+                    "SELECT id, fingerprint FROM inventory_items WHERE fingerprint = ? OR fingerprint = ?",
+                    (fp, legacy_fp),
+                )
+                existing_row = cur.fetchone()
+                if existing_row:
+                    duplicates += 1
+                    # Auto-upgrade legacy fingerprint to HMAC if needed
+                    if existing_row["fingerprint"] == legacy_fp and fp != legacy_fp:
+                        cur.execute(
+                            "UPDATE inventory_items SET fingerprint = ? WHERE id = ?",
+                            (fp, existing_row["id"]),
+                        )
+                    continue
+
+                encrypted = encrypt_payload(code_str)
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO inventory_items (
+                            product_id, denomination_id, inventory_type, encrypted_payload, fingerprint, status
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            product_id,
+                            denomination_id,
+                            inventory_type.value,
+                            encrypted,
+                            fp,
+                            InventoryStatus.AVAILABLE.value,
+                        ),
+                    )
+                    accepted += 1
+                except sqlite3.IntegrityError as e:
+                    if "fingerprint" in str(e).lower():
+                        duplicates += 1
+                    else:
+                        raise
+
         return {
             "accepted": accepted,
             "duplicates": duplicates,
@@ -494,16 +528,8 @@ class InventoryRepository:
 
         Canonicalizes raw codes, preserves all encrypted payloads, keeps records intact, and executes atomically.
         """
-        if self.conn.in_transaction:
-            raise RuntimeError(
-                "Cannot execute migrate_legacy_fingerprints: connection already has an active uncommitted transaction. "
-                "This method requires its own exclusive IMMEDIATE transaction boundary."
-            )
-
-        self.conn.execute("BEGIN IMMEDIATE;")
-
-        cur = self.conn.cursor()
-        try:
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
             cur.execute("SELECT id, encrypted_payload, fingerprint FROM inventory_items")
             rows = cur.fetchall()
             upgraded = 0
@@ -518,11 +544,7 @@ class InventoryRepository:
                         (new_hmac, row["id"]),
                     )
                     upgraded += 1
-            self.conn.commit()
             return upgraded
-        except Exception:
-            self.conn.rollback()
-            raise
 
     def rotate_fingerprint_pepper(self, new_pepper: bytes, old_pepper: Optional[bytes] = None) -> int:
         """Rotates inventory HMAC fingerprints when FINGERPRINT_PEPPER is rotated.
@@ -572,16 +594,8 @@ class InventoryRepository:
         if not new_pepper or not isinstance(new_pepper, bytes):
             raise ValueError("new_pepper must be non-empty bytes.")
 
-        if self.conn.in_transaction:
-            raise RuntimeError(
-                "Cannot execute rotate_fingerprint_pepper: connection already has an active uncommitted transaction. "
-                "This method requires its own exclusive IMMEDIATE transaction boundary."
-            )
-
-        self.conn.execute("BEGIN IMMEDIATE;")
-
-        cur = self.conn.cursor()
-        try:
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
             cur.execute("SELECT id, encrypted_payload, fingerprint FROM inventory_items")
             rows = cur.fetchall()
             rotated = 0
@@ -595,11 +609,7 @@ class InventoryRepository:
                         (new_hmac, row["id"]),
                     )
                     rotated += 1
-            self.conn.commit()
             return rotated
-        except Exception:
-            self.conn.rollback()
-            raise
 
     def reserve_items_for_order(
         self,
@@ -608,9 +618,10 @@ class InventoryRepository:
         quantity: int,
         denomination_id: Optional[int] = None,
     ) -> List[int]:
-        """Atomically reserves available inventory units for an order.
+        """Atomically reserves available inventory units for an order within an exclusive transaction.
 
-        Uses conditional updates to guarantee concurrency safety.
+        Verifies order existence and allowable order status (RESERVABLE_ORDER_STATUSES),
+        validates product and denomination ownership, and rolls back completely if insufficient stock.
         """
         order_id = _validate_int(order_id, "order_id")
         product_id = _validate_int(product_id, "product_id")
@@ -618,107 +629,240 @@ class InventoryRepository:
         if denomination_id is not None:
             denomination_id = _validate_int(denomination_id, "denomination_id")
 
-        cur = self.conn.cursor()
-        if denomination_id is not None:
-            cur.execute(
-                """
-                SELECT id FROM inventory_items
-                WHERE product_id = ? AND denomination_id = ? AND status = 'AVAILABLE'
-                ORDER BY id ASC LIMIT ?
-                """,
-                (product_id, denomination_id, quantity),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT id FROM inventory_items
-                WHERE product_id = ? AND status = 'AVAILABLE'
-                ORDER BY id ASC LIMIT ?
-                """,
-                (product_id, quantity),
-            )
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
+            cur.execute("SELECT id, status FROM orders WHERE id = ?", (order_id,))
+            order_row = cur.fetchone()
+            if not order_row:
+                raise NotFoundError(f"Order {order_id} not found.")
 
-        candidates = [row["id"] for row in cur.fetchall()]
-        if len(candidates) < quantity:
-            raise InsufficientInventoryError(
-                f"Requested {quantity} units for product {product_id}, but only {len(candidates)} available."
-            )
+            order_status = OrderStatus(order_row["status"])
+            if order_status not in RESERVABLE_ORDER_STATUSES:
+                raise InvalidStateTransitionError(
+                    f"Cannot reserve inventory for order {order_id} in status '{order_status.value}'."
+                )
 
-        reserved_ids: List[int] = []
-        for item_id in candidates:
+            cur.execute("SELECT id, product_type FROM products WHERE id = ?", (product_id,))
+            prod_row = cur.fetchone()
+            if not prod_row:
+                raise NotFoundError(f"Product {product_id} not found.")
+
+            product_type = ProductType(prod_row["product_type"])
+            if product_type == ProductType.VOUCHER and denomination_id is None:
+                raise ValidationError(
+                    f"Reserving inventory for VOUCHER product {product_id} requires a valid denomination_id."
+                )
+
+            if denomination_id is not None:
+                if product_type != ProductType.VOUCHER:
+                    raise ValidationError(
+                        f"denomination_id cannot be used with non-VOUCHER product {product_id}."
+                    )
+                cur.execute("SELECT id, product_id FROM voucher_denominations WHERE id = ?", (denomination_id,))
+                denom_row = cur.fetchone()
+                if not denom_row:
+                    raise NotFoundError(f"Voucher denomination {denomination_id} not found.")
+                if denom_row["product_id"] != product_id:
+                    raise ValidationError(
+                        f"Voucher denomination {denomination_id} does not belong to product {product_id}."
+                    )
+
+            if denomination_id is not None:
+                cur.execute(
+                    """
+                    SELECT id FROM inventory_items
+                    WHERE product_id = ? AND denomination_id = ? AND status = 'AVAILABLE'
+                    ORDER BY id ASC LIMIT ?
+                    """,
+                    (product_id, denomination_id, quantity),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id FROM inventory_items
+                    WHERE product_id = ? AND status = 'AVAILABLE'
+                    ORDER BY id ASC LIMIT ?
+                    """,
+                    (product_id, quantity),
+                )
+
+            candidates = [row["id"] for row in cur.fetchall()]
+            if len(candidates) < quantity:
+                raise InsufficientInventoryError(
+                    f"Requested {quantity} units for product {product_id}, but only {len(candidates)} available."
+                )
+
+            reserved_ids: List[int] = []
+            for item_id in candidates:
+                cur.execute(
+                    """
+                    UPDATE inventory_items
+                    SET status = 'RESERVED', reserved_order_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = 'AVAILABLE'
+                    """,
+                    (order_id, item_id),
+                )
+                if cur.rowcount == 1:
+                    reserved_ids.append(item_id)
+
+            if len(reserved_ids) < quantity:
+                raise InsufficientInventoryError(
+                    f"Concurrency conflict: requested {quantity} units, successfully locked {len(reserved_ids)}."
+                )
+
+            return reserved_ids
+
+    def release_order_reservations(self, order_id: int) -> int:
+        """Releases reserved inventory items back to AVAILABLE status when permitted by order status.
+
+        Invariants:
+        - Checks order exists and order.status is in RELEASABLE_ORDER_STATUSES
+          (PENDING_PAYMENT, PAYMENT_REVIEW, CANCELLED, REFUND_REVIEW).
+        - NEVER reverts SOLD items to AVAILABLE.
+        - NEVER modifies reservations belonging to any other order.
+        """
+        order_id = _validate_int(order_id, "order_id")
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
+            cur.execute("SELECT id, status FROM orders WHERE id = ?", (order_id,))
+            order_row = cur.fetchone()
+            if not order_row:
+                raise NotFoundError(f"Order {order_id} not found.")
+
+            order_status = OrderStatus(order_row["status"])
+            if order_status not in RELEASABLE_ORDER_STATUSES:
+                raise InvalidStateTransitionError(
+                    f"Cannot release inventory reservations for order {order_id} in status '{order_status.value}'."
+                )
+
             cur.execute(
                 """
                 UPDATE inventory_items
-                SET status = 'RESERVED', reserved_order_id = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND status = 'AVAILABLE'
+                SET status = 'AVAILABLE', reserved_order_id = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE reserved_order_id = ? AND status = 'RESERVED'
                 """,
-                (order_id, item_id),
+                (order_id,),
             )
-            if cur.rowcount == 1:
-                reserved_ids.append(item_id)
-
-        if len(reserved_ids) < quantity:
-            if reserved_ids:
-                placeholders = ",".join("?" for _ in reserved_ids)
-                cur.execute(
-                    f"""
-                    UPDATE inventory_items
-                    SET status = 'AVAILABLE', reserved_order_id = NULL, updated_at = CURRENT_TIMESTAMP
-                    WHERE id IN ({placeholders})
-                    """,
-                    tuple(reserved_ids),
-                )
-                self.conn.commit()
-            raise InsufficientInventoryError(
-                f"Concurrency conflict: requested {quantity} units, successfully locked {len(reserved_ids)}."
-            )
-
-        self.conn.commit()
-        return reserved_ids
-
-    def release_order_reservations(self, order_id: int) -> int:
-        """Releases reserved inventory items back to AVAILABLE status if an order is cancelled or expires.
-
-        Invariant: NEVER reverts SOLD items to AVAILABLE.
-        """
-        order_id = _validate_int(order_id, "order_id")
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            UPDATE inventory_items
-            SET status = 'AVAILABLE', reserved_order_id = NULL, updated_at = CURRENT_TIMESTAMP
-            WHERE reserved_order_id = ? AND status = 'RESERVED'
-            """,
-            (order_id,),
-        )
-        count = cur.rowcount
-        self.conn.commit()
-        return count
+            return cur.rowcount
 
     def finalize_order_sale(self, order_id: int) -> int:
-        """Transitions reserved inventory items to permanently SOLD state upon successful order completion."""
+        """Transitions reserved inventory items to permanently SOLD state upon valid paid/fulfilling order status.
+
+        Invariants:
+        - Order must exist and be in FINALIZABLE_ORDER_STATUSES (PAID or FULFILLING).
+        - Never transitions already SOLD items or modifies another order's reservations.
+        - Rejects duplicate finalization if order items are already marked SOLD.
+        """
         order_id = _validate_int(order_id, "order_id")
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
+            cur.execute("SELECT id, status FROM orders WHERE id = ?", (order_id,))
+            order_row = cur.fetchone()
+            if not order_row:
+                raise NotFoundError(f"Order {order_id} not found.")
+
+            order_status = OrderStatus(order_row["status"])
+            if order_status not in FINALIZABLE_ORDER_STATUSES:
+                raise InvalidStateTransitionError(
+                    f"Cannot finalize inventory sale for order {order_id} in status '{order_status.value}'. "
+                    f"Order must be PAID or FULFILLING."
+                )
+
+            cur.execute(
+                """
+                UPDATE inventory_items
+                SET status = 'SOLD', updated_at = CURRENT_TIMESTAMP
+                WHERE reserved_order_id = ? AND status = 'RESERVED'
+                """,
+                (order_id,),
+            )
+            count = cur.rowcount
+            if count == 0:
+                cur.execute(
+                    "SELECT 1 FROM inventory_items WHERE reserved_order_id = ? AND status = 'SOLD' LIMIT 1",
+                    (order_id,),
+                )
+                if cur.fetchone():
+                    raise ConflictError(
+                        f"Inventory items for order {order_id} have already been finalized (SOLD)."
+                    )
+            return count
+
+    def get_revealed_code(
+        self,
+        item_id: int,
+        *,
+        expected_order_id: Optional[int] = None,
+        expected_user_id: Optional[int] = None,
+    ) -> str:
+        """Reveals the decrypted code for an inventory item (internal fulfillment primitive).
+
+        SECURITY NOTICE:
+        This repository method does NOT implement end-user RBAC or Telegram session
+        authentication. External/client-facing callers MUST NOT invoke this method
+        without upstream authentication and authorization checks (Phase 3).
+
+        Safety invariants enforced here:
+        - Rejects QUARANTINED and DISABLED items unconditionally.
+        - When `expected_order_id` or `expected_user_id` is provided (order fulfillment context),
+          reads inventory item and linked order in ONE atomic query (no WAL snapshot skew),
+          strictly requires item status == SOLD (already finalized via finalize_order_sale so it
+          cannot be reverted to AVAILABLE), item -> order binding, order -> user ownership,
+          and order status in (PAID, FULFILLING, COMPLETED).
+        """
+        item_id = _validate_int(item_id, "item_id")
+        if expected_order_id is not None:
+            expected_order_id = _validate_int(expected_order_id, "expected_order_id")
+        if expected_user_id is not None:
+            expected_user_id = _validate_int(expected_user_id, "expected_user_id")
+
         cur = self.conn.cursor()
         cur.execute(
             """
-            UPDATE inventory_items
-            SET status = 'SOLD', updated_at = CURRENT_TIMESTAMP
-            WHERE reserved_order_id = ? AND status = 'RESERVED'
+            SELECT
+                i.id,
+                i.status,
+                i.reserved_order_id,
+                i.encrypted_payload,
+                o.user_id AS order_user_id,
+                o.status AS order_status
+            FROM inventory_items i
+            LEFT JOIN orders o ON o.id = i.reserved_order_id
+            WHERE i.id = ?
             """,
-            (order_id,),
+            (item_id,),
         )
-        count = cur.rowcount
-        self.conn.commit()
-        return count
-
-    def get_revealed_code(self, item_id: int) -> str:
-        """Reveals the decrypted code for an inventory item (for authorized fulfillment only)."""
-        item_id = _validate_int(item_id, "item_id")
-        cur = self.conn.cursor()
-        cur.execute("SELECT encrypted_payload FROM inventory_items WHERE id = ?", (item_id,))
         row = cur.fetchone()
         if not row:
             raise NotFoundError(f"Inventory item {item_id} not found.")
+
+        item_status = InventoryStatus(row["status"])
+        if item_status in (InventoryStatus.QUARANTINED, InventoryStatus.DISABLED):
+            raise ValidationError(
+                f"Inventory item {item_id} is in '{item_status.value}' state and cannot be revealed."
+            )
+
+        if expected_order_id is not None or expected_user_id is not None:
+            linked_order_id = row["reserved_order_id"]
+            if linked_order_id is None:
+                raise ValidationError("Inventory item is not assigned to any order.")
+            if expected_order_id is not None and linked_order_id != expected_order_id:
+                raise ValidationError("Inventory item is not assigned to the specified order.")
+            if item_status != InventoryStatus.SOLD:
+                raise ValidationError(
+                    f"Inventory item must be SOLD before fulfillment reveal (current status: '{item_status.value}')."
+                )
+            if row["order_status"] is None or row["order_user_id"] is None:
+                raise NotFoundError(f"Order {linked_order_id} not found.")
+            if expected_user_id is not None and row["order_user_id"] != expected_user_id:
+                raise ValidationError("Order does not belong to the specified user.")
+
+            order_status = OrderStatus(row["order_status"])
+            if order_status not in REVEALABLE_ORDER_STATUSES:
+                raise InvalidStateTransitionError(
+                    f"Cannot reveal inventory code for order {linked_order_id} in status '{order_status.value}'."
+                )
+
         return decrypt_payload(row["encrypted_payload"])
 
 
@@ -772,17 +916,8 @@ class OrderRepository:
                 f"Order total_amount_minor ({total_amount_minor}) does not match sum of items ({computed_total})."
             )
 
-        # Enforce transaction boundary ownership: caller cannot have uncommitted open transaction
-        if self.conn.in_transaction:
-            raise RuntimeError(
-                "Cannot execute create_order: connection already has an active uncommitted transaction. "
-                "create_order manages its own exclusive BEGIN IMMEDIATE transaction boundary."
-            )
-
-        self.conn.execute("BEGIN IMMEDIATE;")
-
-        cur = self.conn.cursor()
-        try:
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
             # 1. Verify user exists and is not blocked
             cur.execute("SELECT id, status FROM users WHERE id = ?", (user_id,))
             user_row = cur.fetchone()
@@ -848,11 +983,7 @@ class OrderRepository:
                     (order_id, prod_id, prod_type, qty, unit_price, currency_norm, meta_json),
                 )
 
-            self.conn.commit()
-            return self.get_order(order_id)
-        except Exception:
-            self.conn.rollback()
-            raise
+        return self.get_order(order_id)
 
     def transition_order_status(
         self,
@@ -864,16 +995,8 @@ class OrderRepository:
         """Transitions order status enforcing strict state machine transitions and audit logging."""
         order_id = _validate_int(order_id, "order_id")
 
-        # Enforce transaction boundary ownership: caller cannot have uncommitted open transaction
-        if self.conn.in_transaction:
-            raise RuntimeError(
-                "Cannot execute transition_order_status: connection already has an active uncommitted transaction. "
-                "transition_order_status manages its own exclusive BEGIN IMMEDIATE transaction boundary."
-            )
-
-        self.conn.execute("BEGIN IMMEDIATE;")
-        cur = self.conn.cursor()
-        try:
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
             order = self.get_order(order_id)
             current_status = expected_current_status if expected_current_status is not None else order.status
 
@@ -916,11 +1039,8 @@ class OrderRepository:
                 """,
                 ("ORDER_STATUS_TRANSITION", "ORDER", order_id, details),
             )
-            self.conn.commit()
-            return self.get_order(order_id)
-        except Exception:
-            self.conn.rollback()
-            raise
+
+        return self.get_order(order_id)
 
     def get_order(self, order_id: int) -> Order:
         order_id = _validate_int(order_id, "order_id")
@@ -977,9 +1097,10 @@ class ReceiptRepository:
         provider_tx_id: Optional[str] = None,
         provider_name: str = "MANUAL",
     ) -> PaymentReceipt:
-        """Submits a receipt file with strict SHA-256 deduplication and provider-scoped tx deduplication.
+        """Submits a receipt file atomically with strict order ownership and deduplication checks.
 
-        Canonicalizes provider_name, preserves binary receipt hashes, and scopes provider transaction IDs.
+        Verifies order ownership (orders.user_id == user_id), canonicalizes provider_name,
+        enforces SHA-256 and (provider_name, provider_tx_id) deduplication.
         Does NOT automatically mark the order as paid.
         """
         order_id = _validate_int(order_id, "order_id")
@@ -996,62 +1117,69 @@ class ReceiptRepository:
         file_sha256 = compute_receipt_sha256(file_bytes)
         norm_tx_id = provider_tx_id.strip() if provider_tx_id and provider_tx_id.strip() else None
 
-        cur = self.conn.cursor()
-        # Verify order and user exist
-        cur.execute("SELECT id FROM orders WHERE id = ?", (order_id,))
-        if not cur.fetchone():
-            raise NotFoundError(f"Order {order_id} not found.")
-
-        cur.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        if not cur.fetchone():
-            raise NotFoundError(f"User {user_id} not found.")
-
-        # Check existing receipt hash
-        cur.execute("SELECT id, order_id FROM payment_receipts WHERE file_sha256 = ?", (file_sha256,))
-        existing = cur.fetchone()
-        if existing:
-            raise DuplicateReceiptError(
-                f"Duplicate receipt: exact file already uploaded for order {existing['order_id']}."
-            )
-
-        # Check provider transaction ID scoped to provider_name if present
-        if norm_tx_id:
-            cur.execute(
-                "SELECT id, order_id FROM payment_receipts WHERE provider_name = ? AND provider_tx_id = ?",
-                (norm_provider, norm_tx_id),
-            )
-            existing_tx = cur.fetchone()
-            if existing_tx:
-                raise DuplicateReceiptError(
-                    f"Duplicate payment identifier: provider '{norm_provider}' tx '{norm_tx_id}' already attached to order {existing_tx['order_id']}."
-                )
-
         try:
-            cur.execute(
-                """
-                INSERT INTO payment_receipts (
-                    order_id, user_id, file_sha256, file_size_bytes, provider_name, provider_tx_id, review_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    order_id,
-                    user_id,
-                    file_sha256,
-                    len(file_bytes),
-                    norm_provider,
-                    norm_tx_id,
-                    ReceiptReviewStatus.PENDING_REVIEW.value,
-                ),
-            )
-            receipt_id = cur.lastrowid
-            self.conn.commit()
+            with transaction(self.conn, mode="IMMEDIATE"):
+                cur = self.conn.cursor()
+                # 1. Verify user exists, order exists & belongs to user_id (without leaking existence/owner details),
+                # and order status permits receipt submission.
+                cur.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+                if not cur.fetchone():
+                    raise NotFoundError(f"User {user_id} not found.")
+
+                cur.execute("SELECT id, user_id, status FROM orders WHERE id = ?", (order_id,))
+                order_row = cur.fetchone()
+                if not order_row or order_row["user_id"] != user_id:
+                    raise ValidationError("Order does not exist or does not belong to the specified user.")
+
+                if order_row["status"] not in (
+                    OrderStatus.PENDING_PAYMENT.value,
+                    OrderStatus.PAYMENT_REVIEW.value,
+                ):
+                    raise InvalidStateTransitionError(
+                        f"Cannot submit receipt for order in status '{order_row['status']}'."
+                    )
+
+                # 2. Check existing receipt hash (without disclosing another order's ID)
+                cur.execute("SELECT id FROM payment_receipts WHERE file_sha256 = ?", (file_sha256,))
+                if cur.fetchone():
+                    raise DuplicateReceiptError(
+                        "Duplicate receipt: exact receipt file has already been uploaded."
+                    )
+
+                # 3. Check provider transaction ID scoped to provider_name (without disclosing other order ID)
+                if norm_tx_id:
+                    cur.execute(
+                        "SELECT id FROM payment_receipts WHERE provider_name = ? AND provider_tx_id = ?",
+                        (norm_provider, norm_tx_id),
+                    )
+                    if cur.fetchone():
+                        raise DuplicateReceiptError(
+                            f"Duplicate payment identifier: transaction for provider '{norm_provider}' has already been submitted."
+                        )
+
+                cur.execute(
+                    """
+                    INSERT INTO payment_receipts (
+                        order_id, user_id, file_sha256, file_size_bytes, provider_name, provider_tx_id, review_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        order_id,
+                        user_id,
+                        file_sha256,
+                        len(file_bytes),
+                        norm_provider,
+                        norm_tx_id,
+                        ReceiptReviewStatus.PENDING_REVIEW.value,
+                    ),
+                )
+                receipt_id = cur.lastrowid
+
             return self.get_receipt(receipt_id)
         except sqlite3.IntegrityError as e:
-            self.conn.rollback()
+            if "orders.user_id" in str(e):
+                raise ValidationError("Order does not belong to the specified user.") from e
             raise DuplicateReceiptError(f"Database constraint violation on receipt submission: {str(e)}") from e
-        except Exception:
-            self.conn.rollback()
-            raise
 
     def update_review_status(
         self,
@@ -1060,18 +1188,18 @@ class ReceiptRepository:
         reviewer_notes: Optional[str] = None,
     ) -> PaymentReceipt:
         receipt_id = _validate_int(receipt_id, "receipt_id")
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            UPDATE payment_receipts
-            SET review_status = ?, reviewer_notes = ?, reviewed_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (review_status.value, reviewer_notes, receipt_id),
-        )
-        if cur.rowcount == 0:
-            raise NotFoundError(f"Payment receipt {receipt_id} not found.")
-        self.conn.commit()
+        with transaction(self.conn, mode="IMMEDIATE"):
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                UPDATE payment_receipts
+                SET review_status = ?, reviewer_notes = ?, reviewed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (review_status.value, reviewer_notes, receipt_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError(f"Payment receipt {receipt_id} not found.")
         return self.get_receipt(receipt_id)
 
     review_receipt = update_review_status

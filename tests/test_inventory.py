@@ -14,6 +14,7 @@ from src.db.models import (
     InsufficientInventoryError,
     InventoryStatus,
     InventoryType,
+    OrderStatus,
     ProductStatus,
     UserStatus,
     ValidationError,
@@ -169,7 +170,7 @@ class TestInventoryManagement(unittest.TestCase):
             self.assertEqual(row["status"], "AVAILABLE")
             self.assertIsNone(row["reserved_order_id"])
 
-        # 4. Re-reserve and finalize sale
+        # 4. Re-reserve and finalize sale (order must be PAID or FULFILLING)
         reserved_again = self.inv_repo.reserve_items_for_order(
             order_id=order.id,
             product_id=self.product.id,
@@ -178,6 +179,9 @@ class TestInventoryManagement(unittest.TestCase):
         )
         self.assertEqual(len(reserved_again), 2)
 
+        self.order_repo.transition_order_status(order.id, OrderStatus.PAYMENT_REVIEW)
+        self.order_repo.transition_order_status(order.id, OrderStatus.PAID)
+
         finalized_count = self.inv_repo.finalize_order_sale(order.id)
         self.assertEqual(finalized_count, 2)
 
@@ -185,7 +189,9 @@ class TestInventoryManagement(unittest.TestCase):
         sold_statuses = [r["status"] for r in cur.fetchall()]
         self.assertEqual(sold_statuses, ["SOLD", "SOLD"])
 
-        # 5. Invariant check: Release must NEVER revert SOLD items to AVAILABLE
+        # 5. Invariant check: Release (even after refund/cancel transition) must NEVER revert SOLD items to AVAILABLE
+        self.order_repo.transition_order_status(order.id, OrderStatus.REFUND_REVIEW)
+        self.order_repo.transition_order_status(order.id, OrderStatus.CANCELLED)
         release_after_sold = self.inv_repo.release_order_reservations(order.id)
         self.assertEqual(release_after_sold, 0)
 

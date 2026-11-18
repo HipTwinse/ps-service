@@ -76,6 +76,35 @@ ALLOWED_ORDER_TRANSITIONS: Dict[OrderStatus, set[OrderStatus]] = {
     OrderStatus.REFUND_REVIEW: {OrderStatus.CANCELLED},
 }
 
+# Explicit compatibility matrix between ProductType and InventoryType
+ALLOWED_INVENTORY_TYPES_BY_PRODUCT_TYPE: Dict[ProductType, set[InventoryType]] = {
+    ProductType.VOUCHER: {InventoryType.VOUCHER_CODE},
+    ProductType.FIXED_PRODUCT: {InventoryType.FIXED_CODE, InventoryType.ACTIVATION_DATA},
+}
+
+# OrderStatus constraints for inventory operations
+RESERVABLE_ORDER_STATUSES: set[OrderStatus] = {
+    OrderStatus.PENDING_PAYMENT,
+    OrderStatus.PAYMENT_REVIEW,
+    OrderStatus.PAID,
+    OrderStatus.FULFILLING,
+}
+RELEASABLE_ORDER_STATUSES: set[OrderStatus] = {
+    OrderStatus.PENDING_PAYMENT,
+    OrderStatus.PAYMENT_REVIEW,
+    OrderStatus.CANCELLED,
+    OrderStatus.REFUND_REVIEW,
+}
+FINALIZABLE_ORDER_STATUSES: set[OrderStatus] = {
+    OrderStatus.PAID,
+    OrderStatus.FULFILLING,
+}
+REVEALABLE_ORDER_STATUSES: set[OrderStatus] = {
+    OrderStatus.PAID,
+    OrderStatus.FULFILLING,
+    OrderStatus.COMPLETED,
+}
+
 
 # Domain Exceptions
 class DatabaseError(Exception):
@@ -96,6 +125,25 @@ class ConflictError(DatabaseError):
 class ValidationError(DatabaseError):
     """Business rule or contract violation."""
     pass
+
+
+def validate_inventory_type_for_product(
+    product_type: ProductType,
+    inventory_type: InventoryType,
+) -> None:
+    """Validates that an InventoryType is permitted for a given ProductType."""
+    if not isinstance(product_type, ProductType):
+        raise ValidationError(f"Invalid product_type: {product_type!r}")
+    if not isinstance(inventory_type, InventoryType):
+        raise ValidationError(f"Invalid inventory_type: {inventory_type!r}")
+
+    allowed = ALLOWED_INVENTORY_TYPES_BY_PRODUCT_TYPE.get(product_type, set())
+    if inventory_type not in allowed:
+        allowed_str = ", ".join(sorted(t.value for t in allowed))
+        raise ValidationError(
+            f"Inventory type '{inventory_type.value}' is incompatible with product type '{product_type.value}'. "
+            f"Allowed inventory types: [{allowed_str}]."
+        )
 
 
 class InvalidStateTransitionError(DatabaseError):
