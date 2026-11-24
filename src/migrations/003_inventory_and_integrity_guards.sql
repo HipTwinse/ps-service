@@ -1,5 +1,67 @@
--- Migration 003: Enforce inventory type compatibility, denomination ownership, and receipt order ownership at DB level
+-- Migration 003: Validate existing rows and enforce inventory type compatibility, denomination ownership, and receipt order ownership at DB level
 
+-- 1. Pre-flight validation of existing rows (aborts atomically without modifying or deleting legacy data)
+CREATE TEMP TABLE _mig003_voucher_type_guard (
+    ok INTEGER NOT NULL CONSTRAINT chk_003_existing_voucher_inventory_type CHECK (ok = 1)
+);
+INSERT INTO _mig003_voucher_type_guard (ok)
+SELECT 0 FROM inventory_items i
+JOIN products p ON p.id = i.product_id
+WHERE p.product_type = 'VOUCHER' AND i.inventory_type != 'VOUCHER_CODE'
+LIMIT 1;
+DROP TABLE _mig003_voucher_type_guard;
+
+CREATE TEMP TABLE _mig003_fixed_type_guard (
+    ok INTEGER NOT NULL CONSTRAINT chk_003_existing_fixed_inventory_type CHECK (ok = 1)
+);
+INSERT INTO _mig003_fixed_type_guard (ok)
+SELECT 0 FROM inventory_items i
+JOIN products p ON p.id = i.product_id
+WHERE p.product_type = 'FIXED_PRODUCT' AND i.inventory_type NOT IN ('FIXED_CODE', 'ACTIVATION_DATA')
+LIMIT 1;
+DROP TABLE _mig003_fixed_type_guard;
+
+CREATE TEMP TABLE _mig003_voucher_denom_req_guard (
+    ok INTEGER NOT NULL CONSTRAINT chk_003_existing_voucher_missing_denomination CHECK (ok = 1)
+);
+INSERT INTO _mig003_voucher_denom_req_guard (ok)
+SELECT 0 FROM inventory_items i
+JOIN products p ON p.id = i.product_id
+WHERE p.product_type = 'VOUCHER' AND i.denomination_id IS NULL
+LIMIT 1;
+DROP TABLE _mig003_voucher_denom_req_guard;
+
+CREATE TEMP TABLE _mig003_non_voucher_denom_guard (
+    ok INTEGER NOT NULL CONSTRAINT chk_003_existing_non_voucher_has_denomination CHECK (ok = 1)
+);
+INSERT INTO _mig003_non_voucher_denom_guard (ok)
+SELECT 0 FROM inventory_items i
+JOIN products p ON p.id = i.product_id
+WHERE p.product_type != 'VOUCHER' AND i.denomination_id IS NOT NULL
+LIMIT 1;
+DROP TABLE _mig003_non_voucher_denom_guard;
+
+CREATE TEMP TABLE _mig003_denom_owner_guard (
+    ok INTEGER NOT NULL CONSTRAINT chk_003_existing_denomination_product_mismatch CHECK (ok = 1)
+);
+INSERT INTO _mig003_denom_owner_guard (ok)
+SELECT 0 FROM inventory_items i
+JOIN voucher_denominations vd ON vd.id = i.denomination_id
+WHERE i.denomination_id IS NOT NULL AND vd.product_id != i.product_id
+LIMIT 1;
+DROP TABLE _mig003_denom_owner_guard;
+
+CREATE TEMP TABLE _mig003_receipt_owner_guard (
+    ok INTEGER NOT NULL CONSTRAINT chk_003_existing_receipt_order_owner_mismatch CHECK (ok = 1)
+);
+INSERT INTO _mig003_receipt_owner_guard (ok)
+SELECT 0 FROM payment_receipts r
+JOIN orders o ON o.id = r.order_id
+WHERE o.user_id != r.user_id
+LIMIT 1;
+DROP TABLE _mig003_receipt_owner_guard;
+
+-- 2. Triggers enforcing invariants on future INSERT/UPDATE operations
 CREATE TRIGGER IF NOT EXISTS trg_inventory_items_validate_insert
 BEFORE INSERT ON inventory_items
 BEGIN
@@ -64,9 +126,10 @@ WHEN OLD.product_type != NEW.product_type
  AND (
      EXISTS (SELECT 1 FROM inventory_items WHERE product_id = NEW.id)
      OR EXISTS (SELECT 1 FROM voucher_denominations WHERE product_id = NEW.id)
+     OR EXISTS (SELECT 1 FROM order_items WHERE product_id = NEW.id)
  )
 BEGIN
-    SELECT RAISE(ABORT, 'Cannot change product_type while inventory_items or voucher_denominations reference product');
+    SELECT RAISE(ABORT, 'Cannot change product_type while inventory_items, voucher_denominations, or order_items reference product');
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_payment_receipts_validate_owner_insert

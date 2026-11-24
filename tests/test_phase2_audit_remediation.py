@@ -111,6 +111,7 @@ class TestPhase2AuditRemediation(unittest.TestCase):
             items=[
                 {
                     "product_id": self.voucher_a.id,
+                    "denomination_id": self.denom_a.id,
                     "product_type_snapshot": "VOUCHER",
                     "quantity": qty,
                     "unit_price_minor": 80000,
@@ -780,34 +781,51 @@ class TestPhase2AuditRemediation(unittest.TestCase):
                 "COMMIT;\n"
             )
 
-            # Seed existing valid catalog, inventory, order, and receipt data
+            # Seed existing valid catalog, inventory, fixed-product order (001 schema), and receipt data
             u_repo = UserRepository(c)
             cat_repo = CatalogRepository(c)
             inv_repo = InventoryRepository(c)
-            ord_repo = OrderRepository(c)
             rec_repo = ReceiptRepository(c)
 
             user, _ = u_repo.get_or_create_user("legacy_u1", "legacy_user")
             v_prod = cat_repo.create_voucher_product("Legacy PSN", "TR", "TRY", ProductStatus.APPROVED)
             denom = cat_repo.add_voucher_denomination(v_prod.id, "TR", "TRY", 25000, 80000)
             inv_repo.import_items(v_prod.id, ["LEG-CODE-1"], InventoryType.VOUCHER_CODE, denom.id)
-            order = ord_repo.create_order(
-                user.id,
-                80000,
-                "RUB",
-                [{"product_id": v_prod.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 80000}],
-            )
-            rec_repo.submit_receipt(order.id, user.id, b"legacy_receipt_bytes", provider_tx_id="LEG-TX-1")
 
-            # Upgrade using run_migrations() -> applies 003 cleanly and adds checksum column
+            f_prod = cat_repo.create_fixed_product(
+                display_name="Legacy Fixed",
+                price_rub_kopecks=80000,
+                delivery_method=DeliveryMethod.MANUAL_REVIEW,
+                supply_method="MANUAL_POOL",
+                approval_status=ApprovalStatus.APPROVED,
+                status=ProductStatus.APPROVED,
+            )
+            cur = c.cursor()
+            cur.execute(
+                "INSERT INTO orders (user_id, status, total_amount_minor, currency) VALUES (?, 'PENDING_PAYMENT', 80000, 'RUB')",
+                (user.id,),
+            )
+            legacy_order_id = cur.lastrowid
+            cur.execute(
+                """
+                INSERT INTO order_items (
+                    order_id, product_id, product_type_snapshot, quantity, unit_price_minor, currency
+                ) VALUES (?, ?, 'FIXED_PRODUCT', 1, 80000, 'RUB')
+                """,
+                (legacy_order_id, f_prod.id),
+            )
+            c.commit()
+            rec_repo.submit_receipt(legacy_order_id, user.id, b"legacy_receipt_bytes", provider_tx_id="LEG-TX-1")
+
+            # Upgrade using run_migrations() -> applies 003, 004, 005, 006 cleanly and adds checksum column
             newly_applied = run_migrations(c)
-            self.assertEqual(newly_applied, [3])
+            self.assertEqual(newly_applied, [3, 4, 5, 6])
 
             # Re-running is idempotent
             self.assertEqual(run_migrations(c), [])
 
             # Legacy valid data remains intact
-            self.assertEqual(len(get_applied_migrations(c)), 3)
+            self.assertEqual(len(get_applied_migrations(c)), 6)
             cur = c.cursor()
             cur.execute("SELECT COUNT(*) FROM inventory_items")
             self.assertEqual(cur.fetchone()[0], 1)

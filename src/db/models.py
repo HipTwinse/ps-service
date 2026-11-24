@@ -246,6 +246,7 @@ class OrderItem:
     id: int
     order_id: int
     product_id: int
+    denomination_id: Optional[int]
     product_type_snapshot: ProductType
     quantity: int
     unit_price_minor: int

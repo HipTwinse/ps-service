@@ -61,7 +61,7 @@ pip install -r requirements.txt
 python -m unittest discover -v tests
 ```
 
-Ожидаемый фактический результат: `Ran 107 tests ... OK` (включая unit, конкурентные и security-remediation тесты в `tests/test_*.py`).
+Ожидаемый фактический результат: `Ran 147 tests ... OK` (включая unit, конкурентные и security-remediation тесты в `tests/test_*.py`).
 
 ---
 
@@ -83,19 +83,15 @@ python -c "from src.db import create_connection, run_migrations; conn = create_c
 
 1. `discover_migration_files()` сканирует `src/migrations/*.sql` по шаблону `^(\d+)_(.*)\.sql$` и сортирует по числовому номеру версии.
 2. `ensure_migration_table()` создаёт таблицу `schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMP)`.
-3. Для каждой неприменённой миграции `run_migrations()` формирует блок:
-   ```sql
-   BEGIN IMMEDIATE;
-   <содержимое файла миграции>
-   INSERT INTO schema_migrations (version, name, checksum) VALUES (<version>, '<escaped_name>', '<sha256>');
-   COMMIT;
-   ```
-   и выполняет его через `conn.executescript(...)` без наивного разбиения по `;`, обеспечивая атомарный откат DDL/DML и записи версии при любой ошибке. При повторных запусках проверяются уникальность версий в `src/migrations/` (`discover_migration_files`) и SHA-256 контрольные суммы уже применённых миграций (для записей с заполненным `checksum`).
+3. Для каждой неприменённой миграции `run_migrations()` открывает транзакцию `with transaction(conn, mode="IMMEDIATE"):`, после получения write-блокировки проверяет `schema_migrations` и SHA-256 `checksum`, разбивает SQL-скрипт через `sqlite3.complete_statement()` (`_split_sql_statements()`) и записывает версию в `schema_migrations` внутри той же транзакции, обеспечивая сериализацию конкурентных запусков и атомарный откат при любой ошибке (включая `BaseException`).
 
 Применяемые миграции на текущий момент:
 - `001_initial_schema.sql` — базовые таблицы (`schema_migrations`, `users`, `products`, `voucher_details`, `voucher_denominations`, `fixed_product_details`, `orders`, `order_items`, `inventory_items`, `payment_receipts`, `audit_events`) и индексы.
 - `002_provider_scoped_receipts.sql` — добавление `provider_name` в `payment_receipts` и пересоздание уникального индекса `idx_receipts_provider_tx(provider_name, provider_tx_id)`.
-- `003_inventory_and_integrity_guards.sql` — SQLite-триггеры уровня БД, обеспечивающие совместимость `ProductType <-> InventoryType`, принадлежность `denomination_id` товару `product_id` и совпадение `payment_receipts.user_id == orders.user_id`.
+- `003_inventory_and_integrity_guards.sql` — pre-flight проверка legacy-строк и SQLite-триггеры уровня БД, обеспечивающие совместимость `ProductType <-> InventoryType`, принадлежность `denomination_id` товару `product_id` и совпадение `payment_receipts.user_id == orders.user_id`.
+- `004_order_item_denomination.sql` — pre-flight проверка legacy `VOUCHER`-позиций, добавление `order_items.denomination_id` (`REFERENCES voucher_denominations(id) ON DELETE RESTRICT`), индекса `idx_order_items_order_product_denom` и триггеров валидации `order_items`.
+- `005_inventory_order_delete_restrict.sql` — pre-flight проверка согласованности инвентаря и заказов, перестройка `inventory_items` с `ON DELETE RESTRICT` для `reserved_order_id`, табличным `CHECK` статуса и `reserved_order_id`, триггерами соответствия `(order_id, product_id, denomination_id)` с `order_items` и запретом `DELETE FROM orders` при связанном инвентаре.
+- `006_order_items_update_and_product_type_guards.sql` — pre-flight проверка `order_items.quantity >= allocated`, пересоздание `trg_order_items_validate_update` (защита `order_id`, `product_id`, `product_type_snapshot`, `denomination_id`, `quantity` при наличии `RESERVED`/`SOLD` инвентаря) и расширение `trg_products_prevent_type_change_with_inventory` на проверку `order_items`.
 
 ---
 

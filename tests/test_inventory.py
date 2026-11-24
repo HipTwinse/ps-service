@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from src.db.connection import create_connection
-from src.db.crypto import compute_fingerprint, encrypt_payload
+from src.db.crypto import compute_fingerprint, decrypt_payload, encrypt_payload
 from src.db.migrations import run_migrations
 from src.db.models import (
     DeliveryMethod,
@@ -94,11 +94,11 @@ class TestInventoryManagement(unittest.TestCase):
             self.assertNotIn(b"IJKL-5678-MNOP", row["encrypted_payload"])
             self.assertEqual(len(row["fingerprint"]), 64)  # SHA-256 hex string
 
-        # Verify decryption works via get_revealed_code
-        cur.execute("SELECT id FROM inventory_items ORDER BY id ASC")
-        item_ids = [r["id"] for r in cur.fetchall()]
-        revealed_1 = self.inv_repo.get_revealed_code(item_ids[0])
-        revealed_2 = self.inv_repo.get_revealed_code(item_ids[1])
+        # Verify decryption works via decrypt_payload on stored encrypted_payload
+        cur.execute("SELECT encrypted_payload FROM inventory_items ORDER BY id ASC")
+        payloads = [r["encrypted_payload"] for r in cur.fetchall()]
+        revealed_1 = decrypt_payload(payloads[0])
+        revealed_2 = decrypt_payload(payloads[1])
         self.assertIn(revealed_1, ["ABCD-1234-EFGH", "IJKL-5678-MNOP"])
         self.assertIn(revealed_2, ["ABCD-1234-EFGH", "IJKL-5678-MNOP"])
         self.assertNotEqual(revealed_1, revealed_2)
@@ -129,6 +129,7 @@ class TestInventoryManagement(unittest.TestCase):
             items=[
                 {
                     "product_id": self.product.id,
+                    "denomination_id": self.denom.id,
                     "product_type_snapshot": "VOUCHER",
                     "quantity": 2,
                     "unit_price_minor": 32000,
@@ -152,10 +153,26 @@ class TestInventoryManagement(unittest.TestCase):
         statuses = [r["status"] for r in cur.fetchall()]
         self.assertEqual(statuses, ["RESERVED", "RESERVED"])
 
-        # 2. Attempting to reserve 2 more when only 1 available must raise InsufficientInventoryError
+        # 2. Attempting to reserve 2 units for another order when only 1 available must raise InsufficientInventoryError
+        order_2 = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=64000,
+            currency="RUB",
+            items=[
+                {
+                    "product_id": self.product.id,
+                    "denomination_id": self.denom.id,
+                    "product_type_snapshot": "VOUCHER",
+                    "quantity": 2,
+                    "unit_price_minor": 32000,
+                    "currency": "RUB",
+                    "metadata_json": None,
+                }
+            ],
+        )
         with self.assertRaises(InsufficientInventoryError):
             self.inv_repo.reserve_items_for_order(
-                order_id=order.id,
+                order_id=order_2.id,
                 product_id=self.product.id,
                 quantity=2,
                 denomination_id=self.denom.id,
@@ -240,10 +257,10 @@ class TestInventoryManagement(unittest.TestCase):
         self.assertEqual(import_result["duplicates"], 1)
 
         # 3. Verify auto-upgrade in place during duplicate check
-        cur.execute("SELECT fingerprint FROM inventory_items WHERE id = ?", (item_id,))
-        updated_fp = cur.fetchone()["fingerprint"]
-        self.assertEqual(updated_fp, modern_fp)
-        self.assertEqual(self.inv_repo.get_revealed_code(item_id), legacy_code)
+        cur.execute("SELECT fingerprint, encrypted_payload FROM inventory_items WHERE id = ?", (item_id,))
+        upgraded_row = cur.fetchone()
+        self.assertEqual(upgraded_row["fingerprint"], modern_fp)
+        self.assertEqual(decrypt_payload(upgraded_row["encrypted_payload"]), legacy_code)
 
         # 4. Insert another legacy item and test batch migrate_legacy_fingerprints
         legacy_code_2 = "LEGACY-CARD-8888"
@@ -273,10 +290,10 @@ class TestInventoryManagement(unittest.TestCase):
         self.assertEqual(upgraded_again, 0)
 
         # Verify decryption of both items
-        cur.execute("SELECT id, fingerprint FROM inventory_items ORDER BY id ASC")
+        cur.execute("SELECT id, fingerprint, encrypted_payload FROM inventory_items ORDER BY id ASC")
         all_items = cur.fetchall()
         for row in all_items:
-            code = self.inv_repo.get_revealed_code(row["id"])
+            code = decrypt_payload(row["encrypted_payload"])
             self.assertEqual(row["fingerprint"], compute_fingerprint(code))
 
     def test_strict_typing_inventory_repository(self):

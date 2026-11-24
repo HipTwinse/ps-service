@@ -85,6 +85,31 @@ def discover_migration_files(migrations_dir: Path = MIGRATIONS_DIR) -> List[Tupl
     return discovered
 
 
+def _split_sql_statements(sql_script: str) -> List[str]:
+    """Splits a SQL script into complete statements using sqlite3.complete_statement().
+
+    Handles multi-statement triggers (BEGIN ... END;) without naive ';' splitting.
+    """
+    statements: List[str] = []
+    buffer = ""
+    for line in sql_script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            stmt = buffer.strip()
+            if stmt:
+                statements.append(stmt)
+            buffer = ""
+
+    leftover_lines = [
+        ln.strip()
+        for ln in buffer.splitlines()
+        if ln.strip() and not ln.strip().startswith("--")
+    ]
+    if leftover_lines:
+        raise ValueError(f"Incomplete SQL statement in migration script: {buffer.strip()[:120]}")
+    return statements
+
+
 def run_migrations(
     conn: sqlite3.Connection,
     migrations_dir: Path = MIGRATIONS_DIR,
@@ -93,13 +118,14 @@ def run_migrations(
 
     Guarantees:
     1. Rejects execution immediately if `conn.in_transaction` is already True (never commits caller tx).
-    2. Verifies uniqueness of migration version numbers and SHA-256 checksums of previously applied files.
-    3. Schema modifications and the corresponding schema_migrations record run in ONE atomic transaction.
-    4. Encapsulates the entire migration script and migration audit record inside a single
-       `BEGIN IMMEDIATE; ... COMMIT;` block executed via `executescript()`.
-    5. Does not use naive `;` splitting, protecting triggers and complex multi-statement SQL.
-    6. If any statement, checksum verification, or version recording fails, rolls back completely:
-       neither schema modifications nor the version record persist.
+    2. Verifies uniqueness of migration version numbers and SHA-256 checksums for previously applied
+       migrations that have a non-NULL stored checksum (legacy NULL-checksum rows are tolerated).
+    3. Acquires a `BEGIN IMMEDIATE` write lock before checking whether each migration is already
+       applied, serializing concurrent migration runners safely.
+    4. Executes all statements of each migration and inserts the `schema_migrations` record inside
+       the same `BEGIN IMMEDIATE` transaction via `sqlite3.complete_statement()` splitting.
+    5. If any statement, checksum verification, or version recording fails (including BaseException),
+       rolls back completely: neither schema modifications nor the version record persist.
 
     Args:
         conn: Target sqlite3.Connection.
@@ -114,10 +140,6 @@ def run_migrations(
         )
 
     ensure_migration_table(conn)
-    cur = conn.execute("SELECT version, name, checksum FROM schema_migrations ORDER BY version ASC")
-    applied_checksums: Dict[int, Optional[str]] = {
-        row["version"]: row["checksum"] for row in cur.fetchall()
-    }
     migration_files = discover_migration_files(migrations_dir)
 
     newly_applied: List[int] = []
@@ -128,31 +150,31 @@ def run_migrations(
 
         file_checksum = hashlib.sha256(sql_script.encode("utf-8")).hexdigest()
 
-        if version in applied_checksums:
-            stored_checksum = applied_checksums[version]
-            if stored_checksum is not None and stored_checksum != file_checksum:
-                raise RuntimeError(
-                    f"Migration {version}_{name} checksum mismatch: applied SQL file has been modified."
-                )
-            continue
-
-        escaped_name = name.replace("'", "''")
-        wrapped_script = (
-            "BEGIN IMMEDIATE;\n"
-            f"{sql_script}\n"
-            f"INSERT INTO schema_migrations (version, name, checksum) VALUES ({version}, '{escaped_name}', '{file_checksum}');\n"
-            "COMMIT;\n"
-        )
-
         try:
-            conn.executescript(wrapped_script)
-            newly_applied.append(version)
-            applied_checksums[version] = file_checksum
+            with transaction(conn, mode="IMMEDIATE"):
+                row = conn.execute(
+                    "SELECT checksum FROM schema_migrations WHERE version = ?",
+                    (version,),
+                ).fetchone()
+                if row is not None:
+                    stored_checksum = row["checksum"]
+                    if stored_checksum is not None and stored_checksum != file_checksum:
+                        raise RuntimeError(
+                            f"Migration {version}_{name} checksum mismatch: applied SQL file has been modified."
+                        )
+                    continue
+
+                for stmt in _split_sql_statements(sql_script):
+                    conn.execute(stmt)
+
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, name, checksum) VALUES (?, ?, ?)",
+                    (version, name, file_checksum),
+                )
+                newly_applied.append(version)
+        except RuntimeError:
+            raise
         except Exception as e:
-            try:
-                conn.execute("ROLLBACK;")
-            except Exception:
-                pass
             raise RuntimeError(
                 f"Migration {version}_{name} failed: {str(e)}"
             ) from e

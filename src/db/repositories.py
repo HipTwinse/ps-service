@@ -623,11 +623,11 @@ class InventoryRepository:
         Verifies order existence and allowable order status (RESERVABLE_ORDER_STATUSES),
         validates product and denomination ownership, and rolls back completely if insufficient stock.
         """
-        order_id = _validate_int(order_id, "order_id")
-        product_id = _validate_int(product_id, "product_id")
-        quantity = _validate_int(quantity, "quantity")
+        order_id = _validate_int(order_id, "order_id", min_value=1)
+        product_id = _validate_int(product_id, "product_id", min_value=1)
+        quantity = _validate_int(quantity, "quantity", min_value=1)
         if denomination_id is not None:
-            denomination_id = _validate_int(denomination_id, "denomination_id")
+            denomination_id = _validate_int(denomination_id, "denomination_id", min_value=1)
 
         with transaction(self.conn, mode="IMMEDIATE"):
             cur = self.conn.cursor()
@@ -670,6 +670,57 @@ class InventoryRepository:
             if denomination_id is not None:
                 cur.execute(
                     """
+                    SELECT COALESCE(SUM(quantity), 0) AS ordered_qty
+                    FROM order_items
+                    WHERE order_id = ? AND product_id = ? AND denomination_id = ?
+                    """,
+                    (order_id, product_id, denomination_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(quantity), 0) AS ordered_qty
+                    FROM order_items
+                    WHERE order_id = ? AND product_id = ? AND denomination_id IS NULL
+                    """,
+                    (order_id, product_id),
+                )
+            ordered_qty = cur.fetchone()["ordered_qty"]
+            if ordered_qty <= 0:
+                raise ValidationError(
+                    f"Product {product_id} (denomination {denomination_id}) is not present in order {order_id}."
+                )
+
+            if denomination_id is not None:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS allocated_qty
+                    FROM inventory_items
+                    WHERE reserved_order_id = ? AND product_id = ? AND denomination_id = ?
+                      AND status IN ('RESERVED', 'SOLD')
+                    """,
+                    (order_id, product_id, denomination_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS allocated_qty
+                    FROM inventory_items
+                    WHERE reserved_order_id = ? AND product_id = ? AND denomination_id IS NULL
+                      AND status IN ('RESERVED', 'SOLD')
+                    """,
+                    (order_id, product_id),
+                )
+            allocated_qty = cur.fetchone()["allocated_qty"]
+            if allocated_qty + quantity > ordered_qty:
+                raise ValidationError(
+                    f"Cannot reserve {quantity} units of product {product_id} (denomination {denomination_id}) "
+                    f"for order {order_id}: ordered {ordered_qty}, already reserved/sold {allocated_qty}."
+                )
+
+            if denomination_id is not None:
+                cur.execute(
+                    """
                     SELECT id FROM inventory_items
                     WHERE product_id = ? AND denomination_id = ? AND status = 'AVAILABLE'
                     ORDER BY id ASC LIMIT ?
@@ -680,7 +731,7 @@ class InventoryRepository:
                 cur.execute(
                     """
                     SELECT id FROM inventory_items
-                    WHERE product_id = ? AND status = 'AVAILABLE'
+                    WHERE product_id = ? AND denomination_id IS NULL AND status = 'AVAILABLE'
                     ORDER BY id ASC LIMIT ?
                     """,
                     (product_id, quantity),
@@ -748,12 +799,14 @@ class InventoryRepository:
     def finalize_order_sale(self, order_id: int) -> int:
         """Transitions reserved inventory items to permanently SOLD state upon valid paid/fulfilling order status.
 
-        Invariants:
+        Invariants (full-order fulfillment model):
         - Order must exist and be in FINALIZABLE_ORDER_STATUSES (PAID or FULFILLING).
-        - Never transitions already SOLD items or modifies another order's reservations.
-        - Rejects duplicate finalization if order items are already marked SOLD.
+        - Rejects duplicate finalization if any order items are already marked SOLD.
+        - Requires exact match between every ordered (product_id, denomination_id, quantity) in order_items
+          and currently RESERVED inventory items for this order; incomplete or mismatched
+          reservations are rejected atomically with no partial transition.
         """
-        order_id = _validate_int(order_id, "order_id")
+        order_id = _validate_int(order_id, "order_id", min_value=1)
         with transaction(self.conn, mode="IMMEDIATE"):
             cur = self.conn.cursor()
             cur.execute("SELECT id, status FROM orders WHERE id = ?", (order_id,))
@@ -769,6 +822,53 @@ class InventoryRepository:
                 )
 
             cur.execute(
+                "SELECT 1 FROM inventory_items WHERE reserved_order_id = ? AND status = 'SOLD' LIMIT 1",
+                (order_id,),
+            )
+            if cur.fetchone():
+                raise ConflictError(
+                    f"Inventory items for order {order_id} have already been finalized (SOLD)."
+                )
+
+            cur.execute(
+                """
+                SELECT product_id, denomination_id, SUM(quantity) AS ordered_qty
+                FROM order_items
+                WHERE order_id = ?
+                GROUP BY product_id, denomination_id
+                """,
+                (order_id,),
+            )
+            expected_by_key = {
+                (row["product_id"], row["denomination_id"]): row["ordered_qty"]
+                for row in cur.fetchall()
+            }
+            if not expected_by_key:
+                raise ValidationError(
+                    f"Order {order_id} has no order items to finalize."
+                )
+
+            cur.execute(
+                """
+                SELECT product_id, denomination_id, COUNT(*) AS reserved_qty
+                FROM inventory_items
+                WHERE reserved_order_id = ? AND status = 'RESERVED'
+                GROUP BY product_id, denomination_id
+                """,
+                (order_id,),
+            )
+            reserved_by_key = {
+                (row["product_id"], row["denomination_id"]): row["reserved_qty"]
+                for row in cur.fetchall()
+            }
+
+            if reserved_by_key != expected_by_key:
+                raise ValidationError(
+                    f"Cannot finalize order {order_id}: reserved inventory {reserved_by_key} "
+                    f"does not match ordered items {expected_by_key}."
+                )
+
+            cur.execute(
                 """
                 UPDATE inventory_items
                 SET status = 'SOLD', updated_at = CURRENT_TIMESTAMP
@@ -777,15 +877,11 @@ class InventoryRepository:
                 (order_id,),
             )
             count = cur.rowcount
-            if count == 0:
-                cur.execute(
-                    "SELECT 1 FROM inventory_items WHERE reserved_order_id = ? AND status = 'SOLD' LIMIT 1",
-                    (order_id,),
+            expected_total = sum(expected_by_key.values())
+            if count != expected_total:
+                raise ConflictError(
+                    f"Unexpected row count finalizing order {order_id}: expected {expected_total}, updated {count}."
                 )
-                if cur.fetchone():
-                    raise ConflictError(
-                        f"Inventory items for order {order_id} have already been finalized (SOLD)."
-                    )
             return count
 
     def get_revealed_code(
@@ -795,26 +891,27 @@ class InventoryRepository:
         expected_order_id: Optional[int] = None,
         expected_user_id: Optional[int] = None,
     ) -> str:
-        """Reveals the decrypted code for an inventory item (internal fulfillment primitive).
+        """Reveals the decrypted code for a SOLD inventory item in a verified order/user context.
 
-        SECURITY NOTICE:
-        This repository method does NOT implement end-user RBAC or Telegram session
-        authentication. External/client-facing callers MUST NOT invoke this method
-        without upstream authentication and authorization checks (Phase 3).
+        Architectural decision:
+        Context-free decryption via get_revealed_code() is explicitly disallowed.
+        Both `expected_order_id` and `expected_user_id` MUST be supplied together.
+        Internal maintenance/crypto checks (such as key/pepper rotation) use decrypt_payload()
+        directly rather than exposing an unauthenticated bypass on the repository.
 
         Safety invariants enforced here:
-        - Rejects QUARANTINED and DISABLED items unconditionally.
-        - When `expected_order_id` or `expected_user_id` is provided (order fulfillment context),
-          reads inventory item and linked order in ONE atomic query (no WAL snapshot skew),
-          strictly requires item status == SOLD (already finalized via finalize_order_sale so it
-          cannot be reverted to AVAILABLE), item -> order binding, order -> user ownership,
-          and order status in (PAID, FULFILLING, COMPLETED).
+        - Requires both `expected_order_id` and `expected_user_id` (strictly positive ints).
+        - Reads inventory item and linked order in ONE atomic query (no WAL snapshot skew).
+        - Rejects QUARANTINED, DISABLED, AVAILABLE, and RESERVED items (must be SOLD).
+        - Verifies item -> order binding, order -> user ownership, and order status in REVEALABLE_ORDER_STATUSES.
         """
-        item_id = _validate_int(item_id, "item_id")
-        if expected_order_id is not None:
-            expected_order_id = _validate_int(expected_order_id, "expected_order_id")
-        if expected_user_id is not None:
-            expected_user_id = _validate_int(expected_user_id, "expected_user_id")
+        item_id = _validate_int(item_id, "item_id", min_value=1)
+        if expected_order_id is None or expected_user_id is None:
+            raise ValidationError(
+                "get_revealed_code requires both expected_order_id and expected_user_id."
+            )
+        expected_order_id = _validate_int(expected_order_id, "expected_order_id", min_value=1)
+        expected_user_id = _validate_int(expected_user_id, "expected_user_id", min_value=1)
 
         cur = self.conn.cursor()
         cur.execute(
@@ -842,26 +939,25 @@ class InventoryRepository:
                 f"Inventory item {item_id} is in '{item_status.value}' state and cannot be revealed."
             )
 
-        if expected_order_id is not None or expected_user_id is not None:
-            linked_order_id = row["reserved_order_id"]
-            if linked_order_id is None:
-                raise ValidationError("Inventory item is not assigned to any order.")
-            if expected_order_id is not None and linked_order_id != expected_order_id:
-                raise ValidationError("Inventory item is not assigned to the specified order.")
-            if item_status != InventoryStatus.SOLD:
-                raise ValidationError(
-                    f"Inventory item must be SOLD before fulfillment reveal (current status: '{item_status.value}')."
-                )
-            if row["order_status"] is None or row["order_user_id"] is None:
-                raise NotFoundError(f"Order {linked_order_id} not found.")
-            if expected_user_id is not None and row["order_user_id"] != expected_user_id:
-                raise ValidationError("Order does not belong to the specified user.")
+        linked_order_id = row["reserved_order_id"]
+        if linked_order_id is None:
+            raise ValidationError("Inventory item is not assigned to any order.")
+        if linked_order_id != expected_order_id:
+            raise ValidationError("Inventory item is not assigned to the specified order.")
+        if item_status != InventoryStatus.SOLD:
+            raise ValidationError(
+                f"Inventory item must be SOLD before fulfillment reveal (current status: '{item_status.value}')."
+            )
+        if row["order_status"] is None or row["order_user_id"] is None:
+            raise NotFoundError(f"Order {linked_order_id} not found.")
+        if row["order_user_id"] != expected_user_id:
+            raise ValidationError("Order does not belong to the specified user.")
 
-            order_status = OrderStatus(row["order_status"])
-            if order_status not in REVEALABLE_ORDER_STATUSES:
-                raise InvalidStateTransitionError(
-                    f"Cannot reveal inventory code for order {linked_order_id} in status '{order_status.value}'."
-                )
+        order_status = OrderStatus(row["order_status"])
+        if order_status not in REVEALABLE_ORDER_STATUSES:
+            raise InvalidStateTransitionError(
+                f"Cannot reveal inventory code for order {linked_order_id} in status '{order_status.value}'."
+            )
 
         return decrypt_payload(row["encrypted_payload"])
 
@@ -888,26 +984,34 @@ class OrderRepository:
         - Verifies that currency is consistent across order and all item snapshots.
         - Completely rolls back on any error without leaving orphan records.
         """
-        user_id = _validate_int(user_id, "user_id")
-        total_amount_minor = _validate_int(total_amount_minor, "total_amount_minor")
+        user_id = _validate_int(user_id, "user_id", min_value=1)
+        total_amount_minor = _validate_int(total_amount_minor, "total_amount_minor", min_value=1)
         if not items:
             raise ValidationError("Order must contain at least one order item.")
 
-        currency_norm = currency.strip().upper() if currency else ""
-        if not currency_norm:
+        if not isinstance(currency, str) or not currency.strip():
             raise ValidationError("Order currency must not be empty.")
+        currency_norm = currency.strip().upper()
+        if currency_norm not in ("RUB", "TRY", "USD"):
+            raise ValidationError(f"Unsupported order currency '{currency_norm}'.")
 
         # Verify mathematical consistency between total_amount_minor and item prices/quantities/currency
         computed_total = 0
         for item in items:
-            qty = _validate_int(item.get("quantity"), "Item quantity")
-            unit_price = _validate_int(item.get("unit_price_minor"), "Unit price")
+            qty = _validate_int(item.get("quantity"), "Item quantity", min_value=1)
+            unit_price = _validate_int(item.get("unit_price_minor"), "Unit price", min_value=0)
             item_curr = item.get("currency")
 
-            if item_curr is not None and item_curr.strip().upper() != currency_norm:
-                raise ValidationError(
-                    f"Item currency '{item_curr}' does not match order currency '{currency_norm}'."
-                )
+            if item_curr is not None:
+                if not isinstance(item_curr, str):
+                    raise ValidationError("Item currency must be a string.")
+                if item_curr.strip().upper() != currency_norm:
+                    raise ValidationError(
+                        f"Item currency '{item_curr}' does not match order currency '{currency_norm}'."
+                    )
+
+            if item.get("denomination_id") is not None:
+                _validate_int(item.get("denomination_id"), "denomination_id", min_value=1)
 
             computed_total += qty * unit_price
 
@@ -926,13 +1030,16 @@ class OrderRepository:
             if user_row["status"] == UserStatus.BLOCKED.value:
                 raise ValidationError("Cannot create order for blocked user.")
 
-            # 2. Validate all products, product types, and supply approvals under active lock
+            # 2. Validate all products, product types, denominations, supply approvals, and catalog prices under active lock
             validated_items = []
             for item in items:
-                prod_id = _validate_int(item.get("product_id"), "Product id")
-                qty = _validate_int(item.get("quantity"), "Item quantity")
-                unit_price = _validate_int(item.get("unit_price_minor"), "Unit price")
+                prod_id = _validate_int(item.get("product_id"), "Product id", min_value=1)
+                qty = _validate_int(item.get("quantity"), "Item quantity", min_value=1)
+                unit_price = _validate_int(item.get("unit_price_minor"), "Unit price", min_value=0)
                 prod_type = item.get("product_type_snapshot")
+                denom_id = item.get("denomination_id")
+                if denom_id is not None:
+                    denom_id = _validate_int(denom_id, "denomination_id", min_value=1)
                 meta_json = item.get("metadata_json")
 
                 # Validate product exists and is approved for sale
@@ -949,10 +1056,13 @@ class OrderRepository:
                         f"Item product_type_snapshot '{prod_type}' does not match product {prod_id} type '{prod_row['product_type']}'."
                     )
 
-                # Defense-in-depth: For FIXED_PRODUCT, verify approval_status directly
                 if prod_row["product_type"] == ProductType.FIXED_PRODUCT.value:
+                    if denom_id is not None:
+                        raise ValidationError(
+                            f"denomination_id must not be specified for FIXED_PRODUCT {prod_id}."
+                        )
                     cur.execute(
-                        "SELECT approval_status FROM fixed_product_details WHERE product_id = ?",
+                        "SELECT price_rub_kopecks, approval_status FROM fixed_product_details WHERE product_id = ?",
                         (prod_id,),
                     )
                     fp_row = cur.fetchone()
@@ -960,8 +1070,50 @@ class OrderRepository:
                         raise ValidationError(
                             f"Fixed product '{prod_id}' does not have an approved supply method."
                         )
+                    if currency_norm != "RUB":
+                        raise ValidationError(
+                            f"Order currency for FIXED_PRODUCT must be 'RUB' (got '{currency_norm}')."
+                        )
+                    if unit_price != fp_row["price_rub_kopecks"]:
+                        raise ValidationError(
+                            f"Unit price {unit_price} does not match catalog price {fp_row['price_rub_kopecks']} "
+                            f"for FIXED_PRODUCT {prod_id}."
+                        )
+                elif prod_row["product_type"] == ProductType.VOUCHER.value:
+                    if denom_id is None:
+                        raise ValidationError(
+                            f"VOUCHER order item for product {prod_id} requires a valid denomination_id."
+                        )
+                    cur.execute(
+                        """
+                        SELECT id, product_id, cost_rub_kopecks, is_active
+                        FROM voucher_denominations
+                        WHERE id = ?
+                        """,
+                        (denom_id,),
+                    )
+                    denom_row = cur.fetchone()
+                    if not denom_row:
+                        raise NotFoundError(f"Voucher denomination {denom_id} not found.")
+                    if denom_row["product_id"] != prod_id:
+                        raise ValidationError(
+                            f"Voucher denomination {denom_id} does not belong to product {prod_id}."
+                        )
+                    if denom_row["is_active"] != 1:
+                        raise ValidationError(
+                            f"Voucher denomination {denom_id} is inactive."
+                        )
+                    if currency_norm != "RUB":
+                        raise ValidationError(
+                            f"Order currency for VOUCHER must be 'RUB' (got '{currency_norm}')."
+                        )
+                    if unit_price != denom_row["cost_rub_kopecks"]:
+                        raise ValidationError(
+                            f"Unit price {unit_price} does not match catalog price {denom_row['cost_rub_kopecks']} "
+                            f"for denomination {denom_id}."
+                        )
 
-                validated_items.append((prod_id, prod_type, qty, unit_price, meta_json))
+                validated_items.append((prod_id, denom_id, prod_type, qty, unit_price, meta_json))
 
             # 3. Insert order and order items
             cur.execute(
@@ -973,14 +1125,14 @@ class OrderRepository:
             )
             order_id = cur.lastrowid
 
-            for prod_id, prod_type, qty, unit_price, meta_json in validated_items:
+            for prod_id, denom_id, prod_type, qty, unit_price, meta_json in validated_items:
                 cur.execute(
                     """
                     INSERT INTO order_items (
-                        order_id, product_id, product_type_snapshot, quantity, unit_price_minor, currency, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        order_id, product_id, denomination_id, product_type_snapshot, quantity, unit_price_minor, currency, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (order_id, prod_id, prod_type, qty, unit_price, currency_norm, meta_json),
+                    (order_id, prod_id, denom_id, prod_type, qty, unit_price, currency_norm, meta_json),
                 )
 
         return self.get_order(order_id)
@@ -1070,6 +1222,7 @@ class OrderRepository:
                 id=row["id"],
                 order_id=row["order_id"],
                 product_id=row["product_id"],
+                denomination_id=row["denomination_id"],
                 product_type_snapshot=ProductType(row["product_type_snapshot"]),
                 quantity=row["quantity"],
                 unit_price_minor=row["unit_price_minor"],

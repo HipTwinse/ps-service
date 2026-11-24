@@ -103,7 +103,7 @@ def transaction(conn: sqlite3.Connection, mode: str = "IMMEDIATE") -> Generator[
     try:
         yield conn
         conn.commit()
-    except Exception:
+    except BaseException:
         if conn.in_transaction:
             try:
                 conn.rollback()

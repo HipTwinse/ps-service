@@ -43,6 +43,13 @@ class TestReceiptDeduplicationAndWorkflow(unittest.TestCase):
             currency="TRY",
             status=ProductStatus.APPROVED,
         )
+        self.denom = self.catalog_repo.add_voucher_denomination(
+            product_id=self.prod.id,
+            region="TR",
+            currency="TRY",
+            face_value_minor=50000,
+            cost_rub_kopecks=160000,
+        )
         self.order1 = self.order_repo.create_order(
             user_id=self.user.id,
             total_amount_minor=160000,
@@ -50,6 +57,7 @@ class TestReceiptDeduplicationAndWorkflow(unittest.TestCase):
             items=[
                 {
                     "product_id": self.prod.id,
+                    "denomination_id": self.denom.id,
                     "product_type_snapshot": "VOUCHER",
                     "quantity": 1,
                     "unit_price_minor": 160000,
@@ -64,6 +72,7 @@ class TestReceiptDeduplicationAndWorkflow(unittest.TestCase):
             items=[
                 {
                     "product_id": self.prod.id,
+                    "denomination_id": self.denom.id,
                     "product_type_snapshot": "VOUCHER",
                     "quantity": 1,
                     "unit_price_minor": 160000,

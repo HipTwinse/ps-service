@@ -222,9 +222,9 @@ class TestCryptoRemediation(unittest.TestCase):
 
             # Decrypted payload in DB must be canonical
             cur = conn.cursor()
-            cur.execute("SELECT id FROM inventory_items")
-            item_id = cur.fetchone()["id"]
-            self.assertEqual(inv_repo.get_revealed_code(item_id), "MY-SECRET-CODE-001")
+            cur.execute("SELECT encrypted_payload FROM inventory_items")
+            row = cur.fetchone()
+            self.assertEqual(decrypt_payload(row["encrypted_payload"]), "MY-SECRET-CODE-001")
             conn.close()
 
     def test_rotate_fingerprint_pepper_maintains_integrity(self):
@@ -250,10 +250,10 @@ class TestCryptoRemediation(unittest.TestCase):
 
             # Verify all fingerprints now match new_pepper
             cur = conn.cursor()
-            cur.execute("SELECT id, fingerprint FROM inventory_items ORDER BY id ASC")
+            cur.execute("SELECT id, fingerprint, encrypted_payload FROM inventory_items ORDER BY id ASC")
             rows = cur.fetchall()
             for row in rows:
-                code = inv_repo.get_revealed_code(row["id"])
+                code = decrypt_payload(row["encrypted_payload"])
                 expected_fp = compute_fingerprint(code, pepper=new_pepper)
                 self.assertEqual(row["fingerprint"], expected_fp)
                 self.assertNotEqual(row["fingerprint"], compute_fingerprint(code, pepper=old_pepper))

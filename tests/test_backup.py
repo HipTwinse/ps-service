@@ -57,6 +57,7 @@ class TestDatabaseBackupAndRestore(unittest.TestCase):
             items=[
                 {
                     "product_id": self.product.id,
+                    "denomination_id": self.denom.id,
                     "product_type_snapshot": "VOUCHER",
                     "quantity": 1,
                     "unit_price_minor": 80000,
