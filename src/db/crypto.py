@@ -4,12 +4,13 @@ All encryption is authenticated using Fernet (AES-128-CBC + HMAC-SHA256).
 Encryption keys are strictly kept outside the database and outside version control.
 """
 
-import base64
 import hashlib
 import hmac
 import os
 from typing import Optional
 from cryptography.fernet import Fernet
+
+from src.db.config import DEFAULT_OPERATIONAL_CONFIG
 
 FernetCipher = Fernet
 
@@ -99,19 +100,31 @@ def get_encryption_key() -> bytes:
 def get_fingerprint_pepper() -> bytes:
     """Retrieves the HMAC pepper secret from environment.
 
-    In production, FINGERPRINT_PEPPER (or INVENTORY_FINGERPRINT_PEPPER) must be set.
+    In production, FINGERPRINT_PEPPER (or INVENTORY_FINGERPRINT_PEPPER) must be set
+    and must meet the minimum length requirement (SG-P2-012).
     Fallback test pepper is only permitted in explicitly designated dev/test environments.
 
     Returns:
         Pepper bytes.
 
     Raises:
-        CryptoConfigurationError: If pepper is absent in production.
+        CryptoConfigurationError: If pepper is absent in production or shorter than minimum length.
     """
-    raw_pepper = os.environ.get("FINGERPRINT_PEPPER") or os.environ.get("INVENTORY_FINGERPRINT_PEPPER")
+    raw_pepper: Optional[str] = None
+    for env_var in ("FINGERPRINT_PEPPER", "INVENTORY_FINGERPRINT_PEPPER"):
+        candidate = os.environ.get(env_var)
+        if candidate is not None and candidate.strip():
+            raw_pepper = candidate.strip()
+            break
 
-    if raw_pepper and raw_pepper.strip():
-        return raw_pepper.strip().encode("utf-8")
+    if raw_pepper is not None:
+        pepper_bytes = raw_pepper.encode("utf-8")
+        min_len = DEFAULT_OPERATIONAL_CONFIG.min_fingerprint_pepper_bytes
+        if len(pepper_bytes) < min_len:
+            raise CryptoConfigurationError(
+                f"Configured fingerprint pepper is too short ({len(pepper_bytes)} bytes; minimum {min_len} bytes required)."
+            )
+        return pepper_bytes
 
     if is_dev_or_test_environment():
         return _DEV_FALLBACK_PEPPER
@@ -121,12 +134,26 @@ def get_fingerprint_pepper() -> bytes:
     )
 
 
+def _resolve_cipher(key: Optional[bytes]) -> Fernet:
+    """Resolves Fernet cipher from explicit key or configured environment key (SG-P2-012)."""
+    if key is None:
+        return Fernet(get_encryption_key())
+    if not isinstance(key, bytes) or not key:
+        raise CryptoConfigurationError("Explicit encryption key must be non-empty bytes.")
+    try:
+        return Fernet(key)
+    except Exception:
+        raise CryptoConfigurationError(
+            "Invalid explicit encryption key: Must be a valid 32 url-safe base64-encoded Fernet key."
+        ) from None
+
+
 def encrypt_payload(plaintext: str, key: Optional[bytes] = None) -> bytes:
     """Encrypts sensitive inventory payload (e.g., voucher codes) using authenticated Fernet encryption.
 
     Args:
         plaintext: Raw sensitive code or credentials.
-        key: Optional encryption key; defaults to get_encryption_key().
+        key: Optional encryption key; defaults to get_encryption_key() ONLY when key is None.
 
     Returns:
         Encrypted payload bytes.
@@ -135,7 +162,7 @@ def encrypt_payload(plaintext: str, key: Optional[bytes] = None) -> bytes:
     if not cleaned:
         raise ValueError("Cannot encrypt an empty payload.")
 
-    cipher = Fernet(key or get_encryption_key())
+    cipher = _resolve_cipher(key)
     return cipher.encrypt(cleaned.encode("utf-8"))
 
 
@@ -144,12 +171,12 @@ def decrypt_payload(encrypted_bytes: bytes, key: Optional[bytes] = None) -> str:
 
     Args:
         encrypted_bytes: Encrypted payload bytes.
-        key: Optional encryption key.
+        key: Optional encryption key; defaults to get_encryption_key() ONLY when key is None.
 
     Returns:
         Decrypted canonical plaintext string.
     """
-    cipher = Fernet(key or get_encryption_key())
+    cipher = _resolve_cipher(key)
     return cipher.decrypt(encrypted_bytes).decode("utf-8")
 
 
@@ -169,7 +196,12 @@ def compute_fingerprint(plaintext: str, pepper: Optional[bytes] = None) -> str:
     cleaned = canonicalize_code(plaintext).encode("utf-8")
     if not cleaned:
         raise ValueError("Cannot compute fingerprint of an empty payload.")
-    pepper_bytes = pepper if pepper is not None else get_fingerprint_pepper()
+    if pepper is None:
+        pepper_bytes = get_fingerprint_pepper()
+    else:
+        if not isinstance(pepper, bytes) or len(pepper) == 0:
+            raise CryptoConfigurationError("Explicit fingerprint pepper must be non-empty bytes.")
+        pepper_bytes = pepper
     return hmac.new(pepper_bytes, cleaned, hashlib.sha256).hexdigest()
 
 

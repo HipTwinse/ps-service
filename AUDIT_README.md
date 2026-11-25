@@ -1,4 +1,4 @@
-# AUDIT_README — Руководство для независимого аудита (Security Gate Phase 2)
+# AUDIT_README — Руководство для независимого аудита (Phase 2 & Phase 3 Stage 3.1 Foundation)
 
 Документ подготовлен исключительно по фактическому состоянию кода и истории Git для независимой проверки проекта через GitHub.
 
@@ -6,38 +6,40 @@
 
 ## 1. Назначение проекта
 
-Сервис подбора оптимальных комбинаций цифровых ваучеров пополнения PlayStation Store (регионы `TR`/`US`, валюты `TRY`/`USD`) с расчётом в рублях (копейках), локальным хранением каталога, зашифрованного инвентаря кодов, заказов и платёжных чеков в SQLite.
+Сервис подбора оптимальных комбинаций цифровых ваучеров пополнения PlayStation Store (регионы `TR`/`US`, валюты `TRY`/`USD`) с расчётом в рублях (копейках), локальным хранением каталога, зашифрованного инвентаря кодов, заказов, платёжных чеков, аудита, попыток доставки и ключей идемпотентности в SQLite.
 
-Продуктовое описание и дорожная карта зафиксированы в [project.md](project.md), [project_context.md](project_context.md) и [AVITO_TRAFFIC_ENGINE.md](AVITO_TRAFFIC_ENGINE.md).
+Продуктовое описание, дорожная карта и архитектурный дизайн Phase 3 зафиксированы в `project.md`, `project_context.md`, `AVITO_TRAFFIC_ENGINE.md` и ветке `docs/phase3-architecture-design` (`PHASE3_ARCHITECTURE_DESIGN.md`).
 
 ---
 
 ## 2. Архитектура и основные модули
 
-Реализованы два базовых слоя (Phase 1 и Phase 2):
+Реализованы базовый вычислительный слой (Phase 1), защищённый слой данных (Phase 2) и фундамент транзакций/ограничений Stage 3.1 (Phase 3 Stage 3.1 Foundation):
 
-- **Phase 1 — Движок оптимального подбора (`src/engine/`, `src/calculator.py`):**
-  - `src/engine/models.py` — контракты входных/выходных данных (`Region`, `Currency`, `Denomination`, `SelectedDenomination`, `OptimizationResult`, `ValidationError`, `validate_input_contract`), целочисленные ограничения (допустимый лимит на заказ: `DEFAULT_MAX_VOUCHERS_PER_ORDER = 6`, верхний предел `MAX_PERMITTED_VOUCHERS_PER_ORDER`).
-  - `src/engine/knapsack.py` — `calculate_optimal_vouchers(...)` (Bounded Covering Knapsack без использования float в денежных вычислениях; оптимизация по минимальной стоимости в копейках, минимальному остатку на кошельке, минимальному количеству ваучеров и детерминированному tie-breaker).
+- **Phase 1 — Движок оптимального подбора (`src/engine/`, `src/calculator.py`, НЕ ИЗМЕНЯЛСЯ):**
+  - `src/engine/models.py` — контракты входных/выходных данных (`Region`, `Currency`, `Denomination`, `SelectedDenomination`, `OptimizationResult`, `ValidationError`, `validate_input_contract`), целочисленные ограничения (`DEFAULT_MAX_VOUCHERS_PER_ORDER = 6`, `MAX_PERMITTED_VOUCHERS_PER_ORDER`).
+  - `src/engine/knapsack.py` — `calculate_optimal_vouchers(...)` (Bounded Covering Knapsack без использования float в денежных вычислениях).
   - `src/calculator.py` — публичный фасад экспорта над `src/engine`.
-- **Phase 2 — Слой данных и безопасности (`src/db/`, `src/migrations/`):**
-  - `src/db/connection.py` — `get_connection` / `create_connection`, `get_connection_context`, `transaction`, `backup_database`, `restore_database`.
-  - `src/db/crypto.py` — `canonicalize_code`, `is_dev_or_test_environment`, `get_encryption_key`, `get_fingerprint_pepper`, `encrypt_payload`, `decrypt_payload`, `compute_fingerprint`, `compute_receipt_sha256`.
-  - `src/db/migrations.py` — `ensure_migration_table`, `get_applied_migrations`, `discover_migration_files`, `run_migrations`.
-  - `src/db/models.py` — перечисления статусов (`ProductType`, `ProductStatus`, `DeliveryMethod`, `ApprovalStatus`, `InventoryType`, `InventoryStatus`, `OrderStatus`, `ReceiptReviewStatus`, `UserStatus`), матрица допустимых переходов `ALLOWED_ORDER_TRANSITIONS`, доменные исключения и dataclass-модели.
-  - `src/db/repositories.py` — транзакционные репозитории (`CatalogRepository`, `UserRepository`, `InventoryRepository`, `OrderRepository`, `ReceiptRepository`) и строгий типовой валидатор `_validate_int` (отклоняющий `bool`, `float`, `str`, `None` и недопустимые границы).
-  - `src/migrations/001_initial_schema.sql`, `src/migrations/002_provider_scoped_receipts.sql` — SQL-миграции схемы.
+- **Phase 2 + Phase 3 Stage 3.1 Foundation — Слой данных, транзакций и инвариантов (`src/db/`, `src/migrations/`):**
+  - `src/db/config.py` — замороженный конфиг `OperationalDefaults` и `DEFAULT_OPERATIONAL_CONFIG` (`OD-08`, `OD-09`, `AR-P3-001`, `AR-P3-006`).
+  - `src/db/connection.py` — `get_connection` / `create_connection`, `get_connection_context`, управляемый реестр транзакций по `id(conn)` с проверкой идентичности `entry.conn is conn`, вложенными `SAVEPOINT`, безопасным failure path (`AR-P3-002`), запретом присоединения к неуправляемым/чужим/потоково-несовместимым транзакциям и запретом эскалации режима блокировки; `backup_database`, `restore_database` (с `except BaseException:` очисткой/откатом, `SG-P2-014`).
+  - `src/db/uow.py` — `UnitOfWork`, `ReadSession` (строгий `PRAGMA query_only=ON` до `BEGIN DEFERRED`, якорное чтение `schema_migrations` для фиксации WAL read snapshot до передачи управления по `AR-P3-003`, откат на выходе и восстановление `query_only` в outer `finally`), `WriteSession`.
+  - `src/db/crypto.py` — `canonicalize_code`, `is_dev_or_test_environment`, `get_encryption_key`, `get_fingerprint_pepper` (минимум 16 байт по `SG-P2-012`), `encrypt_payload`, `decrypt_payload`, `compute_fingerprint` (явный отказ при пустом `key`/`pepper`), `compute_receipt_sha256`.
+  - `src/db/migrations.py` — `ensure_migration_table`, `get_applied_migrations`, `discover_migration_files`, `_split_sql_statements` (символьный SQLite-сканер с поддержкой `sqlite3.complete_statement()`, строк, кавычек, `--` и `/* ... */` комментариев, `SG-P2-005`), `MigrationPreflightError`, `_preflight_migration_007`, `run_migrations`.
+  - `src/db/models.py` — перечисления статусов (`ProductType`, `ProductStatus`, `DeliveryMethod`, `ApprovalStatus`, `InventoryType`, `InventoryStatus`, `OrderStatus`, `ReceiptReviewStatus`, `UserStatus`, `DeliveryStatus`, `DeliveryKind`, `IdempotencyStatus`), матрица `ALLOWED_ORDER_TRANSITIONS`, `is_inventory_backed_item()`, доменные исключения (`UserBlockedError`, `IdempotencyConflictError`, `IdempotencyInProgressError`, `DeliveryInProgressError`, `DeliveryLeaseExpiredError`, `DeliveryCooldownError`) и dataclass-модели (`AuditEvent`, `DeliveryAttempt`, `DeliveryClaim`, `IdempotencyRecord`, `IdempotencyClaimResult`).
+  - `src/db/repositories.py` — транзакционные репозитории (`CatalogRepository`, `UserRepository`, `InventoryRepository`, `OrderRepository`, `ReceiptRepository`, `AuditRepository`, `DeliveryRepository`, `IdempotencyRepository`) и строгий типовой валидатор `_validate_int`.
+  - `src/migrations/001_initial_schema.sql`..`007_phase3_integrity_and_foundation.sql` — forward-only SQL-миграции схемы.
   - `src/db/__init__.py` — реэкспорт публичного API пакета `src.db`.
 
 ---
 
 ## 3. Используемые технологии и зависимости
 
-- **Язык:** Python 3.11+ (проверено на `Python 3.14.7`).
-- **СУБД:** встроенный `sqlite3` (PRAGMA `foreign_keys = ON`, `journal_mode = WAL`, `synchronous = NORMAL`, `busy_timeout`).
-- **Единственная внешняя зависимость (`requirements.txt`):** `cryptography>=41.0.0` (фактически установлено и протестировано `cryptography==50.0.2`).
+- **Язык:** Python 3.11+ (локально проверено на `Python 3.14.7`; GitHub Actions `.github/workflows/ci.yml` ориентирован на `3.11` и `3.12` при push/PR в `main`).
+- **СУБД:** встроенный `sqlite3` (`SQLite 3.50.4` локально; PRAGMA `foreign_keys = ON`, `journal_mode = WAL`, `synchronous = NORMAL`, `busy_timeout`).
+- **Единственная внешняя зависимость (`requirements.txt`):** `cryptography>=41.0.0`.
 - **Тестовый фреймворк:** стандартный `unittest`.
-- **Инструменты будущих фаз (НЕ установлены и НЕ используются в коде):** `aiogram`, `FastAPI`, `Playwright` упоминаются только в проектной документации (`project.md`, `project_context.md`).
+- **Сервисы и интерфейсы будущих фаз (НЕ установлены и НЕ реализованы в Stage 3.1):** `aiogram`, `FastAPI`, HTTP-вебхуки, Mini App, реальные воркеры доставки/платежей.
 
 ---
 
@@ -61,7 +63,8 @@ pip install -r requirements.txt
 python -m unittest discover -v tests
 ```
 
-Ожидаемый фактический результат: `Ran 147 tests ... OK` (включая unit, конкурентные и security-remediation тесты в `tests/test_*.py`).
+Фактический результат на локальном окружении (`Python 3.14.7`): `Ran 174 tests ... OK` (включая `147` базовых/адаптированных тестов Phase 2, `1` новый race-тест `SG-P2-007` в `tests/test_inventory.py` и `26` новых Stage 3.1 тестов в `tests/test_stage31_*.py`).
+*Примечание:* локально установлен только Python 3.14.7 (`py -0p`); прогон на Python 3.11 и 3.12 требует запуска через CI.
 
 ---
 
@@ -82,117 +85,79 @@ python -c "from src.db import create_connection, run_migrations; conn = create_c
 Механизм миграций реализован в `src/db/migrations.py`:
 
 1. `discover_migration_files()` сканирует `src/migrations/*.sql` по шаблону `^(\d+)_(.*)\.sql$` и сортирует по числовому номеру версии.
-2. `ensure_migration_table()` создаёт таблицу `schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMP)`.
-3. Для каждой неприменённой миграции `run_migrations()` открывает транзакцию `with transaction(conn, mode="IMMEDIATE"):`, после получения write-блокировки проверяет `schema_migrations` и SHA-256 `checksum`, разбивает SQL-скрипт через `sqlite3.complete_statement()` (`_split_sql_statements()`) и записывает версию в `schema_migrations` внутри той же транзакции, обеспечивая сериализацию конкурентных запусков и атомарный откат при любой ошибке (включая `BaseException`).
+2. `ensure_migration_table()` создаёт таблицу `schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT, applied_at TIMESTAMP)`.
+3. Для каждой неприменённой миграции `run_migrations()` открывает транзакцию `with transaction(conn, mode="IMMEDIATE"):`, после получения write-блокировки проверяет `schema_migrations` и SHA-256 `checksum`, запускает pre-flight хуки внутри этой же транзакции (`MIGRATION_PREFLIGHT_CHECKS`), разбивает SQL-скрипт через `_split_sql_statements()` и записывает версию в `schema_migrations` внутри той же транзакции, обеспечивая атомарный rollback при любой ошибке.
 
-Применяемые миграции на текущий момент:
-- `001_initial_schema.sql` — базовые таблицы (`schema_migrations`, `users`, `products`, `voucher_details`, `voucher_denominations`, `fixed_product_details`, `orders`, `order_items`, `inventory_items`, `payment_receipts`, `audit_events`) и индексы.
-- `002_provider_scoped_receipts.sql` — добавление `provider_name` в `payment_receipts` и пересоздание уникального индекса `idx_receipts_provider_tx(provider_name, provider_tx_id)`.
-- `003_inventory_and_integrity_guards.sql` — pre-flight проверка legacy-строк и SQLite-триггеры уровня БД, обеспечивающие совместимость `ProductType <-> InventoryType`, принадлежность `denomination_id` товару `product_id` и совпадение `payment_receipts.user_id == orders.user_id`.
-- `004_order_item_denomination.sql` — pre-flight проверка legacy `VOUCHER`-позиций, добавление `order_items.denomination_id` (`REFERENCES voucher_denominations(id) ON DELETE RESTRICT`), индекса `idx_order_items_order_product_denom` и триггеров валидации `order_items`.
-- `005_inventory_order_delete_restrict.sql` — pre-flight проверка согласованности инвентаря и заказов, перестройка `inventory_items` с `ON DELETE RESTRICT` для `reserved_order_id`, табличным `CHECK` статуса и `reserved_order_id`, триггерами соответствия `(order_id, product_id, denomination_id)` с `order_items` и запретом `DELETE FROM orders` при связанном инвентаре.
-- `006_order_items_update_and_product_type_guards.sql` — pre-flight проверка `order_items.quantity >= allocated`, пересоздание `trg_order_items_validate_update` (защита `order_id`, `product_id`, `product_type_snapshot`, `denomination_id`, `quantity` при наличии `RESERVED`/`SOLD` инвентаря) и расширение `trg_products_prevent_type_change_with_inventory` на проверку `order_items`.
+Применяемые forward-only миграции:
+- `001_initial_schema.sql` .. `006_order_items_update_and_product_type_guards.sql` — исторические миграции Phase 2 (**не редактировались, SHA-256 checksums неизменны**).
+- `007_phase3_integrity_and_foundation.sql` — Stage 3.1 БД-инварианты и новые таблицы:
+  - 9 pre-flight проверок (`_preflight_migration_007` с `LEFT JOIN` для обнаружения сиротских строк, отсутствующих/некорректных detail rows, смешанных заказов `OD-04`, `CANCELLED+RESERVED`, двусторонних инвариантов `COMPLETED`, множественных `ACCEPTED` чеков и некорректных forensic-ссылок `AR-P3-007`).
+  - Backfill `orders.paid_at` для legacy `PAID`/`FULFILLING`/`COMPLETED` заказов перед установкой триггеров `AR-P3-005`.
+  - Индексы `idx_receipts_single_accepted_per_order`, `idx_orders_status_created_at`, `idx_inventory_order_status`.
+  - Триггеры целостности `voucher_details`, `fixed_product_details`, `voucher_denominations`, `order_items` (включая запрет смешивания `MANUAL_REVIEW` и inventory-backed позиций `OD-04` и заморозку `order_items` терминальных заказов).
+  - Триггеры `inventory_items`: терминальность `SOLD` (`OD-06`, с сохранением возможности ротации `fingerprint` и `updated_at`), запрет прямой вставки `SOLD`, запрет `AVAILABLE -> SOLD`, семантика `QUARANTINED`/`DISABLED` и forensic-ссылок (`AR-P3-007`), парный контроль `INSERT`/`UPDATE` квот резервирования.
+  - Триггеры `orders` и `payment_receipts` (`AR-P3-005`, `SG-P2-004`) + append-only защита `audit_events`.
+  - Таблицы `order_deliveries` (с append-only триггерами и уникальным индексом активной попытки `DISPATCHING`, `AR-P3-001`) и `idempotency_keys` (`AR-P3-006`).
 
 ---
 
-## 8. Где находится логика заказов, товаров, платежей и выдачи цифровых товаров
+## 8. Архитектурная логика и инварианты Stage 3.1
 
-- **Товары и каталог:** `CatalogRepository` в `src/db/repositories.py` (таблицы `products`, `voucher_details`, `voucher_denominations`, `fixed_product_details`). Изменение `supply_method` у `FIXED_PRODUCT` сбрасывает `approval_status` и `products.status` в `DRAFT`.
-- **Заказы и статусы:** `OrderRepository` в `src/db/repositories.py`, переходы состояний `ALLOWED_ORDER_TRANSITIONS` в `src/db/models.py` (таблицы `orders`, `order_items`, `audit_events`).
-  - Все операции записи используют единую модель владения транзакциями `with transaction(self.conn, mode="IMMEDIATE"):` (`src/db/connection.py`), запрещающую выполнение поверх активной транзакции вызывающего кода.
-  - `create_order()` проверяет статус пользователя, совпадение `product_type_snapshot`, статус `APPROVED` товара/поставщика, целостность суммы и валюты.
-  - `transition_order_status()` проверяет допустимость перехода и использует оптимистичную блокировку (`WHERE id = ? AND status = ?`) с фиксацией в `audit_events`.
-- **Платёжные чеки (ручная сверка, без автоподтверждения оплаты):** `ReceiptRepository` в `src/db/repositories.py` (таблица `payment_receipts`).
-  - `submit_receipt()` внутри эксклюзивной `BEGIN IMMEDIATE` транзакции проверяет существование пользователя, принадлежность заказа (`orders.user_id == user_id`) без раскрытия чужих `order_id`, допустимый статус заказа (`PENDING_PAYMENT` или `PAYMENT_REVIEW`), размер файла (до 10 МБ), считает SHA-256 (`compute_receipt_sha256`), нормализует `provider_name` и `provider_tx_id`, отклоняет дубликаты по хешу файла и паре `(provider_name, provider_tx_id)`. Статус заказа автоматически в `PAID` **не** переводится.
-- **Склад, матрица совместимости и резервирование цифровых товаров:** `InventoryRepository` в `src/db/repositories.py` и `ALLOWED_INVENTORY_TYPES_BY_PRODUCT_TYPE` в `src/db/models.py`.
-  - Матрица совместимости: `VOUCHER -> {VOUCHER_CODE}`; `FIXED_PRODUCT -> {FIXED_CODE, ACTIVATION_DATA}`. Для `VOUCHER` обязательно задаётся `denomination_id`, принадлежащий `product_id` (`voucher_denominations.product_id == product_id`), что продублировано триггерами в миграции `003`.
-  - Связь со статусами заказа (`src/db/models.py`):
-    - `reserve_items_for_order()` разрешено только при `OrderStatus` в `RESERVABLE_ORDER_STATUSES` (`PENDING_PAYMENT`, `PAYMENT_REVIEW`, `PAID`, `FULFILLING`).
-    - `release_order_reservations()` разрешено только при `OrderStatus` в `RELEASABLE_ORDER_STATUSES` (`PENDING_PAYMENT`, `PAYMENT_REVIEW`, `CANCELLED`, `REFUND_REVIEW`) и никогда не затрагивает `SOLD`-позиции и чужие заказы.
-    - `finalize_order_sale()` разрешено только при `OrderStatus` в `FINALIZABLE_ORDER_STATUSES` (`PAID`, `FULFILLING`), запрещает повторное списание уже `SOLD`-товаров (`ConflictError`).
-- **Контракт расшифровки кода (`InventoryRepository.get_revealed_code()`):**
-  - Внешний/клиентский вызов расшифровки без предварительной аутентификации и авторизации (RBAC / проверка Telegram-сессии владельца или администратора) **строго запрещён**.
-  - Метод является внутренним примитивом репозитория: безусловно блокирует `QUARANTINED` и `DISABLED` позиции; при передаче контекста заказа (`expected_order_id`, `expected_user_id`) единым `JOIN`-запросом проверяет привязку `item -> order`, принадлежность заказа пользователю (`orders.user_id == expected_user_id`), обязательный статус позиции `SOLD` (после `finalize_order_sale()`) и статус заказа в `REVEALABLE_ORDER_STATUSES` (`PAID`, `FULFILLING`, `COMPLETED`).
-  - **Рекомендация для Phase 3:** реализовать сервисный слой `FulfillmentService` / Telegram-хендлер с обязательной проверкой аутентификации пользователя (`external_id` -> `user.id`), статуса заказа и ролей оператора/админа перед вызовом `get_revealed_code(..., expected_order_id=..., expected_user_id=...)`.
-  - Пользовательский UI/бот-выдача клиенту в Phase 2 — **не реализована**.
+- **Координация транзакций и `UnitOfWork` (`src/db/connection.py`, `src/db/uow.py`):**
+  - Вложенные вызовы `with transaction(conn, mode="IMMEDIATE"):` используют `SAVEPOINT` поверх единой корневой транзакции; отслеживается флаг `savepoint_created`, чтобы `ROLLBACK TO` не вызывался на несозданном savepoint, а ошибки cleanup никогда не маскировали исходное исключение (`AR-P3-002`).
+  - `UnitOfWork.read()` выставляет `PRAGMA query_only = ON` до `BEGIN DEFERRED`, фиксирует WAL read snapshot реальным запросом `SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1;` (а не константным `SELECT 1`, `AR-P3-003`), при отсутствии/пустоте `schema_migrations` выбрасывает `DatabaseError("Database schema is not initialized...")`, освобождает snapshot через `rollback()` и всегда восстанавливает предыдущий `query_only` в outer `finally`.
+- **Продуктовые решения (`OD-01`–`OD-09`):**
+  - `OD-01` / `OD-02`: `BLOCKED` пользователи блокируются на серверной стороне (`UserBlockedError`) при создании заказов, загрузке чеков, получении `get_revealed_code()` и `DeliveryRepository.claim_delivery()`. Неоплаченные заказы могут быть атомарно отменены с возвратом `RESERVED` инвентаря в `AVAILABLE`.
+  - `OD-03` / `OD-04`: `OFFICIAL_ACTIVATION` работает с `InventoryType.ACTIVATION_DATA`; разрешены совместные заказы `VOUCHER` + inventory-backed `FIXED_PRODUCT`, а смешивание с `MANUAL_REVIEW` запрещено и в Python (`OrderRepository.create_order`, `InventoryRepository.finalize_order_sale`), и SQL-триггерами `007`.
+  - `OD-05`: Пользователь не может отменить заказ в `PAYMENT_REVIEW`; `OrderRepository.cancel_order_atomically()` при отмене оператором атомарно освобождает `RESERVED` инвентарь, переводит ожидающие `PENDING_REVIEW` чеки в `REJECTED` и записывает аудит.
+  - `OD-06` / `OD-07`: `SOLD` терминален и защищён триггером от отката или подмены payload/product/order; операторский интерфейс в Stage 3.1 не имеет break-glass просмотра plaintext и использует примитивы слепой доставки.
+  - `OD-08` / `OD-09`: Пороги (`3` открытых заказа, `900s` TTL, `60s` lease, `60s` redelivery cooldown) сосредоточены в `OperationalDefaults`; `voucher_denominations.cost_rub_kopecks` трактуется как розничная цена без изменения Phase 1.
+- **Семантика доставки (`DeliveryRepository`, `AR-P3-001`):**
+  - Система честно моделирует **at-least-once delivery**: каждая попытка создаёт отдельную append-only запись с уникальными `delivery_id`, `attempt_no`, `claim_token`. Перед внешним HTTP-вызовом проверяется monotonic-бюджет (`check_pre_send_lease_budget()` -> `LEASE_EXPIRED_BEFORE_SEND` при нехватке `< 10.0s`), HTTP timeout ограничен.
+  - Поздний `SENT` после reclaim сохраняется только на старой записи с аудитом `DELIVERY_LATE_SENT_AFTER_RECLAIM`, не затрагивая новую попытку и `SOLD` инвентарь; устаревший `FAILED` игнорируется (`DELIVERY_STALE_OUTCOME_IGNORED`). Дублирование доставки при сетевом таймауте или паузе процесса после pre-send проверки математически исключить нельзя, и `exactly-once` НЕ заявляется.
+- **Семантика идемпотентности (`IdempotencyRepository`, `AR-P3-006`):**
+  - `claim()` атомарно фиксирует `(scope, actor_key, idempotency_key)` в статусе `IN_PROGRESS` с `owner_token`, возвращает `REPLAY` при `COMPLETED` и совпадающем `request_hash`, отклоняет конфликт хеша (`IdempotencyConflictError`), допускает reclaim просроченного `IN_PROGRESS` после `stale_after` (старый `owner_token` при этом отклоняется) и выселяет/очищает истёкшие ключи (`expires_at`). SQLite не ограничивает `IN_PROGRESS` на уровне commit-time CHECK — жизненный цикл управляется протоколом `claim` / `mark_completed` / `release_in_progress`.
 
 ---
 
 ## 9. Где реализованы криптография, хранение секретов и управление ключами
 
-Вся криптографическая логика находится в `src/db/crypto.py` (используется `cryptography.fernet.Fernet`, `hashlib`, `hmac`):
-
-- **Шифрование кодов инвентаря:** `encrypt_payload()` / `decrypt_payload()` используют `Fernet` (AES-128-CBC + HMAC-SHA256) с предварительной каноникализацией кода (`canonicalize_code`, обрезка граничных пробелов/переводов строк).
-- **Дедупликация инвентаря:** `compute_fingerprint()` вычисляет HMAC-SHA256 с секретным ключом `FINGERPRINT_PEPPER` (или `INVENTORY_FINGERPRINT_PEPPER`). Поддержаны `migrate_legacy_fingerprints()` и `rotate_fingerprint_pepper()` в `InventoryRepository`.
-- **Дедупликация чеков:** `compute_receipt_sha256()` (SHA-256 по сырым байтам файла).
-- **Хранение и использование `INVENTORY_ENCRYPTION_KEY`:**
-  - Вне dev/test сред ключ обязан передаваться через переменную окружения `INVENTORY_ENCRYPTION_KEY` (32 url-safe base64 байта Fernet; валидируется при обращении через `Fernet(key_bytes)`). Ключ никогда не сохраняется в SQLite и не попадает в сообщения об ошибках.
-  - `is_dev_or_test_environment()` разрешает fallback (`_DEV_FALLBACK_KEY`, `_DEV_FALLBACK_PEPPER`) **только** если задана хотя бы одна из `ENV`/`APP_ENV` и **все** заданные значения входят в `{"test", "testing", "dev", "development"}`. При `production`, `staging`, неизвестных значениях, конфликте или отсутствии обеих переменных fallback запрещён (`CryptoConfigurationError`).
-- **Последствия потери `INVENTORY_ENCRYPTION_KEY`:**
-  - Полная и необратимая потеря возможности расшифровать все зашифрованные записи `inventory_items.encrypted_payload` (включая невозможность выдачи купленных и свободных кодов, а также невозможность выполнить `rotate_fingerprint_pepper()`, так как пересчёт HMAC требует предварительной расшифровки payload).
-- **Процедура резервирования и восстановления `INVENTORY_ENCRYPTION_KEY`:**
-  - Ключ должен храниться и резервироваться **отдельно** от дампов SQLite (`backup_database`) — в защищённом менеджере секретов и/или зашифрованной оффлайн-копии (cold backup). Резервная копия БД без соответствующего `INVENTORY_ENCRYPTION_KEY` непригодна для выдачи товаров. При восстановлении сервиса из бэкапа сперва восстанавливается целевой ключ в окружении, затем БД (`restore_database`), и выполняется контрольная проверка расшифровки тестовой/канареечной записи.
-- **План безопасной ротации `INVENTORY_ENCRYPTION_KEY` (в коде Phase 2 пока НЕ реализовано — требует отдельной задачи):**
-  1. Остановка всех писателей/воркеров (quiesce) и обязательный бэкап БД + текущего ключа `old_key`.
-  2. Транзакционное перешифрование всех `inventory_items.encrypted_payload` в `BEGIN IMMEDIATE` (расшифровка `old_key` -> шифрование `new_key`, с полным rollback при ошибке) либо двухключевой переход через `cryptography.fernet.MultiFernet([new_key, old_key])`.
-  3. Канареечная проверка расшифровки `new_key` на контрольной записи.
-  4. Выкатка нового `INVENTORY_ENCRYPTION_KEY` во все инстансы, удаление `old_key` из активного чтения после завершения переходного окна, возобновление трафика.
-  - **Риски:** сбой между коммитом перешифрованной БД и выкаткой `new_key` делает инстансы со старым ключом неспособными расшифровывать коды; частичное неатомарное обновление ломает расшифровку.
-- **Отличие ротации `INVENTORY_ENCRYPTION_KEY` от ротации `FINGERPRINT_PEPPER`:**
-  - Ротация `INVENTORY_ENCRYPTION_KEY` меняет конфиденциальные шифротексты `encrypted_payload`, требует наличия и `old_key`, и `new_key` и при потере ключа ведёт к необратимой потере данных.
-  - Ротация `FINGERPRINT_PEPPER` (`InventoryRepository.rotate_fingerprint_pepper()` уже реализована) оставляет `encrypted_payload` без изменений, использует инвариантный `INVENTORY_ENCRYPTION_KEY` для чтения кода и пересчитывает только односторонние HMAC-SHA256 отпечатки `inventory_items.fingerprint` (при ошибке рассогласуется только дедупликация новых загрузок до выравнивания переменной окружения, данные не теряются).
+Вся криптографическая логика находится в `src/db/crypto.py` (`Fernet`, `hashlib`, `hmac`). См. регламент эксплуатации ключей и ротации:
+- `INVENTORY_ENCRYPTION_KEY` (32 url-safe base64 байта Fernet) и `FINGERPRINT_PEPPER` (минимум 16 байт по `SG-P2-012`) обязательны вне явно помеченных `dev`/`test` сред (`is_dev_or_test_environment()`).
+- Явная передача пустых `key=b""` или `pepper=b""` немедленно отклоняется с `CryptoConfigurationError` без отката к переменным окружения (`SG-P2-012`).
+- `AuditRepository` рекурсивно отклоняет передачу секретных ключей (`plaintext`, `code`, `raw_code`, `claim_token`, `owner_token`, `encryption_key`, `pepper`, `secret`, `password`) в `audit_events`.
+- Ротация `FINGERPRINT_PEPPER` (`rotate_fingerprint_pepper(new_pepper, old_pepper=...)`) проверяет `old_pepper` до обновления (`SG-P2-011`) и корректно обновляет `fingerprint` даже на терминальных `SOLD` позициях.
 
 ---
 
-## 10. Какие функции пока не реализованы или отключены
+## 10. Какие функции намеренно НЕ реализованы (Stage 3.2+)
 
-- Telegram-бот (`aiogram 3.x`) и обработчики команд/состояний FSM — **не реализованы**.
-- Telegram Mini App (Frontend) и Backend API (FastAPI) — **не реализованы**.
-- Автоматический приём реальных платежей (СБП / CryptoBot / вебхуки платёжных провайдеров) — **не реализовано**.
-- Автоматическая выдача цифровых товаров конечным пользователям (бот/веб-интерфейс) — **не реализовано**.
-- Парсер PS Store и каталог PS Plus Extra / Deluxe — **не реализованы**.
-- AI-консультант и AI-маркетолог — **не реализованы**.
-- Автоферма аккаунтов (Playwright) — **не реализована**.
-- HTTP-прослойки, аутентификация админки/RBAC и внешние веб-запросы — **не реализованы**.
+- Сервисный слой оркестрации (`src/services/`: checkout, receipt workflow, fulfillment & Telegram sender workers, cron/TTL reaper).
+- Миграция `008` (если потребуется в Stage 3.2 после утверждения Stage 3.1).
+- Telegram-бот (`aiogram 3.x`), FSM, хендлеры команд и операторские кнопки.
+- Mini App (Frontend), FastAPI Backend, HTTP-вебхуки платёжных провайдеров, RBAC/админка.
+- Парсер PS Store и автоферма аккаунтов (Playwright).
 
 ---
 
-## 11. Какие ограничения известны
+## 11. Известные ограничения
 
-1. **SQLite single-writer:** архитектурно SQLite допускает одного активного писателя; при высокой конкурентности записи запросы сериализуются в пределах `timeout_seconds` (`busy_timeout`).
-2. **Операционный регламент `restore_database()` (`src/db/connection.py`):** перед восстановлением БД из резервной копии все процессы приложения и воркеры обязаны быть остановлены, а все соединения закрыты. Пробы `BEGIN EXCLUSIVE` и `PRAGMA wal_checkpoint(TRUNCATE)` являются защитой в глубину, но SQLite не гарантирует межпроцессное обнаружение всех idle-соединений.
-3. **Операционный регламент `rotate_fingerprint_pepper()` (`src/db/repositories.py`):** требует остановки параллельных импортов (quiesce) до завершения ротации и обновления переменной окружения во всех инстансах.
-4. **Трассировка в конкурентном тесте (`tests/test_orders.py`):** сценарий 1 в `test_real_concurrency_approval_revocation_during_create_order` использует `sqlite3.Connection.set_trace_callback` для детерминированного воспроизведения удержания транзакции во время попытки отзыва.
-5. **Отсутствие интеграционного слоя:** в репозитории нет исполняемого entrypoint (`main.py` / CLI / сервера), логика тестируется напрямую через модули `src.engine`, `src.calculator` и `src.db`.
-6. **Непроверенные внешние интеграции:** работоспособность Telegram Bot API, внешних бирж ваучеров и платёжных шлюзов — **не проверено** (отсутствуют в кодовой базе).
-
----
-
-## 12. Какие действия запрещены до завершения аудита
-
-До получения явного положительного вердикта независимого аудита (Security Gate Phase 2) запрещено:
-
-- Начинать Phase 3 (разработку Telegram-бота, FastAPI и Mini App).
-- Подключать реальные платёжные системы и обработку живых платежей.
-- Включать автоматическую выдачу реальных цифровых кодов/аккаунтов.
-- Выполнять деплой на сервер или в production-окружение.
-- Помещать реальные ключи шифрования, токены или пользовательские базы данных в репозиторий.
+1. **SQLite single-writer:** все транзакции записи сериализуются в пределах `timeout_seconds`.
+2. **Операционный регламент `restore_database()`:** обязательная полная остановка всех процессов приложения и закрытие соединений до восстановления.
+3. **Операционный регламент `rotate_fingerprint_pepper()`:** требует остановки писателей (`quiesce`) и синхронной выкатки нового `FINGERPRINT_PEPPER`.
+4. **At-least-once delivery (`AR-P3-001`):** редкие дубликаты сообщений возможны при сетевом сбое/паузе процесса после pre-send проверки.
+5. **Версии Python в CI vs локально:** локально протестировано на `Python 3.14.7` (`174 tests OK`); прогон матрицы `Python 3.11` / `3.12` (`.github/workflows/ci.yml`) остаётся задачей CI.
 
 ---
 
-## 13. История изменений (Security Gate Phase 2 — заключительный этап)
+## 12. Действующие ограничения этапа
 
-История Git сохранена без переписывания (`rebase`/`squash` не применялись):
+В рамках Stage 3.1 ветка `feat/phase3-stage31-foundation` передаётся на независимое Argon Gate Review. До явного решения Product Commander запрещены переход к Stage 3.2, модификация Phase 1 (`src/engine/`, `src/calculator.py`), изменение исторических миграций `001`–`006`, мерж в `main` и открытие PR.
 
-- **Базовый commit (`f849bf1ede96c793ae6baa4b1b1605dd7688c6bb`):**
-  `fix(security-gate): remediate env fallback checks, transaction ownership, deterministic concurrency, checkpoint validation, and strict typing`
-  - Изменённые файлы (8): `src/db/connection.py`, `src/db/crypto.py`, `src/db/repositories.py`, `tests/test_crypto_remediation.py`, `tests/test_inventory.py`, `tests/test_orders.py`, `tests/test_receipts_and_catalog_remediation.py`, `tests/test_restore_safety.py`.
-  - Исправления замечаний аудита: строгая проверка `ENV`/`APP_ENV` (блокировка смешанных, `staging`, `unknown` и `unset` сред), проверка `in_transaction` в `OrderRepository.transition_order_status`, строгий целочисленный валидатор `_validate_int` (отсечение `bool`) во всех репозиториях, проверка `busy == 0` и `log_frames == checkpointed_frames` в `PRAGMA wal_checkpoint(TRUNCATE)` и двухфазное сохранение `.orig_bak_*` в `restore_database()`, детерминированный тест конкурентности заказа и отзыва.
-- **Промежуточный commit (`507e522603e6f543c7db2f78bac03222111ff063`):**
-  `test(orders): make real concurrency test hold active transaction during revocation attempt`
-  - Изменённые файлы (1): `tests/test_orders.py`.
-  - Исправление замечаний аудита: сценарий 1 в `test_real_concurrency_approval_revocation_during_create_order` начал реально удерживать транзакцию `create_order()` через `set_trace_callback` до коммита, а второй поток проверял блокировку пробным соединением, завершение потоков через `assertFalse(t.is_alive())`.
-- **Текущий commit (`c729cd6094384c4029017419d4aadfc7527f7726`):**
-  `test(orders): start real SQL UPDATE revocation while create_order holds transaction`
-  - Изменённые файлы (1): `tests/test_orders.py`.
-  - Исправление замечаний аудита: сценарий 1 перестроен так, чтобы вместо синтетической lock-пробы **настоящий SQL `UPDATE fixed_product_details`** стартовал и упирался в write lock SQLite, пока `create_order()` ещё удерживает транзакцию (до `allow_commit.set()`), с проверкой инвариантов `update_started_before_commit`, `update_completed_after_commit`, `1 order / 1 order_item`, `approval_status == 'DRAFT'`, `0` осиротевших записей и чистого завершения потоков.
+---
+
+## 13. История этапов в Git
+
+- **Phase 2 Verified Baseline (`a261edcd2154e524426d6a258da1862c92ce297d`):** `Merge pull request #1 from HipTwinse/security/phase2-remediation` (`main`, `origin/main`).
+- **Phase 3 Architecture Design Revision 2 (`71025e6f2b114d1df6eb23c5810fbddafeb2401c`):** ветка `docs/phase3-architecture-design`.
+- **Phase 3 Stage 3.1 Foundation (`feat/phase3-stage31-foundation`):** реализация фундамента Stage 3.1, миграции `007`, исправлений `AR-P3-001`–`008` и `SG-P2-005`–`016`, `OD-01`–`09`, а также 27 новых детерминированных тестов (`1` `SG-P2-007` + `26` Stage 3.1).

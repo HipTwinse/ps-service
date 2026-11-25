@@ -13,6 +13,7 @@ from src.db.models import (
     ApprovalStatus,
     DeliveryMethod,
     InsufficientInventoryError,
+    InvalidStateTransitionError,
     InventoryStatus,
     InventoryType,
     OrderStatus,
@@ -415,8 +416,8 @@ class TestPhase2SecurityGateRemediation(unittest.TestCase):
             )
             c2.commit()
 
-            self.assertEqual(run_migrations(c2), [4, 5, 6])
-            self.assertEqual(get_applied_migrations(c2), [1, 2, 3, 4, 5, 6])
+            self.assertEqual(run_migrations(c2), [4, 5, 6, 7])
+            self.assertEqual(get_applied_migrations(c2), [1, 2, 3, 4, 5, 6, 7])
             row = c2.execute("SELECT product_id, denomination_id FROM order_items WHERE order_id = ?", (o_id,)).fetchone()
             self.assertEqual(row["product_id"], p_id)
             self.assertIsNone(row["denomination_id"])
@@ -622,9 +623,13 @@ class TestPhase2SecurityGateRemediation(unittest.TestCase):
             ],
         )
         res_ids = self.inv_repo.reserve_items_for_order(order.id, self.voucher_prod.id, 1, self.denom_100.id)
-        self.order_repo.transition_order_status(order.id, OrderStatus.CANCELLED)
+        # SG-P2-004: cancelling while RESERVED inventory remains is blocked until reservations are released
+        with self.assertRaises(InvalidStateTransitionError):
+            self.order_repo.transition_order_status(order.id, OrderStatus.CANCELLED)
+
         released = self.inv_repo.release_order_reservations(order.id)
         self.assertEqual(released, 1)
+        self.order_repo.transition_order_status(order.id, OrderStatus.CANCELLED)
 
         row = self.conn.execute(
             "SELECT status, reserved_order_id FROM inventory_items WHERE id = ?", (res_ids[0],)
@@ -673,11 +678,11 @@ class TestPhase2SecurityGateRemediation(unittest.TestCase):
                 run_migrations(c)
             self.assertEqual(get_applied_migrations(c), [1, 2, 3, 4])
 
-            # Resolve orphaned legacy state -> 005 and 006 apply cleanly
+            # Resolve orphaned legacy state -> 005, 006, 007 apply cleanly
             c.execute("UPDATE inventory_items SET status = 'AVAILABLE' WHERE fingerprint = 'orphan_fp_1'")
             c.commit()
-            self.assertEqual(run_migrations(c), [5, 6])
-            self.assertEqual(get_applied_migrations(c), [1, 2, 3, 4, 5, 6])
+            self.assertEqual(run_migrations(c), [5, 6, 7])
+            self.assertEqual(get_applied_migrations(c), [1, 2, 3, 4, 5, 6, 7])
         finally:
             c.close()
 
@@ -1244,9 +1249,9 @@ class TestPhase2SecurityGateRemediation(unittest.TestCase):
             )
             inv_repo.reserve_items_for_order(order.id, vp.id, 1, d1.id)
 
-            # Now upgrade to 006
-            self.assertEqual(run_migrations(c), [6])
-            self.assertEqual(get_applied_migrations(c), [1, 2, 3, 4, 5, 6])
+            # Now upgrade to 006 and 007
+            self.assertEqual(run_migrations(c), [6, 7])
+            self.assertEqual(get_applied_migrations(c), [1, 2, 3, 4, 5, 6, 7])
             # Idempotent re-run
             self.assertEqual(run_migrations(c), [])
 
@@ -1302,11 +1307,11 @@ class TestPhase2SecurityGateRemediation(unittest.TestCase):
                 1,
             )
 
-            # Fix inconsistency -> 006 applies cleanly and restores trg_order_items_validate_update
+            # Fix inconsistency -> 006 and 007 apply cleanly and restore trg_order_items_validate_update
             c2.execute("UPDATE order_items SET quantity = 2 WHERE order_id = ?", (order.id,))
             c2.commit()
-            self.assertEqual(run_migrations(c2), [6])
-            self.assertEqual(get_applied_migrations(c2), [1, 2, 3, 4, 5, 6])
+            self.assertEqual(run_migrations(c2), [6, 7])
+            self.assertEqual(get_applied_migrations(c2), [1, 2, 3, 4, 5, 6, 7])
             self._assert_sql_update_blocked(
                 "UPDATE order_items SET quantity = 1 WHERE order_id = ?",
                 (order.id,),

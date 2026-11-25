@@ -65,6 +65,24 @@ class UserStatus(str, Enum):
     BLOCKED = "BLOCKED"
 
 
+class DeliveryStatus(str, Enum):
+    DISPATCHING = "DISPATCHING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+    UNCERTAIN = "UNCERTAIN"
+
+
+class DeliveryKind(str, Enum):
+    INITIAL = "INITIAL"
+    REDELIVERY = "REDELIVERY"
+    OPERATOR_RESEND = "OPERATOR_RESEND"
+
+
+class IdempotencyStatus(str, Enum):
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+
+
 # Allowed state transitions for Orders
 ALLOWED_ORDER_TRANSITIONS: Dict[OrderStatus, set[OrderStatus]] = {
     OrderStatus.PENDING_PAYMENT: {OrderStatus.PAYMENT_REVIEW, OrderStatus.CANCELLED},
@@ -146,6 +164,29 @@ def validate_inventory_type_for_product(
         )
 
 
+def is_inventory_backed_item(
+    product_type: ProductType,
+    delivery_method: Optional[DeliveryMethod] = None,
+) -> bool:
+    """Determines whether an order line item uses SQLite `inventory_items` (OD-03, OD-04).
+
+    - VOUCHER -> always inventory-backed (VOUCHER_CODE).
+    - FIXED_PRODUCT with DeliveryMethod.CODE or DeliveryMethod.OFFICIAL_ACTIVATION -> inventory-backed.
+    - FIXED_PRODUCT with DeliveryMethod.MANUAL_REVIEW -> non-inventory.
+    """
+    if not isinstance(product_type, ProductType):
+        raise ValidationError(f"Invalid product_type: {product_type!r}")
+    if product_type == ProductType.VOUCHER:
+        if delivery_method is not None:
+            raise ValidationError("delivery_method must be None for VOUCHER products.")
+        return True
+    if not isinstance(delivery_method, DeliveryMethod):
+        raise ValidationError(
+            f"FIXED_PRODUCT requires a valid DeliveryMethod (got {delivery_method!r})."
+        )
+    return delivery_method in (DeliveryMethod.CODE, DeliveryMethod.OFFICIAL_ACTIVATION)
+
+
 class InvalidStateTransitionError(DatabaseError):
     """Illegal state transition attempted."""
     pass
@@ -158,6 +199,36 @@ class InsufficientInventoryError(DatabaseError):
 
 class DuplicateReceiptError(ConflictError):
     """Payment receipt SHA-256 hash or provider transaction ID already exists."""
+    pass
+
+
+class UserBlockedError(ValidationError):
+    """Operation forbidden for BLOCKED user (subclass of ValidationError for compatibility)."""
+    pass
+
+
+class IdempotencyConflictError(ConflictError):
+    """Idempotency key reused with a different request_hash."""
+    pass
+
+
+class IdempotencyInProgressError(ConflictError):
+    """Concurrent request with identical idempotency key is actively in progress."""
+    pass
+
+
+class DeliveryInProgressError(ConflictError):
+    """An unexpired delivery dispatch lease is already active for the order."""
+    pass
+
+
+class DeliveryLeaseExpiredError(DatabaseError):
+    """Delivery lease expired prior to dispatch or recording."""
+    pass
+
+
+class DeliveryCooldownError(ConflictError):
+    """Redelivery requested before the configured cooldown elapsed."""
     pass
 
 
@@ -278,3 +349,60 @@ class AuditEvent:
     entity_id: int
     details_json: Optional[str]
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class DeliveryAttempt:
+    id: int
+    order_id: int
+    channel: str
+    delivery_kind: DeliveryKind
+    status: DeliveryStatus
+    attempt_no: int
+    claim_token: str
+    claimed_by: str
+    lease_expires_at: datetime
+    external_message_id: Optional[str]
+    error_code: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    delivered_at: Optional[datetime]
+
+
+@dataclass(frozen=True)
+class DeliveryClaim:
+    delivery_id: int
+    order_id: int
+    target_user_id: int
+    attempt_no: int
+    claim_token: str
+    delivery_kind: DeliveryKind
+    lease_expires_at: datetime
+    lease_monotonic_deadline: float
+    min_send_budget_seconds: float
+    http_timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class IdempotencyRecord:
+    id: int
+    scope: str
+    actor_key: str
+    idempotency_key: str
+    request_hash: str
+    status: IdempotencyStatus
+    owner_token: str
+    response_entity_type: Optional[str]
+    response_entity_id: Optional[int]
+    stale_after: datetime
+    expires_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class IdempotencyClaimResult:
+    outcome: str  # 'CLAIMED' or 'REPLAY'
+    record: IdempotencyRecord
+    owner_token: str
+    reclaimed: bool = False

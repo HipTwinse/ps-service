@@ -73,8 +73,20 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_order_creation_and_price_snapshots(self):
-        """Verify order items preserve historical prices even if catalog values change."""
-        items = [
+        """Verify order items preserve historical prices even if catalog values change (respecting OD-04)."""
+        # Create an inventory-backed FIXED_PRODUCT (OFFICIAL_ACTIVATION) that CAN be combined with VOUCHER
+        inv_fixed = self.catalog_repo.create_fixed_product(
+            display_name="PS Plus Activation",
+            price_rub_kopecks=24900,
+            delivery_method=DeliveryMethod.OFFICIAL_ACTIVATION,
+            supply_method="WHOLESALE_POOL",
+            duration_days=30,
+            approval_status=ApprovalStatus.APPROVED,
+            status=ProductStatus.APPROVED,
+        )
+
+        # 1. Joint order combining VOUCHER + inventory-backed FIXED_PRODUCT (OD-04 allowed)
+        joint_items = [
             {
                 "product_id": self.voucher_prod.id,
                 "denomination_id": self.denom.id,
@@ -84,23 +96,38 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
                 "metadata_json": '{"denomination_minor": 10000}',
             },
             {
-                "product_id": self.fixed_prod.id,
+                "product_id": inv_fixed.id,
                 "product_type_snapshot": "FIXED_PRODUCT",
                 "quantity": 1,
-                "unit_price_minor": 14900,
+                "unit_price_minor": 24900,
                 "metadata_json": '{"duration_days": 30}',
             },
         ]
-
         order = self.order_repo.create_order(
             user_id=self.user.id,
-            total_amount_minor=78900,
+            total_amount_minor=88900,
             currency="RUB",
-            items=items,
+            items=joint_items,
+        )
+
+        # 2. Separate order for MANUAL_REVIEW FIXED_PRODUCT (OD-04: cannot mix with inventory-backed)
+        manual_order = self.order_repo.create_order(
+            user_id=self.user.id,
+            total_amount_minor=14900,
+            currency="RUB",
+            items=[
+                {
+                    "product_id": self.fixed_prod.id,
+                    "product_type_snapshot": "FIXED_PRODUCT",
+                    "quantity": 1,
+                    "unit_price_minor": 14900,
+                    "metadata_json": '{"duration_days": 30}',
+                }
+            ],
         )
 
         self.assertEqual(order.status, OrderStatus.PENDING_PAYMENT)
-        self.assertEqual(order.total_amount_minor, 78900)
+        self.assertEqual(order.total_amount_minor, 88900)
         self.assertEqual(order.currency, "RUB")
 
         # Verify order items
@@ -111,20 +138,24 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         self.assertEqual(v_item.unit_price_minor, 32000)
         self.assertEqual(v_item.quantity, 2)
 
-        f_item = [i for i in order_items if i.product_id == self.fixed_prod.id][0]
-        self.assertEqual(f_item.unit_price_minor, 14900)
-        self.assertEqual(f_item.quantity, 1)
+        f_inv_item = [i for i in order_items if i.product_id == inv_fixed.id][0]
+        self.assertEqual(f_inv_item.unit_price_minor, 24900)
+        self.assertEqual(f_inv_item.quantity, 1)
 
-        # Mutate catalog prices: update fixed product price in DB
+        # Mutate catalog prices: update fixed product prices in DB
         self.conn.execute(
-            "UPDATE fixed_product_details SET price_rub_kopecks = 25000 WHERE product_id = ?",
-            (self.fixed_prod.id,),
+            "UPDATE fixed_product_details SET price_rub_kopecks = 35000 WHERE product_id IN (?, ?)",
+            (self.fixed_prod.id, inv_fixed.id),
         )
+        self.conn.commit()
 
         # Re-fetch order items - snapshots must remain invariant!
         refetched_items = self.order_repo.get_order_items(order.id)
-        refetched_f_item = [i for i in refetched_items if i.product_id == self.fixed_prod.id][0]
-        self.assertEqual(refetched_f_item.unit_price_minor, 14900)
+        refetched_inv_item = [i for i in refetched_items if i.product_id == inv_fixed.id][0]
+        self.assertEqual(refetched_inv_item.unit_price_minor, 24900)
+
+        refetched_manual_item = self.order_repo.get_order_items(manual_order.id)[0]
+        self.assertEqual(refetched_manual_item.unit_price_minor, 14900)
 
     def test_order_creation_blocked_for_blocked_user_or_unapproved_product(self):
         """Verify blocked user or draft product cannot create an order."""
@@ -230,7 +261,18 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         self.assertEqual(valid_order.status, OrderStatus.PENDING_PAYMENT)
 
     def test_order_state_machine_transitions(self):
-        """Verify valid transitions flow smoothly and illegal transitions are rejected."""
+        """Verify valid transitions flow smoothly and illegal transitions (including unfulfilled COMPLETED) are rejected."""
+        from src.db.models import InventoryType
+        from src.db.repositories import InventoryRepository
+
+        inv_repo = InventoryRepository(self.conn)
+        inv_repo.import_items(
+            self.voucher_prod.id,
+            ["SM-TEST-CODE-1"],
+            InventoryType.VOUCHER_CODE,
+            self.denom.id,
+        )
+
         order = self.order_repo.create_order(
             user_id=self.user.id,
             total_amount_minor=32000,
@@ -246,6 +288,7 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
                 }
             ],
         )
+        inv_repo.reserve_items_for_order(order.id, self.voucher_prod.id, 1, self.denom.id)
 
         # Current status: PENDING_PAYMENT
         # Illegal transition: PENDING_PAYMENT -> COMPLETED (must fail)
@@ -265,7 +308,12 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         order = self.order_repo.transition_order_status(order.id, OrderStatus.FULFILLING)
         self.assertEqual(order.status, OrderStatus.FULFILLING)
 
-        # Valid transition: FULFILLING -> COMPLETED
+        # SG-P2-004: FULFILLING -> COMPLETED MUST be rejected while RESERVED inventory remains
+        with self.assertRaises(InvalidStateTransitionError):
+            self.order_repo.transition_order_status(order.id, OrderStatus.COMPLETED)
+
+        # Finalize sale -> SOLD, then FULFILLING -> COMPLETED succeeds
+        self.assertEqual(inv_repo.finalize_order_sale(order.id), 1)
         order = self.order_repo.transition_order_status(order.id, OrderStatus.COMPLETED)
         self.assertEqual(order.status, OrderStatus.COMPLETED)
 
@@ -710,7 +758,6 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
           Verified DB state: 0 orders, 0 order items, 0 orphan records.
         """
         import threading
-        import time
 
         items = [
             {
@@ -813,8 +860,6 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
             sc1_events["revoke_update_started"].wait(timeout=5.0),
             "Scenario 1: real SQL UPDATE revocation did not start in time",
         )
-        # Briefly yield so the revocation thread deterministically enters SQLite busy wait on the held lock
-        time.sleep(0.05)
         self.assertEqual(sc1_results["errors"], [], f"Scenario 1 errors before commit: {sc1_results['errors']}")
         self.assertFalse(sc1_events["order_committed"].is_set(), "Scenario 1: create_order committed prematurely")
         self.assertFalse(sc1_results["revoke_ok"], "Scenario 1: revoke completed before create_order committed")

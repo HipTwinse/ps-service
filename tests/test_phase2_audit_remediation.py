@@ -817,15 +817,15 @@ class TestPhase2AuditRemediation(unittest.TestCase):
             c.commit()
             rec_repo.submit_receipt(legacy_order_id, user.id, b"legacy_receipt_bytes", provider_tx_id="LEG-TX-1")
 
-            # Upgrade using run_migrations() -> applies 003, 004, 005, 006 cleanly and adds checksum column
+            # Upgrade using run_migrations() -> applies 003..007 cleanly and adds checksum column
             newly_applied = run_migrations(c)
-            self.assertEqual(newly_applied, [3, 4, 5, 6])
+            self.assertEqual(newly_applied, [3, 4, 5, 6, 7])
 
             # Re-running is idempotent
             self.assertEqual(run_migrations(c), [])
 
             # Legacy valid data remains intact
-            self.assertEqual(len(get_applied_migrations(c)), 6)
+            self.assertEqual(len(get_applied_migrations(c)), 7)
             cur = c.cursor()
             cur.execute("SELECT COUNT(*) FROM inventory_items")
             self.assertEqual(cur.fetchone()[0], 1)
