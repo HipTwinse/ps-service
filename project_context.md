@@ -1,5 +1,5 @@
 # 🎮 СЕРВИС ДЛЯ PS: ПОЛНЫЙ КОНТЕКСТ ПРОЕКТА (PROJECT CONTEXT)
-*Дата актуализации: Ноябрь 2026 г. | Версия: 2.0 (Phase 1 + Phase 2 Security Gate Remediation)*
+*Дата актуализации: Ноябрь 2026 г. | Версия: 2.1 (Phase 1 + Phase 2 Security Gate Remediation SG-P2-001/002/003)*
 
 ---
 
@@ -65,11 +65,11 @@
 ---
 
 ## 6. ТЕКУЩИЙ СТАТУС И СЛЕДУЮЩИЙ ШАГ
-* **Текущий этап:** **Фаза 1 завершена; Фаза 2 (слой SQLite, миграции, шифрованный инвентарь, заказы, чеки и Security Gate Remediation) реализована и ожидает финального независимого аудита.**
-  - Реализованы: `src/engine/` (`knapsack.py`, `models.py`, `src/calculator.py`), `src/db/` (`connection.py`, `crypto.py`, `migrations.py`, `models.py`, `repositories.py`) и миграции `src/migrations/001_initial_schema.sql`, `002_provider_scoped_receipts.sql`.
-  - Внесены и протестированы доработки Security Gate Phase 2 (`f849bf1`, `507e522`, `c729cd6`, документация для аудита `eb64c96`).
-  - Полный набор из **107 тестов** (`python -m unittest discover -v tests`) проходит локально со статусом `OK` и подключён к GitHub Actions CI (`.github/workflows/ci.yml`). См. также [AUDIT_README.md](AUDIT_README.md).
-* **Следующий шаг:** Получение независимого вердикта **Security Gate Phase 2** (Аргон / ChatGPT) по актуальному состоянию репозитория и результатам CI. Переход к **Фазе 3** (Telegram-бот на `aiogram 3.x`, приём платежей и выдача товаров) строго заблокирован до получения явного вердикта `GO`.
+* **Текущий этап:** **Фаза 1 завершена; Фаза 2 (слой SQLite, миграции `001`–`005`, шифрованный инвентарь, заказы, чеки и Security Gate Remediation по замечаниям `SG-P2-001` / `SG-P2-002` / `SG-P2-003`) реализована и подготовлена к повторной независимой ревизии Argon.**
+  - Реализованы: `src/engine/` (`knapsack.py`, `models.py`, `src/calculator.py`), `src/db/` (`connection.py`, `crypto.py`, `migrations.py`, `models.py`, `repositories.py`) и миграции `001_initial_schema.sql` — `006_order_items_update_and_product_type_guards.sql`.
+  - Внесены и протестированы доработки по итогам Security Gate Phase 2 (`SG-P2-001`/`002`/`003` и `SG-P2-001-FOLLOWUP`; детали в `PHASE2_REMEDIATION_FINDINGS.md`, `PHASE2_REMEDIATION_TEST_RESULTS.txt`, `HANDOFF.md`).
+  - Полный набор из **147 тестов** (`python -m unittest discover -v tests`) проходит локально на `Python 3.14.7` / `SQLite 3.50.4` со статусом `OK` (Python `3.11` / `3.12` ожидают прогона в CI). См. также [AUDIT_README.md](AUDIT_README.md).
+* **Следующий шаг:** Передача исправленной Фазы 2 на независимую ревизию **Argon** и проверка CI на Python `3.11` / `3.12`. Переход к **Фазе 3** (Telegram-бот на `aiogram 3.x`, приём платежей и выдача товаров) строго заблокирован до получения явного вердикта `GO`.
 
 ---
 

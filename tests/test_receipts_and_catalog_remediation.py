@@ -48,17 +48,18 @@ class TestReceiptsAndCatalogRemediation(unittest.TestCase):
     def test_canonical_provider_name_and_scoped_tx_deduplication(self):
         """Provider name is canonicalized to uppercase stripped string and scoped correctly."""
         voucher_prod = self.catalog_repo.create_voucher_product("TR Card", "TR", "TRY", ProductStatus.APPROVED)
+        denom = self.catalog_repo.add_voucher_denomination(voucher_prod.id, "TR", "TRY", 1000, 1000)
         order1 = self.order_repo.create_order(
             user_id=self.user.id,
             total_amount_minor=1000,
             currency="RUB",
-            items=[{"product_id": voucher_prod.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000}],
+            items=[{"product_id": voucher_prod.id, "denomination_id": denom.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000}],
         )
         order2 = self.order_repo.create_order(
             user_id=self.user.id,
             total_amount_minor=1000,
             currency="RUB",
-            items=[{"product_id": voucher_prod.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000}],
+            items=[{"product_id": voucher_prod.id, "denomination_id": denom.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000}],
         )
 
         # Submit receipt with whitespace and lower-case provider
@@ -119,6 +120,7 @@ class TestReceiptsAndCatalogRemediation(unittest.TestCase):
     def test_atomic_order_creation_rejects_unapproved_item_without_orphan_records(self):
         """If any item in an order is unapproved, the entire order is rejected and NO records created."""
         valid_prod = self.catalog_repo.create_voucher_product("TR Card", "TR", "TRY", ProductStatus.APPROVED)
+        denom = self.catalog_repo.add_voucher_denomination(valid_prod.id, "TR", "TRY", 1000, 1000)
         unapproved_prod = self.catalog_repo.create_fixed_product(
             display_name="Unapproved Sub",
             price_rub_kopecks=100000,
@@ -129,7 +131,7 @@ class TestReceiptsAndCatalogRemediation(unittest.TestCase):
         )
 
         items = [
-            {"product_id": valid_prod.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000},
+            {"product_id": valid_prod.id, "denomination_id": denom.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000},
             {"product_id": unapproved_prod.id, "product_type_snapshot": "FIXED_PRODUCT", "quantity": 1, "unit_price_minor": 100000},
         ]
 
@@ -229,11 +231,12 @@ class TestReceiptsAndCatalogRemediation(unittest.TestCase):
     def test_strict_typing_receipt_repository(self):
         """ReceiptRepository methods must enforce strict typing."""
         voucher_prod = self.catalog_repo.create_voucher_product("TR Card", "TR", "TRY", ProductStatus.APPROVED)
+        denom = self.catalog_repo.add_voucher_denomination(voucher_prod.id, "TR", "TRY", 1000, 1000)
         order = self.order_repo.create_order(
             user_id=self.user.id,
             total_amount_minor=1000,
             currency="RUB",
-            items=[{"product_id": voucher_prod.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000}],
+            items=[{"product_id": voucher_prod.id, "denomination_id": denom.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 1000}],
         )
 
         # 1. submit_receipt(order_id, user_id, ...)

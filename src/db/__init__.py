@@ -9,6 +9,7 @@ from src.db.connection import (
     create_connection,
     get_connection_context,
     restore_database,
+    transaction,
 )
 from src.db.crypto import (
     CryptoConfigurationError,
@@ -24,15 +25,23 @@ from src.db.migrations import (
     run_migrations,
 )
 from src.db.models import (
+    ALLOWED_INVENTORY_TYPES_BY_PRODUCT_TYPE,
+    ALLOWED_ORDER_TRANSITIONS,
+    FINALIZABLE_ORDER_STATUSES,
+    RELEASABLE_ORDER_STATUSES,
+    RESERVABLE_ORDER_STATUSES,
+    REVEALABLE_ORDER_STATUSES,
     AuditEvent,
     ConflictError,
     DeliveryMethod,
+    DuplicateReceiptError,
     FixedProductDetails,
     InsufficientInventoryError,
     InvalidStateTransitionError,
     InventoryItem,
     InventoryStatus,
     InventoryType,
+    NotFoundError,
     Order,
     OrderItem,
     OrderStatus,
@@ -46,6 +55,7 @@ from src.db.models import (
     ValidationError,
     VoucherDenomination,
     VoucherDetails,
+    validate_inventory_type_for_product,
 )
 from src.db.repositories import (
     CatalogRepository,
@@ -59,6 +69,7 @@ __all__ = [
     # Connection & migrations
     "create_connection",
     "get_connection_context",
+    "transaction",
     "backup_database",
     "restore_database",
     "run_migrations",
@@ -90,11 +101,20 @@ __all__ = [
     "InventoryItem",
     "PaymentReceipt",
     "AuditEvent",
+    "ALLOWED_ORDER_TRANSITIONS",
+    "ALLOWED_INVENTORY_TYPES_BY_PRODUCT_TYPE",
+    "RESERVABLE_ORDER_STATUSES",
+    "RELEASABLE_ORDER_STATUSES",
+    "FINALIZABLE_ORDER_STATUSES",
+    "REVEALABLE_ORDER_STATUSES",
+    "validate_inventory_type_for_product",
     # Exceptions
+    "NotFoundError",
     "ConflictError",
     "ValidationError",
     "InsufficientInventoryError",
     "InvalidStateTransitionError",
+    "DuplicateReceiptError",
     # Repositories
     "CatalogRepository",
     "UserRepository",

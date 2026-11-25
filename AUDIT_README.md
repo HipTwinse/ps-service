@@ -61,7 +61,7 @@ pip install -r requirements.txt
 python -m unittest discover -v tests
 ```
 
-Ожидаемый фактический результат: `Ran 107 tests ... OK` (включая unit, конкурентные и security-remediation тесты в `tests/test_*.py`).
+Ожидаемый фактический результат: `Ran 147 tests ... OK` (включая unit, конкурентные и security-remediation тесты в `tests/test_*.py`).
 
 ---
 
@@ -83,18 +83,15 @@ python -c "from src.db import create_connection, run_migrations; conn = create_c
 
 1. `discover_migration_files()` сканирует `src/migrations/*.sql` по шаблону `^(\d+)_(.*)\.sql$` и сортирует по числовому номеру версии.
 2. `ensure_migration_table()` создаёт таблицу `schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMP)`.
-3. Для каждой неприменённой миграции `run_migrations()` формирует блок:
-   ```sql
-   BEGIN IMMEDIATE;
-   <содержимое файла миграции>
-   INSERT INTO schema_migrations (version, name) VALUES (<version>, '<escaped_name>');
-   COMMIT;
-   ```
-   и выполняет его через `conn.executescript(...)` без наивного разбиения по `;`, обеспечивая атомарный откат DDL/DML и записи версии при любой ошибке.
+3. Для каждой неприменённой миграции `run_migrations()` открывает транзакцию `with transaction(conn, mode="IMMEDIATE"):`, после получения write-блокировки проверяет `schema_migrations` и SHA-256 `checksum`, разбивает SQL-скрипт через `sqlite3.complete_statement()` (`_split_sql_statements()`) и записывает версию в `schema_migrations` внутри той же транзакции, обеспечивая сериализацию конкурентных запусков и атомарный откат при любой ошибке (включая `BaseException`).
 
 Применяемые миграции на текущий момент:
 - `001_initial_schema.sql` — базовые таблицы (`schema_migrations`, `users`, `products`, `voucher_details`, `voucher_denominations`, `fixed_product_details`, `orders`, `order_items`, `inventory_items`, `payment_receipts`, `audit_events`) и индексы.
 - `002_provider_scoped_receipts.sql` — добавление `provider_name` в `payment_receipts` и пересоздание уникального индекса `idx_receipts_provider_tx(provider_name, provider_tx_id)`.
+- `003_inventory_and_integrity_guards.sql` — pre-flight проверка legacy-строк и SQLite-триггеры уровня БД, обеспечивающие совместимость `ProductType <-> InventoryType`, принадлежность `denomination_id` товару `product_id` и совпадение `payment_receipts.user_id == orders.user_id`.
+- `004_order_item_denomination.sql` — pre-flight проверка legacy `VOUCHER`-позиций, добавление `order_items.denomination_id` (`REFERENCES voucher_denominations(id) ON DELETE RESTRICT`), индекса `idx_order_items_order_product_denom` и триггеров валидации `order_items`.
+- `005_inventory_order_delete_restrict.sql` — pre-flight проверка согласованности инвентаря и заказов, перестройка `inventory_items` с `ON DELETE RESTRICT` для `reserved_order_id`, табличным `CHECK` статуса и `reserved_order_id`, триггерами соответствия `(order_id, product_id, denomination_id)` с `order_items` и запретом `DELETE FROM orders` при связанном инвентаре.
+- `006_order_items_update_and_product_type_guards.sql` — pre-flight проверка `order_items.quantity >= allocated`, пересоздание `trg_order_items_validate_update` (защита `order_id`, `product_id`, `product_type_snapshot`, `denomination_id`, `quantity` при наличии `RESERVED`/`SOLD` инвентаря) и расширение `trg_products_prevent_type_change_with_inventory` на проверку `order_items`.
 
 ---
 
@@ -102,13 +99,22 @@ python -c "from src.db import create_connection, run_migrations; conn = create_c
 
 - **Товары и каталог:** `CatalogRepository` в `src/db/repositories.py` (таблицы `products`, `voucher_details`, `voucher_denominations`, `fixed_product_details`). Изменение `supply_method` у `FIXED_PRODUCT` сбрасывает `approval_status` и `products.status` в `DRAFT`.
 - **Заказы и статусы:** `OrderRepository` в `src/db/repositories.py`, переходы состояний `ALLOWED_ORDER_TRANSITIONS` в `src/db/models.py` (таблицы `orders`, `order_items`, `audit_events`).
-  - `create_order()` выполняется в собственной `BEGIN IMMEDIATE;` транзакции с проверкой статуса пользователя, совпадения `product_type_snapshot`, статуса `APPROVED` товара/поставщика, целостности суммы и валюты.
-  - `transition_order_status()` требует отсутствия активной транзакции на соединении (`if self.conn.in_transaction: raise RuntimeError`), выполняет `BEGIN IMMEDIATE;`, проверяет допустимость перехода и использует оптимистичную блокировку (`WHERE id = ? AND status = ?`) с фиксацией в `audit_events`.
+  - Все операции записи используют единую модель владения транзакциями `with transaction(self.conn, mode="IMMEDIATE"):` (`src/db/connection.py`), запрещающую выполнение поверх активной транзакции вызывающего кода.
+  - `create_order()` проверяет статус пользователя, совпадение `product_type_snapshot`, статус `APPROVED` товара/поставщика, целостность суммы и валюты.
+  - `transition_order_status()` проверяет допустимость перехода и использует оптимистичную блокировку (`WHERE id = ? AND status = ?`) с фиксацией в `audit_events`.
 - **Платёжные чеки (ручная сверка, без автоподтверждения оплаты):** `ReceiptRepository` в `src/db/repositories.py` (таблица `payment_receipts`).
-  - `submit_receipt()` проверяет размер файла (до 10 МБ), считает SHA-256 (`compute_receipt_sha256`), нормализует `provider_name` (uppercase strip) и `provider_tx_id`, проверяет дубликаты по хешу файла и паре `(provider_name, provider_tx_id)`. Статус заказа автоматически в `PAID` **не** переводится.
-- **Склад и резервирование цифровых товаров:** `InventoryRepository` в `src/db/repositories.py` (таблица `inventory_items`).
-  - Реализовано на уровне БД: импорт с шифрованием и дедупликацией (`import_items`), атомарное резервирование (`reserve_items_for_order`), освобождение резерва (`release_order_reservations`), финализация списания (`finalize_order_sale`), расшифровка кода (`get_revealed_code`), миграция/ротация HMAC fingerprint.
-  - Пользовательский UI/бот-выдача клиенту — **не реализована**.
+  - `submit_receipt()` внутри эксклюзивной `BEGIN IMMEDIATE` транзакции проверяет существование пользователя, принадлежность заказа (`orders.user_id == user_id`) без раскрытия чужих `order_id`, допустимый статус заказа (`PENDING_PAYMENT` или `PAYMENT_REVIEW`), размер файла (до 10 МБ), считает SHA-256 (`compute_receipt_sha256`), нормализует `provider_name` и `provider_tx_id`, отклоняет дубликаты по хешу файла и паре `(provider_name, provider_tx_id)`. Статус заказа автоматически в `PAID` **не** переводится.
+- **Склад, матрица совместимости и резервирование цифровых товаров:** `InventoryRepository` в `src/db/repositories.py` и `ALLOWED_INVENTORY_TYPES_BY_PRODUCT_TYPE` в `src/db/models.py`.
+  - Матрица совместимости: `VOUCHER -> {VOUCHER_CODE}`; `FIXED_PRODUCT -> {FIXED_CODE, ACTIVATION_DATA}`. Для `VOUCHER` обязательно задаётся `denomination_id`, принадлежащий `product_id` (`voucher_denominations.product_id == product_id`), что продублировано триггерами в миграции `003`.
+  - Связь со статусами заказа (`src/db/models.py`):
+    - `reserve_items_for_order()` разрешено только при `OrderStatus` в `RESERVABLE_ORDER_STATUSES` (`PENDING_PAYMENT`, `PAYMENT_REVIEW`, `PAID`, `FULFILLING`).
+    - `release_order_reservations()` разрешено только при `OrderStatus` в `RELEASABLE_ORDER_STATUSES` (`PENDING_PAYMENT`, `PAYMENT_REVIEW`, `CANCELLED`, `REFUND_REVIEW`) и никогда не затрагивает `SOLD`-позиции и чужие заказы.
+    - `finalize_order_sale()` разрешено только при `OrderStatus` в `FINALIZABLE_ORDER_STATUSES` (`PAID`, `FULFILLING`), запрещает повторное списание уже `SOLD`-товаров (`ConflictError`).
+- **Контракт расшифровки кода (`InventoryRepository.get_revealed_code()`):**
+  - Внешний/клиентский вызов расшифровки без предварительной аутентификации и авторизации (RBAC / проверка Telegram-сессии владельца или администратора) **строго запрещён**.
+  - Метод является внутренним примитивом репозитория: безусловно блокирует `QUARANTINED` и `DISABLED` позиции; при передаче контекста заказа (`expected_order_id`, `expected_user_id`) единым `JOIN`-запросом проверяет привязку `item -> order`, принадлежность заказа пользователю (`orders.user_id == expected_user_id`), обязательный статус позиции `SOLD` (после `finalize_order_sale()`) и статус заказа в `REVEALABLE_ORDER_STATUSES` (`PAID`, `FULFILLING`, `COMPLETED`).
+  - **Рекомендация для Phase 3:** реализовать сервисный слой `FulfillmentService` / Telegram-хендлер с обязательной проверкой аутентификации пользователя (`external_id` -> `user.id`), статуса заказа и ролей оператора/админа перед вызовом `get_revealed_code(..., expected_order_id=..., expected_user_id=...)`.
+  - Пользовательский UI/бот-выдача клиенту в Phase 2 — **не реализована**.
 
 ---
 
@@ -119,10 +125,22 @@ python -c "from src.db import create_connection, run_migrations; conn = create_c
 - **Шифрование кодов инвентаря:** `encrypt_payload()` / `decrypt_payload()` используют `Fernet` (AES-128-CBC + HMAC-SHA256) с предварительной каноникализацией кода (`canonicalize_code`, обрезка граничных пробелов/переводов строк).
 - **Дедупликация инвентаря:** `compute_fingerprint()` вычисляет HMAC-SHA256 с секретным ключом `FINGERPRINT_PEPPER` (или `INVENTORY_FINGERPRINT_PEPPER`). Поддержаны `migrate_legacy_fingerprints()` и `rotate_fingerprint_pepper()` в `InventoryRepository`.
 - **Дедупликация чеков:** `compute_receipt_sha256()` (SHA-256 по сырым байтам файла).
-- **Управление ключами и изоляция окружений:**
-  - Переменные окружения: `INVENTORY_ENCRYPTION_KEY`, `FINGERPRINT_PEPPER` / `INVENTORY_FINGERPRINT_PEPPER`, `ENV`, `APP_ENV`.
-  - `is_dev_or_test_environment()` разрешает fallback (`_DEV_FALLBACK_KEY`, `_DEV_FALLBACK_PEPPER`) **только** если задана хотя бы одна из `ENV`/`APP_ENV` и **все** заданные значения входят в `{"test", "testing", "dev", "development"}`. При `production`, `staging`, неизвестных значениях, конфликте (например `ENV=dev` и `APP_ENV=staging`) или отсутствии обеих переменных fallback безусловно запрещён (`CryptoConfigurationError`).
-  - В коде `src/db/crypto.py` присутствуют литералы `_DEV_FALLBACK_KEY` и `_DEV_FALLBACK_PEPPER` (исключительно для разрешённых dev/test сред). Реальные production-секреты в репозитории отсутствуют.
+- **Хранение и использование `INVENTORY_ENCRYPTION_KEY`:**
+  - Вне dev/test сред ключ обязан передаваться через переменную окружения `INVENTORY_ENCRYPTION_KEY` (32 url-safe base64 байта Fernet; валидируется при обращении через `Fernet(key_bytes)`). Ключ никогда не сохраняется в SQLite и не попадает в сообщения об ошибках.
+  - `is_dev_or_test_environment()` разрешает fallback (`_DEV_FALLBACK_KEY`, `_DEV_FALLBACK_PEPPER`) **только** если задана хотя бы одна из `ENV`/`APP_ENV` и **все** заданные значения входят в `{"test", "testing", "dev", "development"}`. При `production`, `staging`, неизвестных значениях, конфликте или отсутствии обеих переменных fallback запрещён (`CryptoConfigurationError`).
+- **Последствия потери `INVENTORY_ENCRYPTION_KEY`:**
+  - Полная и необратимая потеря возможности расшифровать все зашифрованные записи `inventory_items.encrypted_payload` (включая невозможность выдачи купленных и свободных кодов, а также невозможность выполнить `rotate_fingerprint_pepper()`, так как пересчёт HMAC требует предварительной расшифровки payload).
+- **Процедура резервирования и восстановления `INVENTORY_ENCRYPTION_KEY`:**
+  - Ключ должен храниться и резервироваться **отдельно** от дампов SQLite (`backup_database`) — в защищённом менеджере секретов и/или зашифрованной оффлайн-копии (cold backup). Резервная копия БД без соответствующего `INVENTORY_ENCRYPTION_KEY` непригодна для выдачи товаров. При восстановлении сервиса из бэкапа сперва восстанавливается целевой ключ в окружении, затем БД (`restore_database`), и выполняется контрольная проверка расшифровки тестовой/канареечной записи.
+- **План безопасной ротации `INVENTORY_ENCRYPTION_KEY` (в коде Phase 2 пока НЕ реализовано — требует отдельной задачи):**
+  1. Остановка всех писателей/воркеров (quiesce) и обязательный бэкап БД + текущего ключа `old_key`.
+  2. Транзакционное перешифрование всех `inventory_items.encrypted_payload` в `BEGIN IMMEDIATE` (расшифровка `old_key` -> шифрование `new_key`, с полным rollback при ошибке) либо двухключевой переход через `cryptography.fernet.MultiFernet([new_key, old_key])`.
+  3. Канареечная проверка расшифровки `new_key` на контрольной записи.
+  4. Выкатка нового `INVENTORY_ENCRYPTION_KEY` во все инстансы, удаление `old_key` из активного чтения после завершения переходного окна, возобновление трафика.
+  - **Риски:** сбой между коммитом перешифрованной БД и выкаткой `new_key` делает инстансы со старым ключом неспособными расшифровывать коды; частичное неатомарное обновление ломает расшифровку.
+- **Отличие ротации `INVENTORY_ENCRYPTION_KEY` от ротации `FINGERPRINT_PEPPER`:**
+  - Ротация `INVENTORY_ENCRYPTION_KEY` меняет конфиденциальные шифротексты `encrypted_payload`, требует наличия и `old_key`, и `new_key` и при потере ключа ведёт к необратимой потере данных.
+  - Ротация `FINGERPRINT_PEPPER` (`InventoryRepository.rotate_fingerprint_pepper()` уже реализована) оставляет `encrypted_payload` без изменений, использует инвариантный `INVENTORY_ENCRYPTION_KEY` для чтения кода и пересчитывает только односторонние HMAC-SHA256 отпечатки `inventory_items.fingerprint` (при ошибке рассогласуется только дедупликация новых загрузок до выравнивания переменной окружения, данные не теряются).
 
 ---
 

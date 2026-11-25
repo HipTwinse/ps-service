@@ -77,6 +77,7 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         items = [
             {
                 "product_id": self.voucher_prod.id,
+                "denomination_id": self.denom.id,
                 "product_type_snapshot": "VOUCHER",
                 "quantity": 2,
                 "unit_price_minor": 32000,
@@ -138,6 +139,7 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
                 items=[
                     {
                         "product_id": self.voucher_prod.id,
+                        "denomination_id": self.denom.id,
                         "product_type_snapshot": "VOUCHER",
                         "quantity": 1,
                         "unit_price_minor": 32000,
@@ -236,6 +238,7 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
             items=[
                 {
                     "product_id": self.voucher_prod.id,
+                    "denomination_id": self.denom.id,
                     "product_type_snapshot": "VOUCHER",
                     "quantity": 1,
                     "unit_price_minor": 32000,
@@ -276,6 +279,7 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         items = [
             {
                 "product_id": self.voucher_prod.id,
+                "denomination_id": self.denom.id,
                 "product_type_snapshot": "VOUCHER",
                 "quantity": 2,
                 "unit_price_minor": 32000,
@@ -297,6 +301,7 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         items = [
             {
                 "product_id": self.voucher_prod.id,
+                "denomination_id": self.denom.id,
                 "product_type_snapshot": "VOUCHER",
                 "quantity": 1,
                 "unit_price_minor": 32000,
@@ -389,6 +394,7 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
             items = [
                 {
                     "product_id": self.voucher_prod.id,
+                    "denomination_id": self.denom.id,
                     "product_type_snapshot": "VOUCHER",
                     "quantity": 1,
                     "unit_price_minor": 32000,
@@ -420,6 +426,7 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         items = [
             {
                 "product_id": self.voucher_prod.id,
+                "denomination_id": self.denom.id,
                 "product_type_snapshot": "VOUCHER",
                 "quantity": 1,
                 "unit_price_minor": 32000,
@@ -530,6 +537,7 @@ class TestOrderLifecycleAndSnapshots(unittest.TestCase):
         """Money and quantity fields must reject booleans (isinstance(True, int)) and non-integers."""
         base_item = {
             "product_id": self.voucher_prod.id,
+            "denomination_id": self.denom.id,
             "product_type_snapshot": "VOUCHER",
             "quantity": 1,
             "unit_price_minor": 32000,
