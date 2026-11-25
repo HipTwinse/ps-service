@@ -1,25 +1,25 @@
-# Phase 3 Architecture & Implementation Design — «Сервис для PS» (`HipTwinse/ps-service`)
+# Phase 3 Architecture & Implementation Design (Revision 1) — «Сервис для PS» (`HipTwinse/ps-service`)
 
 - **Repository:** `https://github.com/HipTwinse/ps-service`
-- **Branch:** `main`
-- **Verified HEAD SHA:** `a261edcd2154e524426d6a258da1862c92ce297d`
-- **Статус документа:** `DESIGN ONLY — IMPLEMENTATION BLOCKED PENDING PRODUCT COMMANDER APPROVAL`
-- **Статус Phase 1 (`src/engine/`, `src/calculator.py`):** не изменена (`0` diff относительно базового `main`)
+- **Source Code Baseline:** `main` @ `a261edcd2154e524426d6a258da1862c92ce297d` (`origin/main` синхронизирован; Python-код, SQL-миграции и схема БД не изменялись)
+- **Documentation Branch:** `docs/phase3-architecture-design` (Revision 1 поверх коммита `f284924edbcbdd0cc01b846b3cd0952f8c91aa45`)
+- **Статус документа:** `DESIGN ONLY (Revision 1) — IMPLEMENTATION BLOCKED PENDING PRODUCT COMMANDER APPROVAL`
+- **Статус Phase 1 (`src/engine/`, `src/calculator.py`):** не изменена (`0` diff относительно `main`)
 - **Статус Phase 2 (`src/db/`, `src/migrations/001`–`006`):** закрыта Security Gate (`GO`), PR #1 влит в `main`, CI (`Python 3.11` / `3.12`) и локальный прогон (`147` тестов на `Python 3.14.7`) — зелёные.
 
 ---
 
 ## 1. Executive Summary
 
-Настоящий документ фиксирует целевую архитектуру **Phase 3 (Service Layer, Transaction Coordination, DB Hardening & Security Policy)** перед переходом к написанию кода. Документ составлен строго на основе фактического кода на ветке `main` (`a261edcd`) и закрывает архитектурные и безопасностные риски, оставленные в статусе неблокирующих после Phase 2 (`SG-P2-004`–`SG-P2-016`), а также закладывает безопасный фундамент для будущих адаптеров Telegram-бота (`aiogram 3.x`) и Mini App API (`FastAPI`).
+Настоящий документ (Revision 1) фиксирует уточнённую целевую архитектуру **Phase 3 (Service Layer, Transaction Coordination, DB Hardening & Security Policy)** для принятия решения Product Commander о старте реализации. Документ основан на фактическом коде на `main @ a261edcd` и эмпирических проверках совместимости Python / SQLite (`Python 3.14.7` / `SQLite 3.50.4`, с обязательным последующим прогоном в CI на `Python 3.11` и `3.12`).
 
-Ключевые архитектурные решения:
+Ключевые архитектурные решения (с учётом исправлений Revision 1):
 
-1. **Координация транзакций и `Unit of Work` (`SG-P2-004`):** вместо удаления `transaction()` из репозиториев (что сломало бы 147 существующих тестов и автономную защиту репозиторного слоя) и вместо внедрения тяжёлого ORM выбирается **управляемая вложенность `transaction()` через SQLite `SAVEPOINT` + явный облегчённый `UnitOfWork`** (`uow.write()` / `uow.read()`). Неуправляемые внешние транзакции (ручной `BEGIN` или неявный DML в `sqlite3`) по-прежнему отклоняются с `RuntimeError`, а эскалация режима блокировки (`DEFERRED -> IMMEDIATE`) внутри вложенного блока запрещается.
-2. **Тонкий сервисный слой (`src/services/`) с жёстким разделением БД и сети:** вся бизнес-оркестрация выносится в сервисы (`CatalogService`, `OrderService`, `PaymentService`, `DeliveryService`) и аудит (`AuditRepository`), которые работают через короткие синхронные SQLite-транзакции (`BEGIN IMMEDIATE`, миллисекунды) в выделенном worker/thread executor. Любые сетевые операции (скачивание файла чека из Telegram, отправка сообщения с кодом пользователю, вызовы внешних API) выполняются **строго до открытия или после коммита** write-транзакции.
-3. **Инварианты жизненного цикла заказа и SQLite (`SG-P2-004`, `SG-P2-006`):** запрещается переход `FULFILLING -> COMPLETED` при наличии `RESERVED` инвентаря или неполном `SOLD`-покрытии `order_items`; переход в `CANCELLED` разрешается только при отсутствии `RESERVED` инвентаря (сервис атомарно вызывает `release_order_reservations()` и `transition_order_status(CANCELLED)`). Эти правила дублируются триггерами SQLite в новой **миграции `007`** (вместе с запретом отката `SOLD` и запретом привязки `voucher_denominations` к `FIXED_PRODUCT`).
-4. **Двухфазная идемпотентная доставка и политика безопасности:** фиксация факта оплаты и перевод инвентаря в `SOLD` происходят атомарно в БД, после чего `DeliveryService` готовит зашифрованный/расшифрованный payload с маскированием в `__repr__`, а Telegram-адаптер выполняет доставку с `protect_content=True` и фиксацией попытки в таблице `order_deliveries` (**миграция `008`**). Спорные политики доступа (`BLOCKED`-пользователи, ручная/автоматическая активация `FIXED_PRODUCT`, возвраты `SOLD`, просмотр кодов оператором) вынесены в **Раздел 13 (`OD-01`–`OD-09`)** на утверждение Product Commander.
-5. **Нулевое вмешательство в Phase 1:** `src/engine/` и `src/calculator.py` остаются неизменными; связь между `Denomination`/`SelectedDenomination` и `voucher_denominations` реализуется на сервисном уровне через уникальный ключ `(region, currency, face_value_minor)`.
+1. **Механизм координации транзакций без `WeakKeyDictionary` (`SG-P2-004`):** стандартный `sqlite3.Connection` в CPython не поддерживает слабые ссылки (`TypeError: cannot create weak reference to 'sqlite3.Connection' object`). Вместо `WeakKeyDictionary` и вместо удаления `transaction()` из репозиториев выбирается **реестр активных управляемых транзакций `_ACTIVE_MANAGED_TX: dict[int, _ManagedTxEntry]` (ключ `id(conn)`) со строгой проверкой `entry.conn is conn`, сильной ссылкой строго на время активной корневой транзакции и гарантированной очисткой в `finally:`**. Вложенные управляемые вызовы используют `SAVEPOINT`; неуправляемые внешние транзакции, кросс-поточный доступ и эскалация режима блокировки (`DEFERRED -> IMMEDIATE`) жёстко отклоняются с `RuntimeError`.
+2. **Согласованные чтения в `UnitOfWork` (`uow.read()` vs `uow.write()`):** `uow.read()` всегда открывает явный `BEGIN DEFERRED` в режиме `PRAGMA query_only = ON` и сразу выполняет `SELECT 1;` для фиксации единого WAL-снимка на всю серию `SELECT` (каталог, цены, остатки склада, статус пользователя). Скрытая эскалация `DEFERRED -> IMMEDIATE` и любые записи внутри `uow.read()` блокируются на трёх уровнях (`ReadSession` API, Python-реестр `transaction()`, SQLite `PRAGMA query_only = ON`). `uow.write()` открывает корневой `BEGIN IMMEDIATE` (или `EXCLUSIVE`) на одном соединении для всех репозиториев.
+3. **Рабочая схема pre-flight для миграции `007` (`SG-P2-006`):** автономный `SELECT RAISE(ABORT, ...)` в SQLite вне триггеров синтаксически нелегален (`OperationalError: RAISE() may only be used within a trigger-program`). Вместо него проектируется **Python pre-flight hook (`MIGRATION_PREFLIGHT_CHECKS[7]`) в `run_migrations()`**, выполняющийся внутри **той же** транзакции `BEGIN IMMEDIATE` строго **до** миграционного DDL. Проверка выполняется через `SELECT` с `LEFT JOIN`; при нарушении выбрасывается `MigrationPreflightError`, транзакция откатывается без единого DDL-изменения, старые checksum `001`–`006` не затрагиваются, повторный запуск безопасен.
+4. **4-стадийный Delivery Workflow (без ложных гарантий `exactly-once`):** выдача цифровых товаров разделяется на независимые фазы: **A. `Claim delivery`** (короткая write-транзакция с lease-токеном и защитой от гонок), **B. `Prepare payload`** (после коммита claim: короткий `uow.read()` для выборки и расшифровки `SOLD`-кодов в памяти с маскированным `__repr__`), **C. `External delivery`** (Telegram Bot API `protect_content=True` полностью вне БД и SQLite-блокировок), **D. `Record outcome`** (отдельная короткая write-транзакция CAS-фиксации `SENT` / `FAILED` / `UNCERTAIN`). Поскольку Telegram Bot API не даёт распределённых транзакций, система честно гарантирует **at-least-once внешнюю доставку с однопоточной lease-дедупликацией и нулевым риском двойного списания со склада**.
+5. **Сохранение Phase 1 и открытые решения:** `src/engine/` и `src/calculator.py` не изменяются; спорные продуктовые/безопасностные политики вынесены в **Раздел 13 (`OD-01`–`OD-09`)**.
 
 ---
 
@@ -27,43 +27,44 @@
 
 ### 2.1. Phase 1 (`src/calculator.py`, `src/engine/`)
 
-Фактическая реализация на `HEAD` `a261edcd`:
-- `src/calculator.py` (`L1–L28`) — чистый фасад реэкспорта `src/engine/__init__.py`.
+Фактическая реализация на `main @ a261edcd`:
+- `src/calculator.py` (`L1–L28`) — фасад реэкспорта `src/engine/__init__.py`.
 - `src/engine/models.py`:
   - `Region` (`TR`, `US`), `Currency` (`TRY`, `USD`, алиас `US = "USD"` — валюты `RUB` в Phase 1 нет), `REGION_CURRENCY_MAP = {Region.TR: Currency.TRY, Region.US: Currency.USD}`.
   - `Denomination(face_value_minor: int, cost_rub_kopecks: int, stock_limit: int, enabled: bool = True)`.
   - `SelectedDenomination(face_value_minor: int, quantity: int, cost_rub_kopecks: int, total_cost_rub_kopecks: int)`.
   - `OptimizationResult(status, region, currency, target_amount_minor, selected_denominations, total_face_value_minor, wallet_change_minor, total_procurement_cost_rub_kopecks, voucher_count, reason)` со свойством `is_success`.
-  - Контрактные лимиты: `DEFAULT_MAX_VOUCHERS_PER_ORDER = 6`, `MAX_PERMITTED_VOUCHERS_PER_ORDER = 20`, `MAX_TARGET_AMOUNT_MINOR = 5_000_000`, `MAX_FACE_VALUE_MINOR = 5_000_000`, `MAX_COST_RUB_KOPECKS = 50_000_000`, `MAX_STOCK_LIMIT = 1_000`, `MAX_DENOMINATIONS_COUNT = 20`.
-- `src/engine/knapsack.py`: функция `calculate_optimal_vouchers(...)` (лексикографическая оптимизация: минимум `total_procurement_cost_rub_kopecks`, затем минимум `wallet_change_minor`, затем минимум `voucher_count`, затем предпочтение более крупных номиналов).
+  - Контрактные ограничения: `DEFAULT_MAX_VOUCHERS_PER_ORDER = 6`, `MAX_PERMITTED_VOUCHERS_PER_ORDER = 20`, `MAX_TARGET_AMOUNT_MINOR = 5_000_000`, `MAX_FACE_VALUE_MINOR = 5_000_000`, `MAX_COST_RUB_KOPECKS = 50_000_000`, `MAX_STOCK_LIMIT = 1_000`, `MAX_DENOMINATIONS_COUNT = 20`.
+- `src/engine/knapsack.py`: функция `calculate_optimal_vouchers(...)` (Branch-and-Bound оптимизатор: минимум `total_procurement_cost_rub_kopecks`, минимум `wallet_change_minor`, минимум `voucher_count`, приоритет более крупных номиналов).
 
-**Критическое наблюдение по интеграции Phase 1 <-> Phase 2:**
-1. `Denomination` и `SelectedDenomination` не содержат `denomination_id` и `product_id`. Мост строится через ограничение `UNIQUE (region, currency, face_value_minor)` таблицы `voucher_denominations` (`001_initial_schema.sql:49`).
-2. `CatalogRepository.get_active_denominations(region, currency)` (`src/db/repositories.py:236–259`) фильтрует только `voucher_denominations.is_active = 1` и **не проверяет `products.status = 'APPROVED'`**, тогда как `OrderRepository.create_order()` (`src/db/repositories.py:1050`) отклоняет заказы на `DRAFT`/`DISABLED`-продукты.
-3. Контракт валюты расходится между слоями: Phase 1 оперирует номиналами в `TRY`/`USD` и ценами `cost_rub_kopecks`, а `OrderRepository.create_order()` (`src/db/repositories.py:1073–1114`) для `VOUCHER` и `FIXED_PRODUCT` жёстко требует `currency == "RUB"` и точного совпадения `unit_price_minor == voucher_denominations.cost_rub_kopecks`.
+**Критическое наблюдение по мосту Phase 1 <-> Phase 2:**
+1. `Denomination` и `SelectedDenomination` не содержат `denomination_id` и `product_id`; сопоставление с БД идёт по `UNIQUE (region, currency, face_value_minor)` таблицы `voucher_denominations` (`001_initial_schema.sql:49`).
+2. `CatalogRepository.get_active_denominations(region, currency)` (`src/db/repositories.py:236–259`) фильтрует только `voucher_denominations.is_active = 1`, но **не проверяет `products.status = 'APPROVED'`**, тогда как `OrderRepository.create_order()` (`src/db/repositories.py:1050`) требует `APPROVED`.
+3. Phase 1 принимает `TRY`/`USD` и считает `total_procurement_cost_rub_kopecks`, а `OrderRepository.create_order()` (`src/db/repositories.py:1073–1114`) требует `currency == "RUB"` и точного совпадения `unit_price_minor == voucher_denominations.cost_rub_kopecks`.
 
 ### 2.2. Phase 2 (`src/db/` и `src/migrations/001`–`006`)
 
-Фактическая реализация на `HEAD` `a261edcd`:
+Фактическая реализация на `main @ a261edcd`:
 - **`src/db/connection.py`:**
-  - `get_connection()` / `create_connection()`: выставляет `row_factory = sqlite3.Row`, `PRAGMA foreign_keys = ON`, `PRAGMA busy_timeout = {timeout_seconds * 1000}`, для файловых БД `PRAGMA journal_mode = WAL` и `PRAGMA synchronous = NORMAL`; использует стандартный `isolation_level=""` модуля `sqlite3`.
-  - `transaction(conn, mode="IMMEDIATE")`: немедленно падает с `RuntimeError`, если `conn.in_transaction` уже `True` (`L97–L100`); в `except BaseException:` откатывает транзакцию (`L106–L112`).
+  - `get_connection()` / `create_connection()`: выставляет `row_factory = sqlite3.Row`, `PRAGMA foreign_keys = ON`, `PRAGMA busy_timeout`, для файловых БД `PRAGMA journal_mode = WAL` и `PRAGMA synchronous = NORMAL`; использует стандартный `isolation_level=""` модуля `sqlite3`.
+  - `transaction(conn, mode="IMMEDIATE")`: при `conn.in_transaction == True` падает с `RuntimeError` (`L97–L100`); в `except BaseException:` откатывает транзакцию (`L106–L112`).
   - `backup_database()` (`L115–L138`): запрещает запуск при `source_conn.in_transaction`.
-  - `restore_database()` (`L141–L330`): проверяет блокировку через `BEGIN EXCLUSIVE` + `PRAGMA wal_checkpoint(TRUNCATE)`, восстанавливает во временный файл, проверяет `PRAGMA integrity_check`, подменяет БД через `.orig_bak_*`, но в блоках `L232`, `L262`, `L295` ловит `except Exception:` вместо `BaseException` (`SG-P2-014`).
-- **`src/db/crypto.py`:** Fernet-шифрование (`encrypt_payload` / `decrypt_payload`) + HMAC-SHA256 (`compute_fingerprint`) с политикой `ENV`/`APP_ENV`. Fallback-секреты разрешены только когда задан хотя бы один из `ENV`/`APP_ENV` и все заданные значения входят в `{"test", "testing", "dev", "development"}`. Наблюдаются мелкие огрехи `SG-P2-012`: `key or get_encryption_key()` (пустые `b""` подменяются), нет минимальной длины `FINGERPRINT_PEPPER`, пробельный `FINGERPRINT_PEPPER` затеняет `INVENTORY_FINGERPRINT_PEPPER`.
-- **`src/db/migrations.py`:** `run_migrations()` сериализуется через `BEGIN IMMEDIATE`, проверяет SHA-256 `checksum` в `schema_migrations`, использует `_split_sql_statements()` на базе построчного `sqlite3.complete_statement(buffer)`. Остаточные краевые случаи парсера (`;` в одной строке или завершающий `/* ... */`) описаны в `SG-P2-005`.
-- **`src/db/repositories.py`:** 5 классов (`CatalogRepository`, `UserRepository`, `InventoryRepository`, `OrderRepository`, `ReceiptRepository`). **`AuditRepository` отсутствует** — запись в `audit_events` выполняется только внутри `OrderRepository.transition_order_status()` (`L1185–L1193`).
-- **`src/migrations/001`–`006`:** 11 таблиц, 13 индексов, 12 активных триггеров. Главные ограничения текущей реализации:
-  1. Нельзя объединить несколько методов репозиториев в одну атомарную транзакцию (`SG-P2-004`).
-  2. `OrderRepository.transition_order_status()` не проверяет инвентарь при переходе в `COMPLETED` или `CANCELLED`, а `finalize_order_sale()` проверяет все `order_items` без исключения для неинвентарных `FIXED_PRODUCT` (`MANUAL_REVIEW`).
-  3. Прямые SQL-операции обходят часть бизнес-ограничений (`SOLD -> AVAILABLE`, `voucher_denominations -> FIXED_PRODUCT`, прыжки статусов `orders`, изменение `order_items` после оплаты) (`SG-P2-006`).
-  4. `ReceiptRepository.submit_receipt()` не проверяет `users.status == 'BLOCKED'`, а `update_review_status()` допускает любой откат статуса проверки чека.
-  5. Методы записи репозиториев читают возвращаемый DTO (`self.get_*()`) после выхода из `with transaction(...)` (`SG-P2-014`).
-  6. `InventoryRepository.get_revealed_code()` не проверяет `users.status` и отдаёт разные сообщения `ValidationError` по статусу/владению (`SG-P2-013`).
+  - `restore_database()` (`L141–L330`): проверяет блокировку (`BEGIN EXCLUSIVE` + `PRAGMA wal_checkpoint(TRUNCATE)`), проверяет `PRAGMA integrity_check`, подменяет файл через `.orig_bak_*`, но в блоках `L232` (временный файл бэкапа), `L257` (staging safety backups) и `L295` (swap & rollback, плюс `L304` при копировании обратно) ловит `except Exception:` вместо `BaseException` (`SG-P2-014`).
+- **`src/db/crypto.py`:** Fernet-шифрование + HMAC-SHA256 с проверкой `ENV`/`APP_ENV`. Остаются недочёты `SG-P2-012` (`key or get_encryption_key()`, нет минимальной длины `FINGERPRINT_PEPPER`, пробельный `FINGERPRINT_PEPPER` затеняет `INVENTORY_FINGERPRINT_PEPPER`).
+- **`src/db/migrations.py`:** `run_migrations()` сериализует применение миграций через `BEGIN IMMEDIATE`, проверяет SHA-256 `checksum` в `schema_migrations`, разбивает скрипт через `_split_sql_statements()` (`sqlite3.complete_statement`). Остаточные краевые случаи парсера (`;` в одной строке или завершающий `/* ... */`) описаны в `SG-P2-005`. Прикладные миграции `003`–`006` реализовали пре-флайты через SQL-паттерн `CREATE TEMP TABLE ... CHECK (ok = 1)`.
+- **`src/db/repositories.py`:** 5 классов (`CatalogRepository`, `UserRepository`, `InventoryRepository`, `OrderRepository`, `ReceiptRepository`). **`AuditRepository` отсутствует** — запись в `audit_events` выполняется только в `OrderRepository.transition_order_status()` (`L1185–L1193`).
+- **`src/migrations/001`–`006`:** 11 таблиц, 13 индексов, 12 активных триггеров. Ключевые пробелы на `HEAD`:
+  1. Невозможность объединить несколько write-операций репозиториев в одну транзакцию (`SG-P2-004`).
+  2. `OrderRepository.transition_order_status()` разрешает `FULFILLING -> COMPLETED` без проверки инвентаря и `-> CANCELLED` при наличии `RESERVED` (`SG-P2-004`).
+  3. `finalize_order_sale()` требует `RESERVED`-инвентарь для **всех** `order_items`, не различая неинвентарные `FIXED_PRODUCT` (`MANUAL_REVIEW`).
+  4. На уровне SQLite не закрыты `SOLD -> AVAILABLE`, привязка `voucher_denominations -> FIXED_PRODUCT`, прыжки `orders.status`, изменение/отмена уже обработанных `payment_receipts` и правки `order_items` после оплаты (`SG-P2-006`).
+  5. `ReceiptRepository.submit_receipt()` не проверяет `users.status == 'BLOCKED'`; `update_review_status()` не запрещает откат терминальных статусов чека; `get_revealed_code()` не проверяет `users.status` (`SG-P2-013`).
+  6. Методы записи репозиториев читают возвращаемый DTO (`self.get_*()`) после выхода из `with transaction(...)` (`SG-P2-014`).
 
-**Влияние на существующие тесты Phase 2 (важно для планирования Stage 3.1):**
-- `tests/test_orders.py:232–275` (`test_order_state_machine_transitions`) создаёт заказ типа `VOUCHER` без резервирования/финализации инвентаря и переводит его `FULFILLING -> COMPLETED`. После включения инварианта `SG-P2-004` этот тест потребует либо резервирования/финализации инвентаря перед `COMPLETED`, либо использования неинвентарного `FIXED_PRODUCT` с подтверждением ручного выполнения.
-- `tests/test_phase2_security_gate_remediation.py:605–643` (`test_sg_p2_002_cancelled_order_release_lifecycle_and_safe_cleanup`) вызывает `transition_order_status(CANCELLED)` **до** `release_order_reservations(order.id)`. При принятии строгой предусловий-модели `CANCELLED` (Вариант A, Раздел 5) порядок шагов в этом тесте должен быть инвертирован (`release` до `CANCELLED` или через `OrderService.cancel_order()`) с добавлением негативного теста, подтверждающего блокировку `CANCELLED` при наличии `RESERVED`.
+**Все 3 существующих теста Phase 2, затрагиваемые проектированием Phase 3 (важно для Stage 3.1):**
+1. `tests/test_orders.py:232–275` (`test_order_state_machine_transitions`) — создаёт заказ `VOUCHER` с 0 инвентаря и переводит его `FULFILLING -> COMPLETED`. При включении инварианта `SG-P2-004` потребуется резерв+финализация инвентаря до `COMPLETED` (или отдельный тест на неинвентарный `FIXED_PRODUCT`).
+2. `tests/test_phase2_security_gate_remediation.py:605–643` (`test_sg_p2_002_cancelled_order_release_lifecycle_and_safe_cleanup`) — вызывает `transition_order_status(CANCELLED)` **до** `release_order_reservations()`. При строгой модели `CANCELLED` (Вариант A, Раздел 5.4) порядок должен быть `release` -> `CANCELLED` (или `OrderService.cancel_order()`).
+3. `tests/test_phase2_remediation_followup.py:75–82, 225–274` (`test_finalize_order_sale_enforces_complete_reservation_atomically`) — проверяет **смешанный заказ** (`VOUCHER` + `FIXED_PRODUCT` с `DeliveryMethod.OFFICIAL_ACTIVATION` и `InventoryType.ACTIVATION_DATA`) через `finalize_order_sale()`. Выбор политик `OD-03` и `OD-04` напрямую влияет на то, сохраняется ли этот контракт или мигрирует в Stage 3.1.
 
 ---
 
@@ -76,197 +77,215 @@ flowchart TD
     TG["Telegram Bot / Webhook (aiogram 3.x)"] --> BRIDGE["Async-to-Sync DB Bridge (asyncio.to_thread)"]
     MINI["Mini App HTTP API (FastAPI / Future)"] --> BRIDGE
     OP["Operator Admin Handlers (RBAC Allowlist)"] --> BRIDGE
-    TG --> DLV_ADAPTER["TelegramDeliveryAdapter (protect_content=True)"]
-    TG --> DL_FILE["Pre-Tx Receipt File Download (Telegram File API)"]
 
+    TG --> DL_FILE["Pre-Tx Receipt File Download (Telegram File API)"]
     BRIDGE --> SVC_CAT["CatalogService"]
     BRIDGE --> SVC_ORD["OrderService"]
     BRIDGE --> SVC_PAY["PaymentService"]
     BRIDGE --> SVC_DLV["DeliveryService"]
 
-    SVC_CAT --> P1["Phase 1 Engine (src/calculator.py / src/engine/ - UNTOUCHED)"]
-    SVC_ORD --> UOW["UnitOfWork (uow.write / uow.read)"]
+    SVC_CAT --> P1["Phase 1 Engine (src/calculator.py - UNTOUCHED)"]
+    SVC_CAT --> UOW["UnitOfWork (uow.read / uow.write)"]
+    SVC_ORD --> UOW
     SVC_PAY --> UOW
     SVC_DLV --> UOW
-    SVC_CAT --> UOW
 
-    UOW --> TX["connection.transaction (Root BEGIN IMMEDIATE + Managed SAVEPOINT)"]
-    UOW --> REPOS["Phase 2 Repositories + AuditRepository"]
-    REPOS --> TX
+    UOW --> READ["uow.read(): BEGIN DEFERRED + PRAGMA query_only=ON"]
+    UOW --> WRITE["uow.write(): Root BEGIN IMMEDIATE + Managed SAVEPOINT"]
+
+    READ --> REPOS["Phase 2 Repositories + AuditRepository"]
+    WRITE --> REPOS
     REPOS --> CRYPTO["crypto.py (Fernet + HMAC-SHA256)"]
-    TX --> DB["SQLite WAL (001-006 + 007 Guards + 008 Support Tables)"]
+    REPOS --> DB["SQLite WAL (001-006 + 007 Guards + 008 Support Tables)"]
 
-    SVC_DLV -. "Post-Commit Payload" .-> DLV_ADAPTER
+    SVC_DLV -. "Stage A: Claim Lease / Stage D: Record Outcome (uow.write)" .-> WRITE
+    SVC_DLV -. "Stage B: Decrypt SOLD Payload (uow.read)" .-> READ
+    SVC_DLV -. "Stage C: In-Memory Payload (No DB Lock)" .-> DLV_ADAPTER["TelegramDeliveryAdapter (protect_content=True)"]
     DL_FILE -. "Bytes + Metadata" .-> SVC_PAY
 ```
 
-### 3.2. Принципы разграничения слоёв
+### 3.2. Разграничение ответственности слоёв
 
-| Слой | Размещение | Ответственность | Жёсткие ограничения |
+| Слой | Размещение | Ответственность | Жёсткие запреты |
 | :--- | :--- | :--- | :--- |
-| **Transport / Adapters** | `src/bot/` (Stage 3.3, не в 3.1/3.2) | Парсинг Telegram updates/HTTP, скачивание файлов чеков, проверка allowlist операторов, отправка сообщений и обработка сетевых ретраев | Не импортирует `sqlite3` напрямую, не открывает транзакций, не формирует SQL |
-| **Service Layer** | `src/services/` (Stage 3.2) | Сценарная оркестрация (UoW), проверка `ActorContext` и политик доступа, вызов Phase 1, идемпотентность, аудит, подготовка и фиксация статуса доставки | Не делает HTTP/Telegram API вызовов внутри `uow.write()`, не хранит глобального мутабельного состояния |
-| **Domain Engine (Phase 1)** | `src/engine/`, `src/calculator.py` | Математический расчёт оптимального набора номиналов (`calculate_optimal_vouchers`) | **Неприкосновенно.** Чистые вычисления без БД и сети |
-| **Repository & DB Layer** | `src/db/`, `src/migrations/` | CRUD, криптография, транзакционные примитивы (`BEGIN IMMEDIATE` / `SAVEPOINT`), DB-инварианты и триггеры | Не принимает решений об UX/Telegram, не содержит сетевого I/O |
+| **Transport / Adapters** | `src/bot/` (Stage 3.3) | Приём updates/HTTP, скачивание файлов чеков, проверка allowlist операторов, вызов Telegram API доставки (`Stage C`) | Не импортирует `sqlite3`, не открывает транзакций, не формирует SQL |
+| **Service Layer** | `src/services/` (Stage 3.2) | Оркестрация через `UnitOfWork`, проверка `ActorContext` и политик доступа, вызов Phase 1, идемпотентность, аудит, `Claim`/`Prepare`/`Record` доставки | Не выполняет Telegram/HTTP I/O внутри `uow.write()` или `uow.read()` |
+| **Domain Engine (Phase 1)** | `src/engine/`, `src/calculator.py` | Математический подбор номиналов (`calculate_optimal_vouchers`) | **Неприкосновенно.** Никакого I/O и зависимостей от БД |
+| **Repository & DB Layer** | `src/db/`, `src/migrations/` | CRUD, криптография, реестр управляемых транзакций (`BEGIN`/`SAVEPOINT`), `run_migrations` + pre-flight hooks, SQLite-триггеры | Не содержит сетевых вызовов и Telegram-специфики |
 
-### 3.3. Компоненты сервисного слоя и контракты методов
+### 3.3. Компоненты сервисного слоя и контракты
 
-#### 1) `src/services/actor.py` — контекст субъекта
+#### 1) `src/services/actor.py` — субъект вызова
 - `ActorType(str, Enum)`: `USER = "USER"`, `OPERATOR = "OPERATOR"`, `SYSTEM = "SYSTEM"`.
 - `@dataclass(frozen=True) class ActorContext`:
   - `actor_type: ActorType`
-  - `user_id: Optional[int]` (внутренний `users.id` для `USER`; `None` для `SYSTEM`)
-  - `external_id: str` (Telegram `user.id` или `"SYSTEM_TTL_WORKER"`)
-  - `correlation_id: Optional[str] = None` (для трассировки без секретов).
+  - `user_id: Optional[int]` (обязателен `>= 1` для `USER`; `None` для `OPERATOR`/`SYSTEM`)
+  - `external_id: str` (непустой идентификатор: Telegram `user.id` или `"SYSTEM_TTL_WORKER"` / `"SYSTEM_DELIVERY_REAPER"`)
+  - `correlation_id: Optional[str] = None` (ID запроса/trace для аудита без секретов).
 
-#### 2) `src/services/errors.py` — иерархия доменных исключений
-Наследует базовые классы из `src/db/models.py` (`DatabaseError` и его подклассы), чтобы исключения не теряли семантику при пробросе:
-- `ServiceError(DatabaseError)` — базовый класс сервисного слоя (или обёртка-миксин над `DatabaseError`).
-- `PermissionDeniedError(DatabaseError)` — нарушение RBAC или чужой контекст (`actor` не владелец / не оператор).
-- `UserBlockedError(PermissionDeniedError)` — операция отклонена из-за `UserStatus.BLOCKED`.
-- `PriceChangedError(ConflictError)` — между квотированием Phase 1 и checkout изменился прайс или активность номинала в каталоге.
-- `IdempotencyConflictError(ConflictError)` — повторное использование `idempotency_key` с другим payload (`request_hash` не совпадает).
-- `DeliveryError(ServiceError)` — ошибка подготовки/фиксации доставки (без утечки plaintext-кода в тексте исключения).
+#### 2) `src/services/errors.py` — согласованная иерархия доменных исключений
+Все сервисные ошибки наследуют `ServiceError(DatabaseError)` (и при конфликте/ограничении также соответствующий базовый класс `src.db.models`), чтобы обработчики верхнего уровня могли ловить как узкие классы (`ConflictError`, `PermissionDeniedError`), так и общий `ServiceError` или `DatabaseError`:
+- `ServiceError(DatabaseError)` — корень сервисных исключений.
+- `PermissionDeniedError(ServiceError)` — нарушение RBAC, отсутствие прав, anti-oracle ошибка доступа к чужому/несуществующему заказу/коду.
+- `UserBlockedError(PermissionDeniedError)` — запрет действия для `UserStatus.BLOCKED`.
+- `PriceChangedError(ConflictError, ServiceError)` — расхождение цены/активности/наличия между квотой и checkout.
+- `IdempotencyConflictError(ConflictError, ServiceError)` — повтор `idempotency_key` с отличающимся `request_hash`.
+- `DeliveryError(ServiceError)` — ошибка стадий доставки (в `__str__` запрещено включать plaintext-коды).
+- `DeliveryInProgressError(ConflictError, DeliveryError)` — активный неистёкший lease `DISPATCHING` другого обработчика.
 
-#### 3) `src/services/catalog_service.py` — каталог и мост к Phase 1
-- `list_approved_voucher_denominations(region: str, currency: str) -> list[VoucherQuoteCandidate]`:
-  - Граница: `uow.read()`.
-  - Запрос: `JOIN products` (`products.status = 'APPROVED' AND products.product_type = 'VOUCHER'`) + `voucher_denominations.is_active = 1` + агрегат доступного склада (`COUNT(*) FROM inventory_items WHERE status = 'AVAILABLE' GROUP BY denomination_id`).
+#### 3) `src/services/uow.py` — `UnitOfWork`, `ReadSession`, `WriteSession`
+- `ReadSession` (только read-методы и сервисные read-запросы на едином `conn` в `BEGIN DEFERRED` + `PRAGMA query_only = ON`):
+  - `.catalog` (read-методы), `.users` (read-методы), `.orders` (read-методы), `.receipts` (read-методы), `.inventory` (read-методы, включая `get_revealed_code`), `.deliveries` (read-методы).
+- `WriteSession` (все 5 существующих репозиториев + новые репозитории, привязанные к **одному** `sqlite3.Connection` в корневом `BEGIN IMMEDIATE`/`EXCLUSIVE`):
+  - `.catalog: CatalogRepository`
+  - `.users: UserRepository`
+  - `.inventory: InventoryRepository`
+  - `.orders: OrderRepository`
+  - `.receipts: ReceiptRepository`
+  - `.audit: AuditRepository`
+  - `.idempotency: IdempotencyRepository`
+  - `.deliveries: DeliveryRepository`
+
+#### 4) `src/services/catalog_service.py` — каталог и мост к Phase 1
 - `quote_voucher_bundle(region: str, currency: str, target_amount_minor: int, max_vouchers_per_order: int = 6, max_allowed_overshoot_minor: Optional[int] = None) -> VoucherBundleQuote`:
-  - Граница: `uow.read()` для загрузки кандидатов, затем вычисление Phase 1 **вне write-транзакции** (`calculate_optimal_vouchers(...)`).
-  - Маппинг: ограничивает `stock_limit = min(available_count, MAX_STOCK_LIMIT)` (`1000`), отсекает список по `MAX_DENOMINATIONS_COUNT` (`20`) с детерминированным приоритетом или явной валидационной ошибкой, сопоставляет `SelectedDenomination.face_value_minor` обратно к `VoucherDenomination.id` и `product_id` через карту `{vd.face_value_minor: vd}`.
-  - Возвращает `VoucherBundleQuote(region, currency, target_amount_minor, items: tuple[QuotedVoucherLine, ...], total_face_value_minor, wallet_change_minor, total_rub_kopecks, quote_fingerprint)`.
+  - Граница: `with uow.read() as session:` читает в едином WAL-снимке одобренные `voucher_denominations` (`products.status = 'APPROVED' AND products.product_type = 'VOUCHER' AND vd.is_active = 1`) и агрегат доступного склада (`AVAILABLE`), **затем вне транзакции** запускает `calculate_optimal_vouchers(...)` (Phase 1).
+  - Маппинг: ограничивает `stock_limit = min(available_count, 1000)`, сопоставляет `SelectedDenomination.face_value_minor` к `VoucherDenomination.(id, product_id)` по уникальному ключу `(region, currency, face_value_minor)`.
 - `list_approved_fixed_products() -> list[FixedProductOffer]`: `uow.read()`, строго `products.status = 'APPROVED' AND fixed_product_details.approval_status = 'APPROVED'`.
-- `create_voucher_product(...)`, `add_voucher_denomination(...)`, `create_fixed_product(...)`, `approve_fixed_product(...)`, `set_product_status(...)`, `import_inventory_codes(...)`:
-  - Граница: `uow.write()`, требуют `ActorType.OPERATOR`, пишут структурированное событие в `AuditRepository` (без открытых кодов!).
+- Операторские методы (`create_voucher_product`, `add_voucher_denomination`, `create_fixed_product`, `approve_fixed_product`, `set_product_status`, `import_inventory_codes`): `uow.write()`, требуют `ActorType.OPERATOR`, пишут аудит (без открытых кодов).
 
-#### 4) `src/services/order_service.py` — оформление, отмена и просмотр заказов
-- `checkout_voucher_bundle(actor: ActorContext, region: str, currency: str, target_amount_minor: int, expected_total_rub_kopecks: Optional[int] = None, max_vouchers_per_order: int = 6, idempotency_key: Optional[str] = None) -> OrderCheckoutResult`:
-  - Граница: короткий `uow.read()` + Phase 1 расчёт, затем одна атомарная `uow.write()` (`BEGIN IMMEDIATE`) с идемпотентностью, созданием заказа и резервированием всех позиций.
+#### 5) `src/services/order_service.py` — оформление, отмена и возврат заказов
+- `checkout_voucher_bundle(actor: ActorContext, region: str, currency: str, target_amount_minor: int, expected_total_rub_kopecks: Optional[int] = None, max_vouchers_per_order: int = 6, max_allowed_overshoot_minor: Optional[int] = None, idempotency_key: Optional[str] = None) -> OrderCheckoutResult`:
+  - Граница: **одна** `uow.write()` (`BEGIN IMMEDIATE`) без предварительного `uow.read()` для избежания TOCTOU. Внутри транзакции проверяет `actor.actor_type == USER`, `actor.user_id >= 1`, `UserStatus == ACTIVE`, лимит открытых заказов (`OD-08`), `IdempotencyRepository`, читает актуальный одобренный каталог и остатки, вызывает чистую функцию `calculate_optimal_vouchers(...)` в памяти (~0.1 мс для `<= 20` номиналов), сверяет `expected_total_rub_kopecks` (`PriceChangedError`), вызывает `OrderRepository.create_order()`, резервирует в отсортированном порядке `(product_id, denomination_id)` через `InventoryRepository.reserve_items_for_order()`, пишет `audit_events` и фиксирует `idempotency_keys`.
 - `checkout_fixed_product(actor: ActorContext, product_id: int, quantity: int = 1, expected_unit_price_rub_kopecks: Optional[int] = None, idempotency_key: Optional[str] = None) -> OrderCheckoutResult`:
-  - Граница: одна `uow.write()`. Проверяет `UserStatus`, `ProductStatus.APPROVED`, `ApprovalStatus.APPROVED`, цену. Для инвентарных типов (см. `OD-03`) резервирует `quantity` позиций в этой же транзакции.
+  - Граница: одна `uow.write()`, проверяет `UserStatus`, `APPROVED`, цену (`PriceChangedError`), резервирует склад для инвентарных типов (`CODE`, и `OFFICIAL_ACTIVATION` согласно `OD-03`).
 - `cancel_order(actor: ActorContext, order_id: int, reason: Optional[str] = None, idempotency_key: Optional[str] = None) -> Order`:
-  - Граница: одна `uow.write()`. Атомарно освобождает `RESERVED` инвентарь (`release_order_reservations`), при необходимости обновляет ожидающие чеки (см. `OD-05`), переводит статус в `CANCELLED` и пишет аудит.
-- `expire_stale_orders(actor: ActorContext, ttl_seconds: int = 900, batch_limit: int = 50) -> list[int]`:
-  - Граница: `ActorType.SYSTEM`; выборка кандидатов `PENDING_PAYMENT` старше `ttl_seconds` (при наличии столбца/политики TTL), затем **отдельная короткая `uow.write()` на каждый заказ** (чтобы не блокировать базу на батч).
-- `get_order_details(actor: ActorContext, order_id: int) -> OrderDetailsDTO`:
-  - Граница: `uow.read()`; для `USER` проверяет `order.user_id == actor.user_id` и политику `UserStatus` (`OD-01`); возвращает заказ, `order_items`, метаданные чеков и статус доставки (без расшифрованных кодов).
-
-#### 5) `src/services/payment_service.py` — приём чеков и проверка оператором
-- `submit_payment_receipt(actor: ActorContext, order_id: int, file_bytes: bytes, provider_name: str = "MANUAL", provider_tx_id: Optional[str] = None, idempotency_key: Optional[str] = None) -> ReceiptSubmissionResult`:
-  - Важно: скачивание `file_bytes` из Telegram выполняется **до** вызова сервиса. Внутри `uow.write()` — проверка идемпотентности, `submit_receipt()`, переход `PENDING_PAYMENT -> PAYMENT_REVIEW` (если заказ ещё в `PENDING_PAYMENT`), запись в `audit_events`.
-- `approve_receipt_and_fulfill(actor: ActorContext, receipt_id: int, reviewer_notes: Optional[str] = None, idempotency_key: Optional[str] = None) -> FulfillmentResult`:
-  - Граница: `ActorType.OPERATOR`, одна `uow.write()`. Атомарно переводит чек в `ACCEPTED`, заказ `PAYMENT_REVIEW -> PAID -> FULFILLING`, вызывает `finalize_order_sale()` и переводит заказ `FULFILLING -> COMPLETED` (для предрезервированных инвентарных заказов).
-- `approve_receipt_only(actor: ActorContext, receipt_id: int, reviewer_notes: Optional[str] = None, idempotency_key: Optional[str] = None) -> Order`:
-  - Альтернативный путь для заказов с отложенной дозакупкой или ручным выполнением (`MANUAL_REVIEW`): переводит чек в `ACCEPTED` и заказ `PAYMENT_REVIEW -> PAID` (или `PAID -> FULFILLING` — единый переходный сценарий без преждевременного `COMPLETED`).
-- `fulfill_paid_order(actor: ActorContext, order_id: int, notes: Optional[str] = None, idempotency_key: Optional[str] = None) -> FulfillmentResult`:
-  - Для заказов в `PAID`/`FULFILLING`: переводит в `FULFILLING` (если `PAID`), финализирует резервы (`finalize_order_sale()`) и переводит в `COMPLETED`.
-- `complete_manual_fulfillment(actor: ActorContext, order_id: int, fulfillment_notes: str, idempotency_key: Optional[str] = None) -> Order`:
-  - Для неинвентарных `FIXED_PRODUCT` (`MANUAL_REVIEW` / `OD-03`): проверяет отсутствие `RESERVED`/`SOLD` инвентаря, требует непустого `fulfillment_notes` (подтверждение выдачи оператором) и переводит `FULFILLING -> COMPLETED`.
-- `reject_receipt(actor: ActorContext, receipt_id: int, reviewer_notes: str, return_to_pending_payment: bool = True, idempotency_key: Optional[str] = None) -> ReceiptReviewResult`:
-  - Граница: `ActorType.OPERATOR`, `uow.write()`. Переводит чек в `REJECTED` (или `DUPLICATE`), при `return_to_pending_payment=True` и отсутствии других `PENDING_REVIEW`/`ACCEPTED` чеков переводит `PAYMENT_REVIEW -> PENDING_PAYMENT` (либо оставляет решение на `OD-05`).
+  - Граница: одна `uow.write()`, единая точка перевода в `CANCELLED` (включая `REFUND_REVIEW -> CANCELLED`). Проверяет матрицу `actor x order.status` (`USER` владелец в `PENDING_PAYMENT`, и в `PAYMENT_REVIEW` по `OD-05`; `OPERATOR` в `PENDING_PAYMENT`/`PAYMENT_REVIEW`/`REFUND_REVIEW`; `SYSTEM` в `PENDING_PAYMENT`), идемпотентность, освобождает `RESERVED` через `release_order_reservations()`, обрабатывает висящие `PENDING_REVIEW` чеки (`OD-05`), вызывает `transition_order_status(..., OrderStatus.CANCELLED, expected_current_status=..., actor_context=actor)`.
 - `initiate_refund_review(actor: ActorContext, order_id: int, reason: str, idempotency_key: Optional[str] = None) -> Order`:
-  - Граница: `ActorType.OPERATOR`, `uow.write()`. Переводит `PAID`/`FULFILLING`/`COMPLETED` в `REFUND_REVIEW` с обязательным аудитом причины.
+  - Граница: `ActorType.OPERATOR`, одна `uow.write()`, переводит `PAID`/`FULFILLING`/`COMPLETED` в `REFUND_REVIEW` с обязательным непустым `reason`. *(Размещение в `OrderService` держит все переходы `orders.status` без привязки к чеку в одном сервисе.)*
+- `expire_stale_orders(actor: ActorContext, ttl_seconds: int = 900, batch_limit: int = 50) -> list[int]`:
+  - Граница: `ActorType.SYSTEM`; выборка просроченных `PENDING_PAYMENT` через `uow.read()`, затем индивидуальная короткая `uow.write()` на каждый заказ.
+- `get_order_details(actor: ActorContext, order_id: int) -> OrderDetailsDTO`:
+  - Граница: `uow.read()`, проверяет владельца и политику `UserStatus` (`OD-01`), при нарушении отдаёт anti-oracle `PermissionDeniedError`.
 
-#### 6) `src/services/delivery_service.py` — безопасная выдача и повторная доставка
-Для исключения сетевых вызовов внутри `BEGIN IMMEDIATE` проектируется **двухфазный паттерн доставки**:
-- `@dataclass(frozen=True) class DeliveryCodeItem`: `inventory_item_id: int`, `product_id: int`, `denomination_id: Optional[int]`, `code: str` — с переопределённым `__repr__` и `__str__`, возвращающими `"DeliveryCodeItem(id=..., code=***REDACTED***)"`, чтобы коды никогда не попадали в логи/traceback.
-- `prepare_order_delivery(actor: ActorContext, order_id: int, allow_redelivery: bool = False) -> DeliveryPayload`:
-  - Граница: `uow.write()` (или `uow.read()` + запись `DELIVERY_PENDING`/`ATTEMPT` в `order_deliveries`).
-  - Проверяет права (`USER` владелец и политика `UserStatus` по `OD-01`, либо `OPERATOR` по `OD-07`), статус заказа (`COMPLETED` / `REVEALABLE_ORDER_STATUSES`), выбирает все `inventory_items` заказа в статусе `SOLD`, расшифровывает через `InventoryRepository.get_revealed_code(..., expected_order_id=order_id, expected_user_id=order.user_id)`.
-  - Создаёт/обновляет запись попытки доставки в `order_deliveries` (`status='PENDING'`, `attempt_count + 1`) и пишет событие `DELIVERY_PREPARED` в `audit_events` (строго только ID позиций, без plaintext кодов).
-  - **Выходит из транзакции и закрывает соединение.**
-- **Вне БД (Transport Adapter):** `TelegramDeliveryAdapter` отправляет сообщение в Telegram с `protect_content=True` (и retry при временных 429/5xx).
-- `record_delivery_outcome(actor: ActorContext, delivery_id: int, succeeded: bool, external_message_id: Optional[str] = None, error_code: Optional[str] = None) -> None`:
-  - Граница: новая короткая `uow.write()`. Фиксирует `SENT` (с `delivered_at`, `external_message_id`) или `FAILED` (только код/класс ошибки, без секретов) в `order_deliveries` и `audit_events`.
+#### 6) `src/services/payment_service.py` — приём чеков и подтверждение оплаты/выполнения
+- `submit_payment_receipt(actor: ActorContext, order_id: int, file_bytes: bytes, provider_name: str = "MANUAL", provider_tx_id: Optional[str] = None, idempotency_key: Optional[str] = None) -> ReceiptSubmissionResult`:
+  - Скачивание `file_bytes` из Telegram выполняется **строго до** вызова сервиса. Внутри одной `uow.write()`: проверка `USER` & `UserStatus` (`OD-02`), ownership с anti-oracle обработкой, идемпотентность, `ReceiptRepository.submit_receipt()`, при `order.status == PENDING_PAYMENT` переход `transition_order_status(order_id, PAYMENT_REVIEW, expected_current_status=PENDING_PAYMENT, actor_context=actor)` (при уже `PAYMENT_REVIEW` поведение определяется `OD-08`), запись `audit_events`.
+- `approve_receipt_and_fulfill(actor: ActorContext, receipt_id: int, reviewer_notes: Optional[str] = None, idempotency_key: Optional[str] = None) -> FulfillmentResult` (**Путь 3A — предрезервированные складские заказы**):
+  - Граница: `ActorType.OPERATOR`, одна `uow.write()`. Переводит чек `PENDING_REVIEW -> ACCEPTED`, заказ `PAYMENT_REVIEW -> PAID -> FULFILLING`, вызывает `finalize_order_sale()`, переводит `FULFILLING -> COMPLETED` и пишет аудит.
+- `approve_receipt_only(actor: ActorContext, receipt_id: int, start_fulfillment: bool = False, reviewer_notes: Optional[str] = None, idempotency_key: Optional[str] = None) -> Order` (**Пути 3B и 3C**):
+  - Граница: `ActorType.OPERATOR`, одна `uow.write()`. Переводит чек в `ACCEPTED`, заказ в `PAID` (`start_fulfillment=False` для дропшиппинга **3B** перед внешним импортом и вызовом `fulfill_paid_order()`) или сразу `PAID -> FULFILLING` (`start_fulfillment=True` для ручной услуги **3C** перед `complete_manual_fulfillment()`).
+- `fulfill_paid_order(actor: ActorContext, order_id: int, notes: Optional[str] = None, idempotency_key: Optional[str] = None) -> FulfillmentResult`:
+  - Граница: `ActorType.OPERATOR`, одна `uow.write()`, для заказов в `PAID`/`FULFILLING` (при необходимости резервирует только что импортированные коды, финализирует `finalize_order_sale()`, переводит в `COMPLETED`).
+- `complete_manual_fulfillment(actor: ActorContext, order_id: int, fulfillment_notes: str, idempotency_key: Optional[str] = None) -> Order`:
+  - Граница: `ActorType.OPERATOR`, одна `uow.write()`. Только для неинвентарных позиций заказа (`MANUAL_REVIEW` и др. по `OD-03`): проверяет непустой `fulfillment_notes`, отсутствие `RESERVED` и `SOLD` по этим позициям и переводит `FULFILLING -> COMPLETED`.
+- `reject_receipt(actor: ActorContext, receipt_id: int, reviewer_notes: str, return_to_pending_payment: bool = True, idempotency_key: Optional[str] = None) -> ReceiptReviewResult`:
+  - Граница: `ActorType.OPERATOR`, одна `uow.write()`. Переводит чек `PENDING_REVIEW -> REJECTED` (или `DUPLICATE`), при отсутствии других активных чеков и `return_to_pending_payment=True` возвращает заказ `PAYMENT_REVIEW -> PENDING_PAYMENT`.
 
-#### 7) `AuditRepository` (добавляется в `src/db/repositories.py`)
-- Метод `record_event(event_type: str, entity_type: str, entity_id: int, actor: Optional[ActorContext] = None, details: Optional[dict[str, Any]] = None) -> AuditEvent`.
-- Обязательный нормализованный формат `details_json`:
-  `{"actor_type": ..., "actor_id": ..., "actor_external_id": ..., "correlation_id": ..., "idempotency_key": ..., ...}`.
-- **Правило безопасности аудита:** запрещено передавать в `details` `file_bytes`, `encrypted_payload`, `plaintext` кодов, ключи шифрования, `FINGERPRINT_PEPPER` или `provider_tx_id` целиком, если это чувствительный платёжный токен (допустим хэш/маскированный суффикс или метаданные перехода).
+#### 7) `src/services/delivery_service.py` — 4-стадийная безопасная доставка
+- `@dataclass(frozen=True) class DeliveryCodeItem`: поля `(inventory_item_id, product_id, denomination_id, code)` с переопределёнными `__repr__` и `__str__`, возвращающими `"DeliveryCodeItem(id=..., code=***REDACTED***)"`.
+- `@dataclass(frozen=True) class DeliveryPayload`: `(delivery_id, claim_token, order_id, target_user_id, target_external_id, items: tuple[DeliveryCodeItem, ...])` (также с маскированным `__repr__`).
+- **4 независимых метода/стадии:**
+  1. **Stage A (`claim_delivery`):** короткая `uow.write()`, проверяет права (`USER` владелец своего заказа / `OPERATOR` повторная отправка по `OD-07` / `SYSTEM` автодиспатч после `approve_receipt_and_fulfill`), политику `UserStatus` (`OD-01`), лениво закрывает просроченные lease (`DISPATCHING -> UNCERTAIN`), отклоняет при активном lease (`DeliveryInProgressError`), создаёт строку в `order_deliveries` (`status='DISPATCHING'`, `claim_token`, `lease_expires_at`), пишет `DELIVERY_CLAIMED` в `audit_events`. Возвращает `DeliveryClaim(delivery_id, claim_token, order_id, target_user_id, target_external_id, lease_expires_at)`.
+  2. **Stage B (`prepare_payload`):** после коммита Stage A открывает короткий `uow.read()`, проверяет, что `delivery_id` всё ещё `DISPATCHING`, `claim_token` совпадает, lease не истёк, а заказ/пользователь в допустимом статусе (`REVEALABLE_ORDER_STATUSES` + `OD-01`); читает `SOLD`-позиции и расшифровывает через `InventoryRepository.get_revealed_code(..., expected_order_id=order_id, expected_user_id=target_user_id)`. Возвращает in-memory `DeliveryPayload`, закрывает read-транзакцию. Никакой plaintext не записывается в БД, логи или аудит.
+  3. **Stage C (Вне сервиса БД — `TelegramDeliveryAdapter`):** отправляет сообщение в Telegram на `payload.target_external_id` (`chat_id` покупателя) с `protect_content=True`. В случае `OD-07` Option A операторский бот вызывает только доставку покупателю, а plaintext не возвращается в интерфейс оператора.
+  4. **Stage D (`record_outcome`):** отдельная короткая `uow.write()`, по `(delivery_id, claim_token)` атомарно обновляет статус `DISPATCHING -> SENT` (при `external_message_id`), `FAILED` или `UNCERTAIN` (при timeout/обрыве связи), либо безопасно до-подтверждает `UNCERTAIN -> SENT` по совпадению `claim_token`. Если lease уже перехвачен другим воркером, исход не затирает новую попытку и логируется как `DELIVERY_STALE_OUTCOME_IGNORED`.
+- `reap_expired_leases(actor: ActorContext, batch_limit: int = 50) -> int`: системный фоновый сборщик просроченных `DISPATCHING` (`lease_expires_at <= CURRENT_TIMESTAMP` -> `UNCERTAIN`).
+
+#### 8) `AuditRepository` (`src/db/repositories.py`)
+- `record_event(event_type: str, entity_type: str, entity_id: int, actor: Optional[ActorContext] = None, details: Optional[dict[str, Any]] = None) -> AuditEvent`.
+- `OrderRepository.transition_order_status()` получает опциональный обратно совместимый параметр `actor_context: Optional[ActorContext] = None`, чтобы **каждый** переход `ORDER_STATUS_TRANSITION` (`SG-P2-015`) сохранял нормализованные `actor_type`, `actor_external_id`, `correlation_id`, `from_status`, `to_status`, `notes`.
+- **Запрет секретов в аудите:** в `details_json` не передаются plaintext коды, `file_bytes`, `encrypted_payload`, ключи/pepper.
 
 ---
 
 ## 4. Transaction Coordination / Unit of Work Design (`SG-P2-004`)
 
-### 4.1. Сравнение вариантов архитектуры
+### 4.1. Выбор механизма учёта состояния транзакций
 
-| Вариант | Суть | Плюсы | Минусы | Вердикт |
+Локальная проверка в Python подтвердила: `weakref.WeakKeyDictionary` **непригоден** для `sqlite3.Connection` (`TypeError: cannot create weak reference to 'sqlite3.Connection' object`). Сравнение рабочих альтернатив для `Python 3.11`, `3.12` и `3.14`:
+
+| Подход | Механизм | Совместимость с Phase 2 (147 тестов) | Риски и недостатки | Вердикт |
 | :--- | :--- | :--- | :--- | :--- |
-| **1. Только `SAVEPOINT` в `transaction()` без `UnitOfWork`** | Вызовы сервисов напрямую открывают `with transaction(conn):` и вызывают репозитории | Минимальный объём нового кода | Размытое владение соединением в сервисах, каждый сервис сам управляет factory/close и retry на `SQLITE_BUSY` | Отклонён как единственный механизм |
-| **2. Внешний UoW с удалением `transaction()` из репозиториев** | Репозитории перестают вызывать `transaction()` и надеются на вызывающий UoW | Простое вложение | **Ломает обратную совместимость** со всеми 147 тестами Phase 2 и делает прямые вызовы репозиториев небезопасными | **Отклонён** |
-| **3. Управляемый `SAVEPOINT` в `transaction()` + Явный облегчённый `UnitOfWork`** | `transaction()` поддерживает контролируемую вложенность через `SAVEPOINT`, продолжая отвергать чужие транзакции; `UnitOfWork` инкапсулирует соединение и репозитории | 100% обратная совместимость с Phase 2; полная атомарность любых композиций; явная граница блокировок в сервисах; без ORM-оверхеда | Требует аккуратного трекинга глубины/режима транзакций на уровне соединения | **ВЫБРАН** |
+| **1. `id(conn)` с сильной ссылкой только на активную корневую транзакцию** | `_ACTIVE_MANAGED_TX: dict[int, _ManagedTxEntry]` под `threading.Lock()`, с проверкой `entry.conn is conn` и удалением в корневом `finally:` | **100%** (работает с любым `sqlite3.Connection` из `sqlite3.connect` / `create_connection`) | Требует строгой очистки в `finally:` на корневом уровне | **ВЫБРАН** |
+| **2. `id(conn)` без сильной ссылки на объект** | Хранит только `int` и `depth` | 100% | При редком сбое/утечке и закрытии `conn` освобождённый `id` может быть переиспользован новым `sqlite3.Connection` (ABA-ошибка) | Отклонён |
+| **3. Обёртка / Proxy над `sqlite3.Connection`** | Отдельный класс-обёртка со своим атрибутом `_tx_state` | **Нарушает** прямой `isinstance(conn, sqlite3.Connection)` и обходится при передаче сырого `conn` в репозитории | Сломает часть вызовов или потребует переписывания сигнатур | Отклонён |
+| **4. Подкласс `sqlite3.Connection` (`factory=ManagedConnection`)** | Хранение атрибута в подклассе | Работает только через `create_connection()`, **не работает** для соединений, созданных через `sqlite3.connect()` в стороннем коде/тестах | Хрупко без резервного реестра | Отклонён |
 
-### 4.2. Механика управляемого `transaction()` (`src/db/connection.py`)
-
-Для сохранения гарантии из Phase 2 (*«запрет случайного присоединения к чужой незакоммиченной транзакции»*) в `src/db/connection.py` вводится реестр управляемого состояния на соединение на базе `weakref.WeakKeyDictionary[sqlite3.Connection, _ManagedTxState]`, защищённый `threading.Lock()`:
+### 4.2. Точный алгоритм управляемого `transaction()` (`src/db/connection.py`)
 
 ```python
 @dataclass
-class _ManagedTxState:
-    depth: int = 0
-    root_mode: str = "IMMEDIATE"
-    next_savepoint_id: int = 1
-    owner_thread_id: int = 0
+class _ManagedTxEntry:
+    conn: sqlite3.Connection          # сильная ссылка ТОЛЬКО на время активной корневой транзакции
+    depth: int
+    root_mode: str                    # 'DEFERRED' | 'IMMEDIATE' | 'EXCLUSIVE'
+    read_only: bool                   # True только для uow.read() / read_only=True
+    next_savepoint_id: int
+    owner_thread_id: int
 ```
 
-**Точные правила поведения `transaction(conn, mode="IMMEDIATE")`:**
-
-1. **Защита от неуправляемой внешней транзакции (инвариант Phase 2 сохранён на 100%):**
-   - Если `conn.in_transaction` истинно, **а в реестре `state.depth == 0`**, это означает, что транзакцию открыл внешний код (`conn.execute("BEGIN ...")` или неявный DML при `isolation_level=""`).
-   - Действие: **немедленно выбросить `RuntimeError`** (сохранив существующее сообщение и защиту).
-2. **Обнаружение рассинхронизации:**
-   - Если `not conn.in_transaction`, но `state.depth > 0` (например, внешний код принудительно сделал `ROLLBACK` или `COMMIT` в обход менеджера): очистить `_ManagedTxState` и немедленно выбросить `RuntimeError("Managed transaction state desynchronized")`.
-3. **Запуск корневой транзакции (`depth == 0` и `not conn.in_transaction`):**
-   - Выполнить `conn.execute(f"BEGIN {norm_mode};")`.
-   - Зафиксировать `state = _ManagedTxState(depth=1, root_mode=norm_mode, next_savepoint_id=1, owner_thread_id=threading.get_ident())`.
-   - Внутри `try`: `yield conn`, затем `conn.commit()`.
-   - В `except BaseException:` (включая `KeyboardInterrupt`, `SystemExit`, `asyncio.CancelledError`): если `conn.in_transaction`, выполнить `conn.rollback()` (с подавлением `sqlite3.Error` только при сбое отката) и пробросить исключение.
-   - В `finally:` удалить `conn` из реестра `_MANAGED_TX_REGISTRY`.
-4. **Вложенная управляемая транзакция (`depth >= 1` и `conn.in_transaction`):**
-   - **Проверка потока:** если `state.owner_thread_id != threading.get_ident()`, выбросить `RuntimeError` (одно `sqlite3.Connection` не должно делить одну активную транзакцию между потоками).
-   - **Запрет эскалации блокировки (критично для SQLite):**
-     - Определяется иерархия строгости: `DEFERRED (1) < IMMEDIATE (2) < EXCLUSIVE (3)`.
-     - Если вложенный вызов требует `mode` строже, чем `state.root_mode` (например, внешний `DEFERRED`, а репозиторий просит `IMMEDIATE`), выбрасывается `RuntimeError("Cannot escalate SQLite lock mode inside nested transaction")`!
-     - Причина: в SQLite `SAVEPOINT` внутри уже начатой `DEFERRED`-транзакции **не** приобретает upfront write lock в момент входа и подвержен немедленному `SQLITE_BUSY` deadlock при обновлении снимка до записи. Поэтому любая пишущая композиция обязана начинаться с корневого `BEGIN IMMEDIATE` (или `EXCLUSIVE`).
-     - Напротив, вложенный `DEFERRED` внутри корневого `IMMEDIATE` допустим (корневая блокировка уже максимальна для записи).
-   - **Механика `SAVEPOINT`:**
-     - Присвоить уникальное имя `sp_name = f"sp_mgr_{state.next_savepoint_id}"`, увеличить `next_savepoint_id += 1` и `depth += 1`.
-     - Выполнить `conn.execute(f"SAVEPOINT {sp_name};")`.
+1. **Реестр:** `_ACTIVE_MANAGED_TX: dict[int, _ManagedTxEntry] = {}` и `_TX_REGISTRY_LOCK = threading.Lock()`.
+2. **Валидация режима:** `norm_mode` должен быть в `{"DEFERRED", "IMMEDIATE", "EXCLUSIVE"}` (`ValueError`).
+3. **Атомарная проверка входа под `_TX_REGISTRY_LOCK`:**
+   - `conn_id = id(conn)`, `tid = threading.get_ident()`.
+   - Получить `entry = _ACTIVE_MANAGED_TX.get(conn_id)`.
+   - Если `entry is None`:
+     - **Защита от чужой незакоммиченной транзакции:** если `conn.in_transaction` истинно -> `raise RuntimeError("Cannot start managed transaction: connection already has an active uncommitted transaction.")` (полное сохранение контракта Phase 2).
+     - Иначе регистрируется корневая транзакция: `is_root = True`, `entry = _ManagedTxEntry(conn=conn, depth=1, root_mode=norm_mode, read_only=read_only, next_savepoint_id=1, owner_thread_id=tid)`, `_ACTIVE_MANAGED_TX[conn_id] = entry`.
+   - Если `entry is not None`:
+     - Проверка идентичности объекта: если `entry.conn is not conn` -> `raise RuntimeError("Managed transaction registry identity mismatch.")`.
+     - Проверка рассинхронизации: если `not conn.in_transaction` (внешний код сделал raw `COMMIT`/`ROLLBACK` внутри `with transaction`) -> удалить запись из `_ACTIVE_MANAGED_TX` и `raise RuntimeError("Managed transaction state desynchronized.")`.
+     - **Контроль `owner_thread_id`:** если `entry.owner_thread_id != tid` -> `raise RuntimeError("Cannot enter managed transaction from a different thread.")`.
+     - **Запрет эскалации режима и записи в `read_only`:**
+       - `rank = {"DEFERRED": 1, "IMMEDIATE": 2, "EXCLUSIVE": 3}`.
+       - Если `entry.read_only and not read_only` -> `raise RuntimeError("Cannot start write transaction inside a read-only transaction.")`.
+       - Если `rank[norm_mode] > rank[entry.root_mode]` -> `raise RuntimeError(f"Cannot escalate SQLite transaction mode from {entry.root_mode} to {norm_mode}.")`.
+     - Присвоить `is_root = False`, `sp_name = f"sp_mgr_{entry.next_savepoint_id}"`, `entry.next_savepoint_id += 1`, `entry.depth += 1`.
+4. **Выполнение и гарантированная очистка:**
+   - **Корневая (`is_root=True`):**
+     - Если перед `BEGIN` возникает ошибка (`conn.execute(f"BEGIN {norm_mode};")` упало с `OperationalError` при `SQLITE_BUSY`), `finally:` гарантированно удаляет `entry` из `_ACTIVE_MANAGED_TX`!
+     - `try: yield conn`: если `read_only=True`, выполняется `conn.rollback()` (освобождает snapshot без commit-эффектов); иначе `conn.commit()`.
+     - `except BaseException:` (перехватывает `KeyboardInterrupt`, `SystemExit`, `asyncio.CancelledError`, пользовательские `BaseException`): если `conn.in_transaction`, выполняется `conn.rollback()` (ошибки `sqlite3.Error` самого rollback не затирают исходное исключение) и re-raise.
+     - `finally:` под `_TX_REGISTRY_LOCK` проверяется `if _ACTIVE_MANAGED_TX.get(conn_id) is entry: _ACTIVE_MANAGED_TX.pop(conn_id, None)`. Сильная ссылка на `conn` немедленно освобождается — **0 утечки памяти**.
+   - **Вложенная (`is_root=False`):**
+     - `conn.execute(f"SAVEPOINT {sp_name};")`.
      - При нормальном выходе: `conn.execute(f"RELEASE SAVEPOINT {sp_name};")`.
-     - При `except BaseException:`: если `conn.in_transaction`, выполнить **оба** оператора:
-       1. `conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")` — откатывает изменения внутри блока, но **не удаляет** сам savepoint в SQLite!
-       2. `conn.execute(f"RELEASE SAVEPOINT {sp_name};")` — обязательно снимает savepoint со стека, чтобы при перехвате исключения вызывающей стороной (если сервис решает обработать частичный отказ и продолжить транзакцию) не копились висячие точки сохранения.
-     - В `finally:`: `state.depth -= 1`.
-5. **Совместимость с `backup_database()` и `run_migrations()`:**
-   - И `backup_database()`, и `run_migrations()` продолжают проверять `if conn.in_transaction: raise RuntimeError(...)`. Их нельзя вызывать внутри ни внешней, ни управляемой транзакции — только на спокойном соединении.
-6. **Консистентность чтения DTO (`SG-P2-014`):**
-   - После перевода `self.get_*()` в репозиториях **внутрь** `with transaction(self.conn, mode="IMMEDIATE"):` (до `commit`/`RELEASE`) возвращаемый объект `Order` / `PaymentReceipt` / `Product` всегда читается в той же изолированной write-транзакции (и на корневом уровне, и при вызове из вложенного `UnitOfWork`).
-7. **Взаимодействие с `isolation_level=""` (стандартный режим `sqlite3` в Phase 2):**
-   - Поскольку внешняя корневая `transaction()` явно вызывает `BEGIN IMMEDIATE;` до первого `yield` и явно вызывает `conn.commit()`/`conn.rollback()` по выходу, Python `sqlite3` (включая версии `3.11`, `3.12`, `3.14`) корректно поддерживает `conn.in_transaction == True` на протяжении всего цикла `SAVEPOINT` и не вставляет скрытых автокоммитов.
+     - При `except BaseException:`: если `conn.in_transaction`, последовательно выполняются **оба** оператора:
+       1. `conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")`
+       2. `conn.execute(f"RELEASE SAVEPOINT {sp_name};")`
+       *(Проверено локально в SQLite: без второго `RELEASE` savepoint остаётся висеть в стеке SQLite; с обоими — внутренние правки откатываются, внешний контекст может продолжать работу или откатываться дальше).*
+     - `finally:` под `_TX_REGISTRY_LOCK` уменьшается `entry.depth -= 1`.
+5. **Совместимость с `backup_database()`, `run_migrations()` и `isolation_level=""`:**
+   - `backup_database()` и `run_migrations()` сохраняют `if conn.in_transaction: raise RuntimeError(...)` и поэтому запрещены внутри любой управляемой или неуправляемой транзакции.
+   - Поведение проверено на `isolation_level=""`: явный `BEGIN IMMEDIATE;` / `BEGIN DEFERRED;` выставляет `conn.in_transaction = True`, а вложенные `SAVEPOINT` и `RELEASE` сохраняют целостность транзакции до внешнего `conn.commit()`/`conn.rollback()`.
+   - Для консистентности чтения DTO (`SG-P2-014`) все вызовы `self.get_*()` в методах записи репозиториев переносятся **внутрь** `with transaction(self.conn, mode="IMMEDIATE"):`.
 
-### 4.3. Контракт `UnitOfWork` (`src/services/uow.py`)
+### 4.3. Семантика `UnitOfWork`: `uow.read()` vs `uow.write()`
 
 ```python
 class UnitOfWork:
-    # Фабрика подключений (production) ИЛИ заимствованное соединение (tests)
     @classmethod
     def from_connection(cls, conn: sqlite3.Connection) -> "UnitOfWork": ...
 
     @contextmanager
-    def write(self, mode: str = "IMMEDIATE") -> Iterator["DbSession"]: ...
+    def read(self) -> Iterator["ReadSession"]: ...
 
     @contextmanager
-    def read(self) -> Iterator["DbSession"]: ...
+    def write(self, mode: str = "IMMEDIATE") -> Iterator["WriteSession"]: ...
 ```
 
-- **`DbSession`** предоставляет свойства с ленивой инициализацией на одном и том же `conn`: `.catalog` (`CatalogRepository`), `.users` (`UserRepository`), `.inventory` (`InventoryRepository`), `.orders` (`OrderRepository`), `.receipts` (`ReceiptRepository`), `.audit` (`AuditRepository`), `.idempotency` / `.deliveries` (Stage 3.2).
-- **Владение соединением:**
-  - Если `UnitOfWork` создан с `db_path` / `connection_factory`: каждый вход в `uow.write()` или `uow.read()` открывает короткоживущее соединение через `get_connection_context()`, выполняет работу и **всегда закрывает** соединение в `finally`. `uow.write()` дополнительно оборачивает тело в `with transaction(conn, mode=mode):`.
-  - В `uow.read()` транзакция для записи не открывается; используется один `SELECT`-снимок (при необходимости серия согласованных чтений оборачивается в `with transaction(conn, mode="DEFERRED"):` с автоматическим `commit`/закрытием). Попытка вызвать методы записи репозиториев внутри `uow.read()` на корневом `DEFERRED`-снимке немедленно пресечётся либо интерфейсом `ReadSession` (который экспонирует только read-методы и сервисные query-методы), либо запретом эскалации `DEFERRED -> IMMEDIATE`!
-  - Если `UnitOfWork.from_connection(conn)` используется в юнит-тестах: `uow` **не закрывает** `conn` при выходе из контекста, но полноценно управляет `transaction(conn, mode="IMMEDIATE")`.
-- **Повторные попытки при `SQLITE_BUSY`:** допускаются **только** на самой внешней границе `uow.write()` (до первого успешного входа в `BEGIN IMMEDIATE`, когда никаких изменений ещё не сделано) с ограниченным числом попыток и малым backoff. Внутри уже открытой транзакции retry категорически запрещён.
+- **`uow.read()` (согласованный WAL snapshot без записи):**
+  1. Получает `conn` (из фабрики или заимствованный в тестах) и проверяет, что `not conn.in_transaction` (если передано заимствованное соединение с чужой открытой транзакцией — `RuntimeError`).
+  2. Читает текущее значение `prev_qo = conn.execute("PRAGMA query_only;").fetchone()[0]` и включает `conn.execute("PRAGMA query_only = ON;")`.
+  3. **Всегда** открывает `with transaction(conn, mode="DEFERRED", read_only=True):`.
+  4. **Немедленно выполняет `conn.execute("SELECT 1;").fetchone()`**! *(Критично для SQLite: сам по себе `BEGIN DEFERRED;` откладывает захват WAL read-маркера до первого запроса; только после первого `SELECT` все последующие `SELECT` каталога, цен и склада видят абсолютно один и тот же снимок БД, даже если параллельный писатель закоммитил изменения между 1-м и 2-м `SELECT` — подтверждено локальной пробой `WAL_DEFERRED_SNAPSHOT`.)*
+  5. Передаёт `ReadSession(conn)` (экспонирует только read-методы).
+  6. При выходе сбрасывает транзакцию (`rollback()`), в `finally:` восстанавливает `PRAGMA query_only = {prev_qo};` и закрывает соединение, если оно создано фабрикой.
+  7. Любая случайная попытка записи или вызова метода репозитория с `transaction(mode="IMMEDIATE")` внутри `uow.read()` блокируется **тройной защитой**: интерфейсом `ReadSession`, Python-проверкой `read_only`/`DEFERRED -> IMMEDIATE` (`RuntimeError`) и SQLite `PRAGMA query_only = ON` (`OperationalError: attempt to write a readonly database`).
+- **`uow.write(mode="IMMEDIATE")`:**
+  - Принимает только `"IMMEDIATE"` или `"EXCLUSIVE"` (попытка передать `"DEFERRED"` в `uow.write()` отклоняется с `ValueError`).
+  - Открывает корневой `with transaction(conn, mode=mode, read_only=False):`, отдаёт `WriteSession(conn)` (все репозитории используют одно и то же соединение `conn` и вложенные `SAVEPOINT`).
+  - Ретраи на `SQLITE_BUSY` разрешены **исключительно** до успешного входа в корневой `BEGIN IMMEDIATE` (когда не выполнено ни одного оператора), с ограниченным числом попыток и коротким джиттером.
 
 ---
 
@@ -276,7 +295,7 @@ class UnitOfWork:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING_PAYMENT : create_order (RUB snapshot + reserve if inventory-backed)
+    [*] --> PENDING_PAYMENT : create_order (RUB snapshot and reserve if inventory-backed)
 
     PENDING_PAYMENT --> PAYMENT_REVIEW : submit_receipt (PENDING_REVIEW)
     PENDING_PAYMENT --> CANCELLED : cancel_order / TTL expire [RESERVED == 0]
@@ -289,61 +308,55 @@ stateDiagram-v2
     PAID --> REFUND_REVIEW : initiate_refund_review
 
     FULFILLING --> COMPLETED : complete_inventory [RESERVED == 0 and SOLD == ordered_qty]
-    FULFILLING --> COMPLETED : complete_manual [non-inventory and RESERVED/SOLD == 0 and operator notes]
+    FULFILLING --> COMPLETED : complete_manual [non-inventory and operator notes]
     FULFILLING --> REFUND_REVIEW : initiate_refund_review
 
     COMPLETED --> REFUND_REVIEW : initiate_refund_review
 
-    REFUND_REVIEW --> CANCELLED : finalize_refund_cancel [RESERVED == 0; SOLD remains immutable]
+    REFUND_REVIEW --> CANCELLED : cancel_order [RESERVED == 0; SOLD per OD-06]
 
     CANCELLED --> [*]
 ```
 
 ### 5.2. Матрица строгих предусловий переходов
 
-В дополнение к `ALLOWED_ORDER_TRANSITIONS` (`src/db/models.py:69–77`) вводятся жёсткие предусловия:
-
 | Переход | Предусловие в Python (`OrderRepository` / Service) | Предусловие в SQLite (Миграция `007`) | Политика по инвентарю и чекам |
 | :--- | :--- | :--- | :--- |
-| `* -> PAYMENT_REVIEW` | Существует хотя бы 1 чек `payment_receipts` в статусе `PENDING_REVIEW` (при вызове через `PaymentService`) | Разрешён из `PENDING_PAYMENT` | Резервы остаются `RESERVED` за заказом |
-| `PAYMENT_REVIEW -> PAID` | Фиксируется `paid_at = CURRENT_TIMESTAMP`; при вызове через `PaymentService` обязан существовать чек `ACCEPTED` | Разрешён только из `PAYMENT_REVIEW`; `paid_at` заполняется | Резервы (если были) остаются `RESERVED` |
-| `PAYMENT_REVIEW -> PENDING_PAYMENT` | Нет чеков в статусе `ACCEPTED` или `PENDING_REVIEW` | Разрешён из `PAYMENT_REVIEW` | Резервы сохраняются до отмены или TTL |
-| `PAID -> FULFILLING` | Заказ имеет >= 1 `order_items` | Разрешён только из `PAID` | Подготовка к выдаче / дозакупке |
-| **`FULFILLING -> COMPLETED` (инвентарные позиции)** | 1) `COUNT(RESERVED для order_id) == 0`; 2) Для каждого инвентарного `(product_id, denomination_id)` `COUNT(SOLD) == SUM(order_items.quantity)` | **Триггер блокирует переход**, если есть хотя бы 1 `RESERVED` по заказу ИЛИ для любого `VOUCHER` / `FIXED_PRODUCT (CODE)` несоответствие `SOLD != ordered_qty` | Гарантирует 100% полноту выдачи; частичная выдача невозможна |
-| **`FULFILLING -> COMPLETED` (неинвентарные `FIXED_PRODUCT`)** | 1) `COUNT(RESERVED для order_id) == 0`; 2) `COUNT(SOLD)` по неинвентарной позиции `== 0`; 3) Вызов выполнен с `ActorType.OPERATOR` и непустым `notes` (передано в `audit_events`) | Триггер проверяет `RESERVED == 0` и отсутствие привязки `VOUCHER`/`CODE` без `SOLD` | Чётко разделяет ручную выдачу и складские коды |
-| **`* -> CANCELLED`** (`PENDING_PAYMENT`, `PAYMENT_REVIEW`, `REFUND_REVIEW`) | **`COUNT(RESERVED для order_id) == 0`** (инвентарь должен быть освобождён **до** перехода в `CANCELLED` внутри той же UoW-транзакции) | **Триггер блокирует `NEW.status = 'CANCELLED'`**, если `EXISTS (SELECT 1 FROM inventory_items WHERE reserved_order_id = NEW.id AND status = 'RESERVED')` | Если отмена из `REFUND_REVIEW` после выдачи кода, уже `SOLD`-позиции **не откатываются** в `AVAILABLE` |
-| `* -> REFUND_REVIEW` | Допустим из `PAID`, `FULFILLING`, `COMPLETED`; рекомендуется обязательный `notes` с причиной | Разрешён из `PAID`, `FULFILLING`, `COMPLETED` | Останавливает дальнейшую выдачу (`REVEALABLE_ORDER_STATUSES` исключает `REFUND_REVIEW`) |
+| `PENDING_PAYMENT -> PAYMENT_REVIEW` | Через `PaymentService`: создан чек `PENDING_REVIEW` в той же транзакции | Разрешён только из `PENDING_PAYMENT` | Резервы остаются `RESERVED` |
+| `PAYMENT_REVIEW -> PAID` | Фиксируется `paid_at = CURRENT_TIMESTAMP`; через `PaymentService` проверен чек `ACCEPTED` | Разрешён только из `PAYMENT_REVIEW`; проверяет `NEW.paid_at IS NOT NULL` *(для сервиса/репозитория гарантировано SQL-запросом `paid_at = CURRENT_TIMESTAMP`)* | До 1 `ACCEPTED` чека на заказ |
+| `PAYMENT_REVIEW -> PENDING_PAYMENT` | Через `PaymentService`: не осталось `ACCEPTED`/`PENDING_REVIEW` чеков | Разрешён из `PAYMENT_REVIEW` | Резервы сохраняются |
+| `PAID -> FULFILLING` | У заказа есть `>= 1` `order_items` | Разрешён только из `PAID` | Подготовка выдачи / дозакупки |
+| **`FULFILLING -> COMPLETED` (инвентарные позиции)** | 1) `COUNT(RESERVED для order_id) == 0`; 2) Для каждого инвентарного `(product_id, denomination_id)` `COUNT(SOLD) == SUM(order_items.quantity)` | **Триггер блокирует**, если есть хотя бы 1 `RESERVED` по заказу ИЛИ по любому инвентарному `(product_id, denomination_id)` `SOLD != ordered_qty` | 100% полнота выдачи |
+| **`FULFILLING -> COMPLETED` (неинвентарные позиции)** | 1) `COUNT(RESERVED для order_id) == 0`; 2) Для неинвентарного `(product_id, NULL)` `COUNT(SOLD) == 0`; 3) В сервисе `ActorType.OPERATOR` + непустой `fulfillment_notes` | Триггер проверяет `RESERVED == 0` и отсутствие `SOLD` по неинвентарным позициям | Чёткая граница между складом и ручной услугой |
+| **`* -> CANCELLED`** (`PENDING_PAYMENT`, `PAYMENT_REVIEW`, `REFUND_REVIEW`) | **`COUNT(RESERVED для order_id) == 0`** (резервы снимаются до перехода в `CANCELLED` в той же транзакции) | **Триггер блокирует `NEW.status = 'CANCELLED'`**, если существует хотя бы 1 `RESERVED` по заказу | При `REFUND_REVIEW -> CANCELLED` обработка `SOLD` по `OD-06` |
+| `* -> REFUND_REVIEW` | Допустим из `PAID`, `FULFILLING`, `COMPLETED`; через сервис — обязательный непустой `reason` | Разрешён из `PAID`, `FULFILLING`, `COMPLETED` | Останавливает выдачу (`REVEALABLE_ORDER_STATUSES` не включает `REFUND_REVIEW`) |
 
-### 5.3. Политика для `FIXED_PRODUCT`, не использующих `inventory_items`
+### 5.3. Политика инвентарных vs неинвентарных `FIXED_PRODUCT`
 
-По текущей схеме `001_initial_schema.sql:56` у `fixed_product_details` есть `delivery_method` со значениями:
-1. `'CODE'` — **всегда инвентарный**: код хранится в `inventory_items` (`InventoryType.FIXED_CODE`), резервируется на checkout, переводится в `SOLD` в `finalize_order_sale()`, раскрывается через `get_revealed_code()`.
-2. `'MANUAL_REVIEW'` — **всегда неинвентарный**: в `inventory_items` не хранится; финализируется оператором вручную через `complete_manual_fulfillment(actor=OPERATOR, order_id, fulfillment_notes)`.
-3. `'OFFICIAL_ACTIVATION'` — **спорная серая зона** (может идти через зашифрованные `ACTIVATION_DATA` в `inventory_items` либо как ручная услуга оператора без `inventory_items`). Вынесено в **Open Decision `OD-03`**.
+- `'CODE'` (`delivery_method`): **всегда инвентарный** (`InventoryType.FIXED_CODE`).
+- `'MANUAL_REVIEW'`: **всегда неинвентарный** (финализируется через `complete_manual_fulfillment`).
+- `'OFFICIAL_ACTIVATION'`: **ожидает решения Product Commander (`OD-03`)** — в коде на `HEAD` существует тест `tests/test_phase2_remediation_followup.py:75–82, 225–274`, использующий `OFFICIAL_ACTIVATION` вместе с `InventoryType.ACTIVATION_DATA` в одном заказе с `VOUCHER` (смешанный заказ в контексте `finalize_order_sale()`, что также вынесено в `OD-04`).
+- Соответственно `InventoryRepository.finalize_order_sale()` и `trg_orders_validate_status_transition` (миграция `007`) будут использовать единую согласованную классификацию инвентарных позиций после утверждения `OD-03`/`OD-04`.
 
-**Важное исправление в `InventoryRepository.finalize_order_sale()` (`src/db/repositories.py:833–869`):**
-Сейчас `finalize_order_sale()` собирает **все** `order_items` заказа (включая `FIXED_PRODUCT`) и требует для каждого `RESERVED`-позиции. Если в заказе есть неинвентарный `MANUAL_REVIEW`, текущий код отвергнет финализацию с `ValidationError`.
-- В Phase 3 `finalize_order_sale()` должен определять множество **инвентарно-обеспечиваемых** строк заказа (через JOIN с `products` и `fixed_product_details`: `product_type = 'VOUCHER'` или `delivery_method = 'CODE'`, а для `OFFICIAL_ACTIVATION` — по итогу `OD-03`).
-- На время Phase 3 MVP **рекомендуется запретить смешанные заказы** (в одном заказе одновременно инвентарные и ручные позиции — вынесено в `OD-04`), чтобы состояние заказа `FULFILLING -> COMPLETED` имело однозначную семантику.
+### 5.4. Модель освобождения резервов при `CANCELLED` (Вариант A)
 
-### 5.4. Выбор модели освобождения резервов при `CANCELLED`
-
-- **Вариант A (Рекомендуемый): Явное предусловие в `OrderRepository` + атомарная оркестрация в `OrderService` + SQLite-триггер.**
-  - `OrderRepository.transition_order_status(CANCELLED)` проверяет `RESERVED == 0` и кидает `InvalidStateTransitionError` при наличии неснятых резервов.
-  - `OrderService.cancel_order()` внутри одной `uow.write()` вызывает сначала `InventoryRepository.release_order_reservations(order_id)`, затем `OrderRepository.transition_order_status(order_id, CANCELLED)`.
-  - Триггер БД гарантирует запрет `CANCELLED` при живом `RESERVED` даже при прямом SQL.
-  - *Почему выбран Вариант A:* сохраняет Single Responsibility Principle (репозиторий заказов не мутирует таблицу инвентаря скрытым побочным эффектом), исключает молчаливый сброс резервов при ошибочном ручном вызове и делает нарушение заметным и в Python, и в SQLite.
-- *Альтернатива (Вариант B — авто-освобождение внутри `OrderRepository.transition_order_status`):* создаёт скрытую связность между репозиториями и затрудняет миграцию/аудит изменений по инвентарю без вызова `InventoryRepository`.
+Принята строгая двухшаговая модель в одной транзакции:
+1. `OrderRepository.transition_order_status(..., CANCELLED)` проверяет `COUNT(RESERVED) == 0` (при нарушении — `InvalidStateTransitionError`).
+2. `OrderService.cancel_order()` внутри одной `uow.write()` вызывает сначала `InventoryRepository.release_order_reservations()`, затем `OrderRepository.transition_order_status(CANCELLED)`.
+3. Триггер `trg_orders_validate_status_transition` дублирует запрет на уровне SQLite.
 
 ### 5.5. Жизненный цикл проверки чека (`payment_receipts.review_status`)
 
-- `PENDING_REVIEW -> {ACCEPTED, REJECTED, DUPLICATE}`.
-- `ACCEPTED`, `REJECTED`, `DUPLICATE` — **терминальные состояния** для конкретной строки чека (в Phase 2 `ReceiptRepository.update_review_status()` не ограничивал обратные переходы, например `ACCEPTED -> REJECTED`).
-- Для одного `order_id` допускается **не более одного** чека в статусе `ACCEPTED` (проверяется в сервисе и триггером/индексом в миграции `007`).
+- При создании: строго `PENDING_REVIEW` (проверяется в Python и `BEFORE INSERT` триггером).
+- Разрешённые переходы: `PENDING_REVIEW -> {ACCEPTED, REJECTED, DUPLICATE}`.
+- `ACCEPTED`, `REJECTED`, `DUPLICATE` — **терминальные** состояния (защищено и в `ReceiptRepository.update_review_status()`, и в `BEFORE UPDATE` триггере).
+- Частичный уникальный индекс `idx_receipts_single_accepted_per_order ON payment_receipts(order_id) WHERE review_status = 'ACCEPTED'` гарантирует не более одного принятого чека на заказ.
 
 ---
 
 ## 6. Atomic Business Workflows
+
+Во всех 4 сценариях ниже операции с БД внутри одной транзакции выполняются на **едином `sqlite3.Connection`**, принадлежащем `WriteSession` (`uow.write()`), с точным использованием `expected_current_status=...` в `OrderRepository.transition_order_status()`.
 
 ### 6.1. Workflow 1: Checkout (`create_order` + `reserve_items_for_order`)
 
@@ -355,53 +368,56 @@ sequenceDiagram
     participant CatSvc as CatalogService
     participant P1 as Phase 1 Knapsack
     participant OrdSvc as OrderService
-    participant UoW as UnitOfWork (BEGIN IMMEDIATE)
+    participant Session as WriteSession (uow.write / BEGIN IMMEDIATE)
     participant Idem as IdempotencyRepo
     participant OrdRepo as OrderRepository
     participant InvRepo as InventoryRepository
     participant Audit as AuditRepository
 
-    User->>Handler: Подтвердить покупку (TR 500 TRY)
-    Handler->>CatSvc: quote_voucher_bundle(TR, TRY, 50000)
-    CatSvc->>P1: calculate_optimal_vouchers(...)
-    P1-->>CatSvc: OptimizationResult (selected_denominations, RUB cost)
-    CatSvc-->>Handler: VoucherBundleQuote
+    opt Пре-квота до подтверждения кнопки (необязательно для цены)
+        User->>Handler: Выбирает сумму (например TR 500 TRY)
+        Handler->>CatSvc: quote_voucher_bundle(TR, TRY, 50000)
+        CatSvc->>CatSvc: uow.read() -> APPROVED + AVAILABLE
+        CatSvc->>P1: calculate_optimal_vouchers(...)
+        P1-->>CatSvc: OptimizationResult
+        CatSvc-->>Handler: VoucherBundleQuote
+    end
 
-    Handler->>OrdSvc: checkout_voucher_bundle(actor, quote/params, idempotency_key)
-    OrdSvc->>UoW: with uow.write() [BEGIN IMMEDIATE]
-    UoW->>Idem: claim_or_replay(scope="CHECKOUT", key, request_hash)
+    User->>Handler: Подтверждает покупку (expected_total, key)
+    Handler->>OrdSvc: checkout_voucher_bundle(actor, ..., expected_total, key)
+    OrdSvc->>Session: with uow.write() [BEGIN IMMEDIATE]
+    OrdSvc->>OrdSvc: Проверка ActorType.USER, UserStatus==ACTIVE, open_orders_cap (OD-08)
+    OrdSvc->>Idem: claim_or_replay(scope="CHECKOUT", key, request_hash)
     alt Повтор с тем же request_hash
         Idem-->>OrdSvc: existing order_id
+        OrdSvc->>OrdRepo: get_order(order_id) + get_order_items(order_id)
+        OrdSvc-->>Session: exit uow.write() (без мутаций)
         OrdSvc-->>Handler: OrderCheckoutResult (idempotent replay)
-    else Новый запрос
+    else Новый checkout
+        OrdSvc->>Session: Чтение APPROVED voucher_denominations + AVAILABLE остатков
+        OrdSvc->>P1: calculate_optimal_vouchers(...)
+        Note over OrdSvc: Если price != expected_total_rub_kopecks -> PriceChangedError
         OrdSvc->>OrdRepo: create_order(user_id, total_rub, "RUB", items)
-        Note over OrdRepo: Проверяет User != BLOCKED, product APPROVED, denom active, точное совпадение RUB цен
         OrdRepo-->>OrdSvc: Order (PENDING_PAYMENT)
-        loop Детерминированный порядок по (product_id, denomination_id)
+        loop Отсортировано по (product_id, denomination_id)
             OrdSvc->>InvRepo: reserve_items_for_order(order.id, product_id, qty, denom_id)
         end
         OrdSvc->>Audit: record_event("ORDER_CHECKOUT_CREATED", "ORDER", order.id, actor)
         OrdSvc->>Idem: mark_completed(key, "ORDER", order.id)
-        UoW-->>OrdSvc: COMMIT
+        OrdSvc-->>Session: COMMIT (exit uow.write)
         OrdSvc-->>Handler: OrderCheckoutResult
     end
 ```
 
 - **Граница транзакции:**
-  - *До транзакции:* (опционально) пре-квотирование `CatalogService.quote_voucher_bundle()`.
-  - *Внутри `uow.write()` (`BEGIN IMMEDIATE`):* повторное чтение актуального каталога/склада, сверка цены (`expected_total_rub_kopecks`), проверка лимита открытых неоплаченных заказов (`OD-08`), `IdempotencyRepo`, `OrderRepository.create_order()`, цикл `InventoryRepository.reserve_items_for_order()`, `AuditRepository.record_event()`.
-  - *После коммита:* показ реквизитов оплаты пользователю в Telegram.
-- **Последовательность операций:** расчёт корзины -> `BEGIN IMMEDIATE` -> idempotency check -> проверка лимитов и актуальной цены каталога -> `create_order()` -> последовательное резервирование по отсортированному списку `(product_id, denomination_id)` (для детерминизма блокировок) -> `audit_events` -> `idempotency_keys` -> `COMMIT`.
-- **Предусловия:** `actor.actor_type == USER`, пользователь существует и `status == 'ACTIVE'`, продукт `APPROVED`, номинал `is_active == 1` (для `FIXED_PRODUCT`: `approval_status == 'APPROVED'`), достаточный остаток `AVAILABLE` в `inventory_items`.
-- **Возможные ошибки:** `UserBlockedError`, `PriceChangedError` (если каталог/склад изменились с момента пре-квоты), `InsufficientInventoryError`, `IdempotencyConflictError`, `ValidationError` (включая отказ Phase 1 `no_solution`).
-- **Поведение при rollback:** при отказе резервирования на *любом* из номиналов (например, на 2-м номинале в корзине из 2 номиналов) `transaction()` откатывает **всю** `BEGIN IMMEDIATE` транзакцию (и заказ `orders`, и строки `order_items`, и уже зарезервированный 1-й номинал возвращаются в исходное состояние). Сироты-заказы без резервов не возникают.
-- **Защита от повторного выполнения:** обязательный `idempotency_key` (на базе Telegram `callback_query.id` / сгенерированного checkout nonce); повтор при сбое сети возвращает созданный заказ без повторного списания со склада.
-- **Необходимые тесты:**
-  - Успешный checkout `VOUCHER` (1 и 2+ номинала в одном заказе) и `FIXED_PRODUCT`.
-  - Rollback-тест: в корзине из 2 номиналов для 1-го есть 1 код, для 2-го — 0 кодов -> заказ не создан, 1-й код остался `AVAILABLE`.
-  - `PriceChangedError` при изменении `cost_rub_kopecks` между quote и checkout.
-  - Конкурентный тест (`Barrier(2)`): 2 пользователя одновременно оформляют последний код -> ровно 1 успех, 1 `InsufficientInventoryError`, `RESERVED` ровно 1 раз.
-  - Идемпотентный replay с тем же ключом и `IdempotencyConflictError` при подмене суммы/региона под тем же ключом.
+  - *До транзакции:* опциональное предварительное квотирование `CatalogService.quote_voucher_bundle()` (`uow.read()` + Phase 1).
+  - *Внутри одной `uow.write()` (`BEGIN IMMEDIATE`):* проверка `actor.actor_type == USER`, `actor.user_id >= 1`, `UserStatus == ACTIVE`, лимит неоплаченных заказов (`OD-08`), идемпотентность, **повторное чтение** одобренных номиналов и остатков склада на том же соединении, вызов чистой функции Phase 1 `calculate_optimal_vouchers()`, сверка `expected_total_rub_kopecks`, `OrderRepository.create_order()`, резервирование `InventoryRepository.reserve_items_for_order()` в отсортированном порядке `(product_id, denomination_id)`, аудит, фиксация `idempotency_keys`.
+  - *После коммита:* отображение счёта на оплату пользователю в Telegram.
+- **Предусловия:** `UserStatus.ACTIVE`, `ProductStatus.APPROVED`, `voucher_denominations.is_active == 1` (или `ApprovalStatus.APPROVED` для `FIXED_PRODUCT`), достаточный `AVAILABLE` остаток.
+- **Возможные ошибки:** `UserBlockedError`, `PermissionDeniedError`, `PriceChangedError`, `InsufficientInventoryError`, `IdempotencyConflictError`, `ValidationError` (включая `no_solution` от Phase 1).
+- **Поведение при rollback:** при сбое на любом номинале или при аудите `transaction()` откатывает весь `BEGIN IMMEDIATE` целиком: не остаётся ни строки в `orders`/`order_items`, ни частичных резервов, ни `IN_PROGRESS` ключа идемпотентности.
+- **Защита от повторного выполнения:** `idempotency_key` (`request_hash` включает `user_id`, `region`, `currency`, `target_amount_minor`, `expected_total_rub_kopecks`, `max_vouchers_per_order`, `max_allowed_overshoot_minor`).
+- **Необходимые тесты:** checkout 1 и 2+ номиналов, rollback на 2-м номинале при нехватке склада, `PriceChangedError` при изменении цены между квотой и checkout, гонка 2 потоков (`Barrier(2)`) за последний ваучер, replay и `IdempotencyConflictError`.
 
 ### 6.2. Workflow 2: Submit Receipt (`submit_receipt` + `transition_order_status(PAYMENT_REVIEW)`)
 
@@ -411,56 +427,52 @@ sequenceDiagram
     actor User as Telegram User
     participant Bot as Telegram Handler
     participant PaySvc as PaymentService
-    participant UoW as UnitOfWork (BEGIN IMMEDIATE)
+    participant Session as WriteSession (uow.write / BEGIN IMMEDIATE)
     participant Idem as IdempotencyRepo
-    participant RcptRepo as ReceiptRepository
     participant OrdRepo as OrderRepository
+    participant RcptRepo as ReceiptRepository
     participant Audit as AuditRepository
 
-    User->>Bot: Загружает скрин/PDF чека + tx_id
-    Note over Bot: ВНЕ ТРАНЗАКЦИИ: download_file() + проверка size <= 10MB
+    User->>Bot: Отправляет чек + provider_tx_id
+    Note over Bot: ВНЕ БД: download_file() + проверка 0 < size <= 10MB
     Bot->>PaySvc: submit_payment_receipt(actor, order_id, file_bytes, provider, tx_id, key)
-    PaySvc->>UoW: with uow.write() [BEGIN IMMEDIATE]
-    UoW->>Idem: claim_or_replay(scope="RECEIPT_SUBMIT", key, request_hash)
+    PaySvc->>Session: with uow.write() [BEGIN IMMEDIATE]
+    PaySvc->>PaySvc: Проверка ActorType.USER & UserStatus (OD-02)
+    PaySvc->>Idem: claim_or_replay(scope="RECEIPT_SUBMIT", key, request_hash)
     alt Идемпотентный повтор того же чека
         Idem-->>PaySvc: existing receipt_id
+        PaySvc->>RcptRepo: get_receipt(receipt_id)
+        PaySvc->>OrdRepo: get_order(order_id)
+        PaySvc-->>Session: exit uow.write() (без мутаций)
         PaySvc-->>Bot: ReceiptSubmissionResult (replay)
     else Новая подача
-        PaySvc->>PaySvc: Проверка owner & user status (см. OD-02)
+        PaySvc->>OrdRepo: get_order(order_id) + сверка user_id (anti-oracle PermissionDeniedError)
         PaySvc->>RcptRepo: submit_receipt(order_id, user_id, file_bytes, tx_id, provider)
         RcptRepo-->>PaySvc: PaymentReceipt (PENDING_REVIEW)
         alt order.status == PENDING_PAYMENT
-            PaySvc->>OrdRepo: transition_order_status(order_id, PAYMENT_REVIEW, expected=PENDING_PAYMENT)
+            PaySvc->>OrdRepo: transition_order_status(order_id, PAYMENT_REVIEW, expected_current_status=PENDING_PAYMENT, actor_context=actor)
             OrdRepo-->>PaySvc: Order (PAYMENT_REVIEW)
         else order.status == PAYMENT_REVIEW
-            Note over PaySvc: Повторная подача чека по тому же заказу (политика OD-08)
+            Note over PaySvc: Повторная подача чека допустима только если разрешено OD-08
         end
         PaySvc->>Audit: record_event("RECEIPT_SUBMITTED", "ORDER", order_id, actor)
         PaySvc->>Idem: mark_completed(key, "RECEIPT", receipt.id)
-        UoW-->>PaySvc: COMMIT
+        PaySvc-->>Session: COMMIT (exit uow.write)
         PaySvc-->>Bot: ReceiptSubmissionResult
     end
-    Note over Bot: ПОСЛЕ COMMIT: уведомить оператора в админ-чат
+    Note over Bot: ПОСЛЕ COMMIT: уведомить оператора
 ```
 
 - **Граница транзакции:**
-  - *До транзакции:* загрузка файла из Telegram API (сетевой I/O), проверка `0 < len(file_bytes) <= 10 * 1024 * 1024`.
-  - *Внутри `uow.write()` (`BEGIN IMMEDIATE`):* проверка идемпотентности, политика `UserStatus` (`OD-02`), `ReceiptRepository.submit_receipt()`, переход `PENDING_PAYMENT -> PAYMENT_REVIEW` (при текущем статусе `PENDING_PAYMENT`), запись `audit_events`.
-  - *После коммита:* отправка уведомления оператору в Telegram.
-- **Последовательность операций:** скачивание файла (pre-tx) -> `BEGIN IMMEDIATE` -> проверка владельца/статуса пользователя/заказа -> вычисление SHA-256 и запись чека -> условный перевод статуса заказа в `PAYMENT_REVIEW` -> аудит -> `COMMIT` -> уведомление оператора.
-- **Предусловия:** `order.user_id == actor.user_id`, заказ в статусе `PENDING_PAYMENT` (или `PAYMENT_REVIEW` согласно `OD-08`), файл не пуст и `<= 10 MiB`, `file_sha256` и `(provider_name, provider_tx_id)` ранее не использовались.
-- **Возможные ошибки:** `ValidationError` (не владелец, пустой/слишком большой файл, невалидный `provider_name`), `UserBlockedError` (`OD-02`), `DuplicateReceiptError` (повторный хэш файла или `provider_tx_id`), `InvalidStateTransitionError` (заказ уже `CANCELLED`/`PAID`/`COMPLETED`), `IdempotencyConflictError`.
-- **Поведение при rollback:** если `transition_order_status(PAYMENT_REVIEW)` падает (например, заказ параллельно отменён), `submit_receipt()` откатывается целиком — в БД не остаётся «осиротевшего» чека для отменённого заказа; при успехе `submit_receipt()` без падения, но падении аудита откатываются и чек, и смена статуса.
-- **Защита от повторного выполнения:**
-  - При обрыве сети между клиентом и сервером повторный запрос с тем же `idempotency_key` и тем же `file_sha256` вернёт существующий `PaymentReceipt` без `DuplicateReceiptError`.
-  - Попытка загрузить тот же чек (`file_sha256` или `provider_tx_id`) для **другого** заказа или с другим `idempotency_key` жёстко блокируется с `DuplicateReceiptError` (антифрод).
-- **Необходимые тесты:**
-  - Успешная подача переводит `PENDING_PAYMENT -> PAYMENT_REVIEW` атомарно.
-  - Rollback-тест: сбой после `submit_receipt()` (инъекция ошибки в `transition_order_status`) не оставляет строки в `payment_receipts`.
-  - Конкурентный тест (`Barrier(2)`): `submit_receipt` против `cancel_order` (или TTL worker) на одном заказе — ровно один побеждает, инвариант `CANCELLED` + отсутствие чеков vs `PAYMENT_REVIEW` + чек соблюдён.
-  - Replay с тем же `idempotency_key` возвращает результат; чужой чек с тем же `file_sha256` отклонён с `DuplicateReceiptError`.
+  - *До транзакции:* скачивание байтов чека через Telegram API и проверка размера `0 < len <= 10 MiB`.
+  - *Внутри `uow.write()` (`BEGIN IMMEDIATE`):* проверка `UserStatus` (`OD-02`), идемпотентность (`request_hash` включает `actor.user_id`, `order_id`, `file_sha256`, канонизированный `provider_name`, канонизированный `provider_tx_id`), проверка существования и владения `order` с единым anti-oracle `PermissionDeniedError`, `ReceiptRepository.submit_receipt()`, переход `PENDING_PAYMENT -> PAYMENT_REVIEW` с `expected_current_status=OrderStatus.PENDING_PAYMENT`, запись аудита, фиксация `idempotency_keys`.
+  - *После коммита:* уведомление операторов.
+- **Предусловия:** заказ существует и принадлежит `actor.user_id`, статус `PENDING_PAYMENT` (или `PAYMENT_REVIEW` по `OD-08`), файл не пуст и `<= 10 MiB`, `provider_name` — валидная строка (после фикса `SG-P2-016` не допускает нестроковые типы и обрезается/нормализуется; разрешённые провайдеры могут быть ограничены конфигом), `file_sha256` и `(provider_name, provider_tx_id)` не дублируются.
+- **Возможные ошибки:** `PermissionDeniedError` (чужой или несуществующий `order_id`), `UserBlockedError` (`OD-02`), `ValidationError` (размер/тип), `DuplicateReceiptError` (дубль хэша или `provider_tx_id`), `InvalidStateTransitionError` (заказ уже `CANCELLED`/`PAID`/`COMPLETED`), `IdempotencyConflictError`.
+- **Поведение при rollback:** ошибка в `transition_order_status` или аудите полностью откатывает `submit_receipt()`.
+- **Необходимые тесты:** атомарный перевод в `PAYMENT_REVIEW`, rollback-тест при ошибке после `submit_receipt()`, гонка `submit_payment_receipt` vs `cancel_order` (`Barrier(2)`), replay одного запроса vs конфликт при смене `provider_tx_id` под тем же `idempotency_key` (`IdempotencyConflictError`), антидубль `DuplicateReceiptError`.
 
-### 6.3. Workflow 3: Approve Receipt and Fulfill (`ACCEPTED` + `PAID` + `FULFILLING` + `finalize_order_sale` + `COMPLETED`)
+### 6.3. Workflow 3: Approve Receipt and Fulfill + 4-Stage Delivery
 
 ```mermaid
 sequenceDiagram
@@ -469,60 +481,76 @@ sequenceDiagram
     participant AdminBot as Operator Bot Handler
     participant PaySvc as PaymentService
     participant DlvSvc as DeliveryService
-    participant UoW as UnitOfWork (BEGIN IMMEDIATE)
-    participant RcptRepo as ReceiptRepository
-    participant OrdRepo as OrderRepository
-    participant InvRepo as InventoryRepository
-    participant Audit as AuditRepository
+    participant Session as WriteSession / ReadSession
     participant TgAdapter as TelegramDeliveryAdapter
+    actor Buyer as Buyer Telegram Chat
 
     Op->>AdminBot: Нажимает "Подтвердить и выдать" (receipt_id)
-    AdminBot->>PaySvc: approve_receipt_and_fulfill(actor=OPERATOR, receipt_id, key)
-    PaySvc->>UoW: with uow.write() [BEGIN IMMEDIATE]
-    Note over PaySvc: Проверка ActorType.OPERATOR & Idempotency
-    PaySvc->>RcptRepo: update_review_status(receipt_id, ACCEPTED, notes)
-    PaySvc->>OrdRepo: transition_order_status(order_id, PAID, expected=PAYMENT_REVIEW)
-    PaySvc->>OrdRepo: transition_order_status(order_id, FULFILLING, expected=PAID)
-    PaySvc->>InvRepo: finalize_order_sale(order_id)
-    Note over InvRepo: Все RESERVED -> SOLD, сверка по (product_id, denomination_id)
-    PaySvc->>OrdRepo: transition_order_status(order_id, COMPLETED, expected=FULFILLING)
-    PaySvc->>Audit: record_event("ORDER_APPROVED_AND_FULFILLED", "ORDER", order_id, actor)
-    UoW-->>PaySvc: COMMIT
+    AdminBot->>PaySvc: approve_receipt_and_fulfill(actor=OPERATOR, receipt_id, notes, key)
+    PaySvc->>Session: with uow.write() [BEGIN IMMEDIATE]
+    Note over PaySvc: Проверка ActorType.OPERATOR & IdempotencyRepo
+    PaySvc->>Session: receipt = update_review_status(receipt_id, ACCEPTED, notes)
+    PaySvc->>Session: transition_order_status(order_id, PAID, expected_current_status=PAYMENT_REVIEW, actor_context=actor)
+    PaySvc->>Session: transition_order_status(order_id, FULFILLING, expected_current_status=PAID, actor_context=actor)
+    PaySvc->>Session: finalize_order_sale(order_id)
+    PaySvc->>Session: transition_order_status(order_id, COMPLETED, expected_current_status=FULFILLING, actor_context=actor)
+    PaySvc->>Session: audit.record_event("ORDER_APPROVED_AND_FULFILLED", "ORDER", order_id, actor)
+    PaySvc-->>Session: COMMIT (exit uow.write)
     PaySvc-->>AdminBot: FulfillmentResult(order=COMPLETED, sold_count)
 
-    Note over AdminBot,TgAdapter: ПОСЛЕ COMMIT: доставка кодов ВНЕ SQLite write lock
-    AdminBot->>DlvSvc: prepare_order_delivery(actor=SYSTEM/USER, order_id)
-    DlvSvc->>UoW: with uow.write() [BEGIN IMMEDIATE]
-    DlvSvc->>InvRepo: get_revealed_code(...) по каждой SOLD позиции
-    DlvSvc->>Audit: record_event("DELIVERY_DISPATCH_STARTED", ...)
-    UoW-->>DlvSvc: COMMIT (DeliveryPayload с замаскированным __repr__)
+    Note over AdminBot,Buyer: ДОСТАВКА В 4 НЕЗАВИСИМЫХ СТАДИИ (внешний I/O строго вне БД)
 
-    AdminBot->>TgAdapter: sendMessage(chat_id, codes, protect_content=True)
-    TgAdapter-->>AdminBot: message_id / error
-    AdminBot->>DlvSvc: record_delivery_outcome(delivery_id, succeeded, message_id/error_code)
-    DlvSvc->>UoW: with uow.write() [BEGIN IMMEDIATE]
-    UoW-->>DlvSvc: COMMIT
+    rect rgb(235, 245, 255)
+        Note over AdminBot,Session: Stage A: Claim delivery (короткая write-транзакция)
+        AdminBot->>DlvSvc: claim_delivery(actor=OPERATOR, order_id, delivery_kind="INITIAL")
+        DlvSvc->>Session: with uow.write() [BEGIN IMMEDIATE]
+        DlvSvc->>Session: Просрочить истекшие DISPATCHING; проверить отсутствие активного lease & политика OD-01
+        DlvSvc->>Session: INSERT order_deliveries (DISPATCHING, claim_token, lease_expires_at) + audit
+        DlvSvc-->>Session: COMMIT (write lock освобождён)
+        DlvSvc-->>AdminBot: DeliveryClaim(delivery_id, claim_token)
+    end
+
+    rect rgb(245, 245, 245)
+        Note over AdminBot,Session: Stage B: Prepare payload (после коммита Stage A, read-only snapshot)
+        AdminBot->>DlvSvc: prepare_payload(actor=OPERATOR, delivery_id, claim_token)
+        DlvSvc->>Session: with uow.read() [BEGIN DEFERRED + query_only=ON]
+        DlvSvc->>Session: Проверить активный claim_token; get_revealed_code() по всем SOLD позициям
+        DlvSvc-->>Session: ROLLBACK (read tx закрыта)
+        DlvSvc-->>AdminBot: DeliveryPayload (in-memory, masked __repr__)
+    end
+
+    rect rgb(255, 248, 235)
+        Note over AdminBot,Buyer: Stage C: External delivery (БЕЗ подключения и транзакции SQLite)
+        AdminBot->>TgAdapter: send_delivery_payload(payload, protect_content=True)
+        TgAdapter->>Buyer: Telegram sendMessage(buyer_chat_id, codes, protect_content=True)
+        TgAdapter-->>AdminBot: ExternalDeliveryOutcome(SENT/FAILED/UNCERTAIN, msg_id/err_code)
+    end
+
+    rect rgb(235, 255, 240)
+        Note over AdminBot,Session: Stage D: Record outcome (отдельная короткая write-транзакция)
+        AdminBot->>DlvSvc: record_outcome(actor=OPERATOR, delivery_id, claim_token, outcome)
+        DlvSvc->>Session: with uow.write() [BEGIN IMMEDIATE]
+        DlvSvc->>Session: CAS UPDATE order_deliveries WHERE id=? AND claim_token=? -> SENT/FAILED/UNCERTAIN + audit
+        DlvSvc-->>Session: COMMIT
+    end
 ```
 
-- **Разделение вариантов исполнения (критично для бизнес-модели с нулевым складом / дропшиппингом):**
-  1. **Путь 3A — Складской буфер (1-клик `approve_receipt_and_fulfill`):** вся цепочка (`ACCEPTED` -> `PAID` -> `FULFILLING` -> `finalize_order_sale()` -> `COMPLETED`) проходит в **одной** `uow.write()`. Подходит, когда позиции уже были `RESERVED` на checkout.
-  2. **Путь 3B — Дропшиппинг / ручная дозакупка кода (`approve_receipt_only` -> закупка оператором -> `fulfill_paid_order`):** если заказ оформлен без предрезерва или требует внешней закупки (вне БД), оператор в 1-й транзакции подтверждает оплату (`ACCEPTED` -> `PAID`), затем **вне БД** закупает и импортирует код (`import_items`), затем во 2-й транзакции (`fulfill_paid_order`) резервирует (при необходимости), финализирует (`SOLD`) и завершает (`COMPLETED`).
-  3. **Путь 3C — Неинвентарная ручная услуга (`MANUAL_REVIEW`):** `approve_receipt_only` (`ACCEPTED` -> `PAID` -> `FULFILLING`), выполнение услуги оператором **вне БД**, затем `complete_manual_fulfillment(order_id, fulfillment_notes)` (`FULFILLING -> COMPLETED`).
-- **Граница транзакции для Пути 3A:**
-  - *Внутри 1-й `uow.write()`:* проверка роли `OPERATOR`, идемпотентность, обновление чека (`PENDING_REVIEW -> ACCEPTED`), отсутствие других `ACCEPTED` чеков на заказ, переходы заказа (`PAYMENT_REVIEW -> PAID -> FULFILLING`), `finalize_order_sale()`, переход (`FULFILLING -> COMPLETED`), аудит.
-  - *После коммита:* выдача кодов пользователю через `DeliveryService` (отдельная короткая `uow.write()` на подготовку/учёт попытки, отправка в Telegram вне БД, короткая `uow.write()` на фиксацию `SENT`/`FAILED`).
-- **Предусловия:** `actor.actor_type == OPERATOR`, чек в `PENDING_REVIEW`, заказ в `PAYMENT_REVIEW`, нет другого `ACCEPTED` чека по заказу, все инвентарные позиции заказа находятся в `RESERVED` в точном количестве и с точным `(product_id, denomination_id)`.
-- **Возможные ошибки:** `PermissionDeniedError`, `NotFoundError`, `InvalidStateTransitionError` (чек уже обработан или заказ не в `PAYMENT_REVIEW`), `ValidationError` (несоответствие `RESERVED` позиций), `ConflictError` (уже `SOLD` / конкурентное изменение статуса), `IdempotencyConflictError`.
-- **Поведение при rollback:**
-  - Если `finalize_order_sale()` падает на проверке неполного резерва, откатываются **и `COMPLETED`, и `FULFILLING`, и `PAID`, и `review_status = ACCEPTED`** — чек остаётся `PENDING_REVIEW`, заказ остаётся `PAYMENT_REVIEW`, инвентарь остаётся `RESERVED`. Никаких «зависших `PAID`/`FULFILLING` без товара» не возникает.
-  - Если же БД успешно закоммитила `COMPLETED` + `SOLD`, а на следующем шаге упал Telegram API (`sendMessage`), заказ **не откатывается** (деньги приняты, товар списан), но в `order_deliveries` фиксируется `FAILED`, и клиент/оператор может безопасно повторить доставку уже проданных `SOLD`-кодов (повторного списания со склада не происходит).
-- **Защита от повторного выполнения:**
-  - Двойной клик двух операторов (или повторный webhook/callback): 1-й вызов переводит чек в `ACCEPTED` и заказ в `COMPLETED`; 2-й вызов с тем же `idempotency_key` получает кэшированный результат, а 2-й вызов с *другим* ключом от другого оператора получает `InvalidStateTransitionError` / `ConflictError` на уровне `BEGIN IMMEDIATE` без повторной финализации.
-- **Необходимые тесты:**
-  - Атомарный `approve_receipt_and_fulfill` (1 и несколько позиций).
-  - Fault-injection rollback: сбой в `finalize_order_sale()` откатывает статус чека обратно в `PENDING_REVIEW` и заказа в `PAYMENT_REVIEW`.
-  - Конкурентный тест (`Barrier(2)`): 2 оператора одновременно жмут `Approve` на одном чеке — 1 успех, 1 ошибка состояния (`ConflictError`/`InvalidStateTransitionError`), ровно 1 `ACCEPTED` чек, ровно 1 набор `SOLD`.
-  - Повторная доставка после симуляции падения Telegram API (после коммита `COMPLETED`): заказ остаётся `COMPLETED`, повторная выдача отдаёт те же `SOLD` коды без ошибки `InsufficientInventoryError`.
+- **Пути исполнения оплаты и выполнения:**
+  - **Путь 3A (`approve_receipt_and_fulfill`):** 1-клик для предрезервированных складских заказов (`ACCEPTED -> PAID -> FULFILLING -> finalize_order_sale -> COMPLETED` в одной `uow.write()`).
+  - **Путь 3B (`approve_receipt_only(start_fulfillment=False)` -> закупка/импорт -> `fulfill_paid_order`):** для дропшиппинга без предрезерва.
+  - **Путь 3C (`approve_receipt_only(start_fulfillment=True)` -> ручное оказание -> `complete_manual_fulfillment`):** для неинвентарных `MANUAL_REVIEW`.
+- **Обработка граничного кейса с блокировкой пользователя до одобрения:** если между созданием заказа/подачей чека и подтверждением оператором пользователь получил `UserStatus.BLOCKED`, политика определяется `OD-01`/`OD-02`: при `OD-01` Option A (`Strict Lockout`) в `approve_receipt_and_fulfill` заказ переходит в `COMPLETED`/`SOLD`, а `DeliveryService.claim_delivery` при `UserStatus == BLOCKED` отклоняет автодиспатч с `UserBlockedError` и оставляет `SOLD`-товар замороженным до разблокировки/ручного возврата (`REFUND_REVIEW`) — без утечки кодов заблокированному пользователю.
+- **Сценарии сбоев и восстановления 4-стадийной доставки:**
+
+| Сценарий сбоя | Состояние в БД (`order_deliveries`) | Механизм восстановления и гарантии |
+| :--- | :--- | :--- |
+| **1. Падение процесса до отправки в Telegram (после Stage A или B)** | Строка остаётся в `DISPATCHING` с `lease_expires_at` (например, `now + 60s`). | По истечении lease следующий вызов `claim_delivery()` или `reap_expired_leases()` переводит просроченный `DISPATCHING` в `UNCERTAIN` и разрешает выдать новый `claim_token` для повторной попытки. |
+| **2. Падение после успешной отправки в Telegram, до коммита Stage D `SENT`** | В Telegram сообщение уже ушло, а в БД висит истёкший `DISPATCHING` -> переходит в `UNCERTAIN`. | При повторной доставке клиент получает **те же самые `SOLD`-коды** своего заказа (новое списание со склада невозможно). В логе/аудите честно отражено, что предыдущая попытка имела статус `UNCERTAIN` (модель **at-least-once**). |
+| **3. Timeout / обрыв сети с неизвестным ответом Telegram API** | Stage C классифицирует результат как `UNCERTAIN`; Stage D фиксирует `status = 'UNCERTAIN'` с `error_code = 'TG_TIMEOUT'`. | Если фоновый retry или повторный запрос пользователя/оператора запускает новую попытку, используется новый `attempt_no` и те же `SOLD`-коды. Если поздний ответ предыдущего HTTP-запроса успевает прийти в `record_outcome` с тем же `claim_token`, `UNCERTAIN -> SENT` обновляется безопасно; при перехвате другим `claim_token` результат старого токена игнорируется (`DELIVERY_STALE_OUTCOME_IGNORED`). |
+| **4. Повторная отправка (`REDELIVERY` / `OPERATOR_RESEND`)** | Предыдущая попытка в статусе `SENT`/`FAILED`/`UNCERTAIN` сохраняется неизменной; создаётся **новая** строка `order_deliveries` с `attempt_no + 1`. | `claim_delivery(delivery_kind="REDELIVERY")` проверяет rate-limit (`OD-08`) и активный `DISPATCHING` lease, не переписывает историю прошлых успешных `SENT` и заново проходит B -> C -> D. |
+| **5. Гонка двух параллельных обработчиков доставки** | Частичный уникальный индекс `idx_order_deliveries_single_active_dispatch ON order_deliveries(order_id) WHERE status = 'DISPATCHING'`. | В `BEGIN IMMEDIATE` второй обработчик не может вставить второй активный `DISPATCHING` при неистёкшем lease и получает `DeliveryInProgressError`. |
+
+- **Честный отказ от `exactly-once`:** Telegram Bot API не поддерживает идемпотентные ключи доставки сообщений и двухфазный коммит. Поэтому система не обещает `exactly-once delivery`; гарантируются: **одномоментная эксклюзивность `DISPATCHING` (lease)**, **невозможность повторного списания/выдачи чужого или нового инвентаря** и **полная наблюдаемость статусов `SENT` / `FAILED` / `UNCERTAIN`**.
 
 ### 6.4. Workflow 4: Cancel Order (`release_order_reservations` + `CANCELLED`)
 
@@ -531,91 +559,110 @@ sequenceDiagram
     autonumber
     actor Caller as User / Operator / TTL Worker
     participant OrdSvc as OrderService
-    participant UoW as UnitOfWork (BEGIN IMMEDIATE)
+    participant Session as WriteSession (uow.write / BEGIN IMMEDIATE)
+    participant Idem as IdempotencyRepo
+    participant OrdRepo as OrderRepository
     participant InvRepo as InventoryRepository
     participant RcptRepo as ReceiptRepository
-    participant OrdRepo as OrderRepository
     participant Audit as AuditRepository
 
     Caller->>OrdSvc: cancel_order(actor, order_id, reason, idempotency_key)
-    OrdSvc->>UoW: with uow.write() [BEGIN IMMEDIATE]
-    Note over OrdSvc: Проверка прав (owner/OPERATOR/SYSTEM) и допустимого статуса заказа
-    alt Статус в {PENDING_PAYMENT, PAYMENT_REVIEW, REFUND_REVIEW}
-        OrdSvc->>InvRepo: release_order_reservations(order_id)
-        InvRepo-->>OrdSvc: released_count (RESERVED -> AVAILABLE, reserved_order_id = NULL)
-        opt Есть чеки PENDING_REVIEW (см. OD-05)
-            OrdSvc->>RcptRepo: Отклонить висящие PENDING_REVIEW чеки (REJECTED)
+    OrdSvc->>Session: with uow.write() [BEGIN IMMEDIATE]
+    OrdSvc->>Idem: claim_or_replay(scope="ORDER_CANCEL", key, request_hash)
+    alt Повтор с тем же request_hash
+        Idem-->>OrdSvc: existing order_id
+        OrdSvc->>OrdRepo: get_order(order_id)
+        OrdSvc-->>Session: exit uow.write() (без мутаций)
+        OrdSvc-->>Caller: Order (CANCELLED - idempotent replay)
+    else Новая отмена
+        OrdSvc->>OrdRepo: get_order(order_id)
+        Note over OrdSvc: Матрица прав (USER owner в PENDING_PAYMENT [и PAYMENT_REVIEW по OD-05]; OPERATOR в PENDING_PAYMENT/PAYMENT_REVIEW/REFUND_REVIEW; SYSTEM только PENDING_PAYMENT)
+        alt Статус допустим для actor
+            OrdSvc->>InvRepo: release_order_reservations(order_id)
+            InvRepo-->>OrdSvc: released_count (RESERVED -> AVAILABLE, reserved_order_id = NULL)
+            opt Есть чеки PENDING_REVIEW (согласно OD-05)
+                OrdSvc->>RcptRepo: reject_pending_receipts_for_order(order_id, reason)
+            end
+            OrdSvc->>OrdRepo: transition_order_status(order_id, CANCELLED, notes=reason, expected_current_status=order.status, actor_context=actor)
+            Note over OrdRepo: Проверяет COUNT(RESERVED)==0; обработка SOLD при REFUND_REVIEW по OD-06
+            OrdSvc->>Audit: record_event("ORDER_CANCELLED", "ORDER", order_id, actor, {released_count})
+            OrdSvc->>Idem: mark_completed(key, "ORDER", order.id)
+            OrdSvc-->>Session: COMMIT (exit uow.write)
+            OrdSvc-->>Caller: Order (CANCELLED)
+        else Недопустимый статус (PAID / FULFILLING / COMPLETED / чужой заказ)
+            OrdSvc-->>Caller: InvalidStateTransitionError / PermissionDeniedError
         end
-        OrdSvc->>OrdRepo: transition_order_status(order_id, CANCELLED, notes=reason)
-        Note over OrdRepo: Проверяет COUNT(RESERVED) == 0; SOLD позиции не трогаются
-        OrdSvc->>Audit: record_event("ORDER_CANCELLED", "ORDER", order_id, actor, {released_count})
-        UoW-->>OrdSvc: COMMIT
-        OrdSvc-->>Caller: Order (CANCELLED)
-    else Статус уже CANCELLED (при том же idempotency_key)
-        OrdSvc-->>Caller: Idempotent replay Order (CANCELLED)
-    else Статус PAID / FULFILLING / COMPLETED
-        OrdSvc-->>Caller: InvalidStateTransitionError (требуется initiate_refund_review)
     end
 ```
 
-- **Граница транзакции:** одна короткая `uow.write()` (`BEGIN IMMEDIATE`) без сетевого I/O; уведомление пользователя/оператора — строго после коммита.
-- **Последовательность операций:** проверка субъекта и принадлежности (`USER` только свой заказ, см. также `OD-05` про отмену из `PAYMENT_REVIEW`; `OPERATOR`/`SYSTEM` по своим правилам) -> идемпотентность -> `release_order_reservations(order_id)` -> обработка ожидающих чеков (`OD-05`) -> `transition_order_status(order_id, CANCELLED)` -> `audit_events` -> `COMMIT`.
-- **Предусловия:** заказ в статусе `PENDING_PAYMENT`, `PAYMENT_REVIEW` или `REFUND_REVIEW` (отмена из `PAID`/`FULFILLING`/`COMPLETED` напрямую запрещена — только через `REFUND_REVIEW`).
-- **Возможные ошибки:** `PermissionDeniedError`, `NotFoundError`, `InvalidStateTransitionError` (включая попытку отменить уже `PAID`/`COMPLETED` заказ или `CANCELLED` без идемпотентного ключа), `ConflictError`.
-- **Поведение при rollback:** если `transition_order_status(CANCELLED)` завершается ошибкой (например, невалидный исходный статус), освобождение резервов `release_order_reservations()` **откатывается** — товар остаётся зарезервированным за заказом, исключая «живой заказ без резервов». При отмене из `REFUND_REVIEW` уже проданные (`SOLD`) коды никогда не возвращаются в `AVAILABLE`.
-- **Защита от повторного выполнения:** повтор с тем же `idempotency_key` возвращает уже отменённый заказ; конкурентная отмена и `approve_receipt_and_fulfill` / `submit_receipt` сериализуются через `BEGIN IMMEDIATE`.
-- **Необходимые тесты:**
-  - Атомарная отмена из `PENDING_PAYMENT`, `PAYMENT_REVIEW`, `REFUND_REVIEW` (проверка: `RESERVED -> AVAILABLE`, `SOLD` остаётся `SOLD`).
-  - Негативный тест: попытка прямого `OrderRepository.transition_order_status(order.id, CANCELLED)` при наличии `RESERVED` -> `InvalidStateTransitionError`.
-  - Rollback-тест: сбой на шаге `transition_order_status(CANCELLED)` откатывает `release_order_reservations()` (инвентарь остаётся `RESERVED`).
-  - Конкурентные тесты (`Barrier(2)`): `cancel_order` vs `approve_receipt_and_fulfill`; `cancel_order` (TTL worker) vs `submit_payment_receipt`.
+- **Граница транзакции:** одна короткая `uow.write()` (`BEGIN IMMEDIATE`); уведомления в Telegram — после коммита.
+- **Возможные ошибки:** `PermissionDeniedError`, `InvalidStateTransitionError`, `IdempotencyConflictError`, `ConflictError`.
+- **Поведение при rollback:** ошибка на шаге `transition_order_status(CANCELLED)` или обработке чеков откатывает `release_order_reservations()` (резервы возвращаются в `RESERVED`).
+- **Необходимые тесты:** отмена из `PENDING_PAYMENT`, `PAYMENT_REVIEW`, `REFUND_REVIEW`; rollback-тест отказа после `release_order_reservations()`; отказ прямого `transition_order_status(CANCELLED)` при наличии `RESERVED`; replay + `IdempotencyConflictError`; гонки `cancel_order` vs `submit_payment_receipt` и `cancel_order` vs `approve_receipt_and_fulfill`.
 
 ---
 
 ## 7. Database Invariants and Migration 007 Proposal (`SG-P2-006`)
 
-### 7.1. Нужна ли миграция `007`?
+### 7.1. Необходимость миграции `007` и сохранение checksum `001`–`006`
 
-**Да, обязательно.** Существующие миграции `001`–`006` защищены SHA-256 `checksum` в таблице `schema_migrations` (`src/db/migrations.py:159–164`): любая правка уже применённых файлов приведёт к `RuntimeError("checksum mismatch")` на существующих БД. Новые DB-level инварианты вносятся строго forward-only миграцией **`src/migrations/007_phase3_integrity_guards.sql`**, а сервисные таблицы поддержки (`idempotency_keys`, `order_deliveries`, защита `audit_events`) — отдельной миграцией **`src/migrations/008_phase3_service_support.sql`** (разделение гарантирует, что `007` отвечает только за целостность существующей схемы Phase 2).
+Миграции `001`–`006` защищены SHA-256 `checksum` в таблице `schema_migrations` (`src/db/migrations.py:159–164`) и остаются **полностью неизменными**. Все новые инварианты схемы добавляются строго forward-only миграцией **`src/migrations/007_phase3_integrity_guards.sql`**, а сервисные таблицы — миграцией **`src/migrations/008_phase3_service_support.sql`**.
 
-### 7.2. Pre-flight проверки в миграции `007`
+### 7.2. Pre-flight проверки миграции `007` (исправленная рабочая схема)
 
-С учётом замечания **`SG-P2-006`** (подраздел 3 о том, что `INNER JOIN` в `003` пропускает битые строки, созданные с `foreign_keys = OFF`), **все pre-flight проверки в `007` обязаны использовать `LEFT JOIN`**. Миграция `007` прерывается через `SELECT RAISE(ABORT, ...)` внутри `BEGIN IMMEDIATE` (атомарный откат) при обнаружении любого из нарушений:
+> **Исправление архитектурной ошибки:** автономный оператор `SELECT RAISE(ABORT, ...);` вне триггера в SQLite запрещён (`sqlite3.OperationalError: RAISE() may only be used within a trigger-program`, подтверждено локальной пробой). Поэтому pre-flight для миграции `007` реализуется не через standalone `SELECT RAISE`, а через **Python pre-flight hook в `src/db/migrations.py`**, который выполняется **внутри той же транзакции `BEGIN IMMEDIATE`** перед исполнением DDL миграции.
 
-1. `chk_007_voucher_denom_invalid_product`: строка в `voucher_denominations` с отсутствующим продуктом (`p.id IS NULL`) или `p.product_type != 'VOUCHER'`.
-2. `chk_007_voucher_denom_details_mismatch`: строка в `voucher_denominations`, не совпадающая по `(region, currency)` с `voucher_details` или нарушающая пары `('TR','TRY')` / `('US','USD')`.
+**Необходимые изменения в `src/db/migrations.py` (для Stage 3.1):**
+1. Новое исключение `MigrationPreflightError(RuntimeError)` (экспорт в `src/db/__init__.py`).
+2. Реестр `MIGRATION_PREFLIGHT_CHECKS: dict[int, Callable[[sqlite3.Connection], None]] = {7: _preflight_migration_007}` и опциональный параметр `preflight_hooks` в `run_migrations(...)` для тестируемости.
+3. Точный порядок внутри `with transaction(conn, mode="IMMEDIATE"):` в `run_migrations()` для версии `version`:
+   - **Шаг 1:** `SELECT checksum FROM schema_migrations WHERE version = ?`. Если версия уже применена: проверить совпадение `checksum` и выполнить `continue` **до** запуска pre-flight и DDL (гарантирует идемпотентность повторных запусков).
+   - **Шаг 2:** Если для `version` есть hook в `preflight_hooks` — вызвать `preflight_fn(conn)` **строго до выполнения любого DDL** из `.sql`-файла, но в той же `BEGIN IMMEDIATE` транзакции. При обнаружении нарушений `preflight_fn` бросает `MigrationPreflightError` с точным кодом проверки и первыми ID битых строк -> `transaction()` откатывает транзакцию целиком, DDL не выполняется, `schema_migrations` остаётся нетронутой.
+   - **Шаг 3:** Выполнить все операторы из `_split_sql_statements(sql_script)` в этой же `BEGIN IMMEDIATE` транзакции (в SQLite DDL — `CREATE TRIGGER`, `CREATE INDEX`, `CREATE TABLE` — полностью транзакционен и откатывается при ошибке, подтверждено локальной пробой `DDL_TRIGGER_ROLLBACK`).
+   - **Шаг 4:** Вставить запись в `schema_migrations` (`version, name, file_checksum`) и зафиксировать единым `COMMIT`.
+
+**Перечень проверок в `_preflight_migration_007(conn)` (все через `LEFT JOIN` согласно `SG-P2-006`):**
+
+1. `chk_007_voucher_denom_invalid_product`: `voucher_denominations vd LEFT JOIN products p ON p.id = vd.product_id WHERE p.id IS NULL OR p.product_type != 'VOUCHER'`.
+2. `chk_007_voucher_denom_details_mismatch`: `voucher_denominations vd LEFT JOIN voucher_details vdet ON vdet.product_id = vd.product_id WHERE vdet.product_id IS NULL OR vdet.region != vd.region OR vdet.currency != vd.currency OR NOT ((vd.region = 'TR' AND vd.currency = 'TRY') OR (vd.region = 'US' AND vd.currency = 'USD'))` *(явная проверка `vdet.product_id IS NULL` закрывает `UNKNOWN` в SQL NULL-логике)*.
 3. `chk_007_orphaned_inventory_or_order_items`: строки `inventory_items` или `order_items` с `p.id IS NULL` (`LEFT JOIN products`).
-4. `chk_007_cancelled_order_with_reserved_inventory`: заказы в статусе `CANCELLED`, у которых остались `inventory_items` со статусом `'RESERVED'`.
-5. `chk_007_completed_order_inventory_mismatch`: заказы в статусе `COMPLETED`, у которых либо остались `'RESERVED'` позиции, либо по инвентарным `order_items` (`VOUCHER` / `FIXED_PRODUCT` со способом `CODE`) количество `SOLD` не равно заказанному `SUM(quantity)`.
-6. `chk_007_multiple_accepted_receipts`: заказ `order_id`, имеющий более 1 чека в статусе `'ACCEPTED'`.
+4. `chk_007_cancelled_order_with_reserved_inventory`: заказы в `CANCELLED`, на которых числятся `inventory_items` со статусом `'RESERVED'`.
+5. `chk_007_completed_order_inventory_mismatch`: заказы в `COMPLETED`, у которых либо есть `'RESERVED'` позиции, либо по инвентарным `order_items` (критерий инвентарности `VOUCHER` / `CODE` / плюс `OFFICIAL_ACTIVATION` согласно `OD-03`) количество `'SOLD'` не равно `SUM(quantity)`.
+6. `chk_007_paid_order_missing_paid_at`: заказы со статусом `'PAID'` (или `'FULFILLING'`/`'COMPLETED'`), у которых `paid_at IS NULL` *(если применимо к существующим БД — в тестах Phase 2 `transition_order_status(PAID)` всегда проставляет `paid_at`)*.
+7. `chk_007_multiple_accepted_receipts`: заказы, у которых `COUNT(*) > 1` для `payment_receipts.review_status = 'ACCEPTED'`.
 
-### 7.3. Предлагаемые SQLite-триггеры в миграции `007`
+### 7.3. Предлагаемые объекты в `007_phase3_integrity_guards.sql`
 
-| Имя триггера | Таблица и событие | Проверяемые инварианты |
+| Объект БД | Тип и событие | Точные проверяемые инварианты (с учётом исправлений Revision 1) |
 | :--- | :--- | :--- |
-| `trg_voucher_denominations_validate_insert` | `BEFORE INSERT ON voucher_denominations` | Запрещает `product_type != 'VOUCHER'` (`FIXED_PRODUCT`); проверяет соответствие `NEW.(region, currency)` таблице `voucher_details` и паре `TR/TRY` или `US/USD` |
-| `trg_voucher_denominations_validate_update` | `BEFORE UPDATE OF product_id, region, currency ON voucher_denominations` | То же для `NEW.product_id`, `NEW.region`, `NEW.currency` (плюс запрещает смену `region`/`currency` при уже существующих `order_items` или `inventory_items` на этот `denomination_id`) |
-| `trg_inventory_items_validate_status_transition` | `BEFORE UPDATE OF status, reserved_order_id ON inventory_items` | **1)** Жёстко запрещает любой переход **из `OLD.status = 'SOLD'`** (`SOLD -> AVAILABLE`, `SOLD -> RESERVED`, `SOLD -> QUARANTINED`, `SOLD -> DISABLED`) и запрещает менять `reserved_order_id` у `SOLD` *(если `OD-06` разрешит `SOLD -> QUARANTINED`, разрешить только этот переход при неизменном `reserved_order_id`)*; **2)** Запрещает прямой прыжок `AVAILABLE -> SOLD` в обход `RESERVED`; **3)** Запрещает `RESERVED -> RESERVED` на другой `reserved_order_id`; **4)** Запрещает `QUARANTINED`/`DISABLED` переводить сразу в `RESERVED`/`SOLD` (и сбрасывать в `AVAILABLE`, если сохранился `reserved_order_id`) |
-| `trg_inventory_items_enforce_allocation_cap` | `BEFORE INSERT` и `BEFORE UPDATE OF product_id, denomination_id, status, reserved_order_id ON inventory_items` (при `NEW.status IN ('RESERVED', 'SOLD')`) | Проверяет на уровне БД, что `COUNT(существующих RESERVED/SOLD по этому (order_id, product_id, denomination_id) исключая NEW.id) + 1 <= SUM(order_items.quantity)` и что `orders.status` допустим для резервирования/продажи |
-| `trg_orders_validate_status_transition` | `BEFORE UPDATE OF status ON orders` | **1)** Матрица допустимых переходов `OLD.status -> NEW.status` (идентично `ALLOWED_ORDER_TRANSITIONS`); **2)** При `NEW.status = 'COMPLETED'`: запрет при наличии `RESERVED` и запрет при несовпадении `COUNT(SOLD)` с `SUM(quantity)` для инвентарных позиций (`VOUCHER`, `FIXED_PRODUCT` с `delivery_method = 'CODE'`); **3)** При `NEW.status = 'CANCELLED'`: запрет при наличии `RESERVED` по заказу |
-| `trg_payment_receipts_validate_review_transition` | `BEFORE UPDATE OF review_status ON payment_receipts` | Запрещает изменять терминальный статус (`OLD.review_status IN ('ACCEPTED', 'REJECTED', 'DUPLICATE')`); при `NEW.review_status = 'ACCEPTED'` проверяет отсутствие другого `ACCEPTED` чека по тому же `NEW.order_id` |
-| `trg_order_items_freeze_after_pending` | `BEFORE INSERT / UPDATE / DELETE ON order_items` | Запрещает добавлять/удалять или менять цену/количество `order_items`, если `orders.status != 'PENDING_PAYMENT'` (закрывает пробел изменения состава/цен после начала оплаты) |
-
-*Примечание по согласованности с миграцией `005` / `006`:* перед созданием новых триггеров убедиться, что имена не конфликтуют с 12 существующими триггерами; existing `trg_inventory_items_validate_insert`/`update` остаются на своих задачах, а новые триггеры дополняют их ортогонально.
+| `idx_receipts_single_accepted_per_order` | `CREATE UNIQUE INDEX ... ON payment_receipts(order_id) WHERE review_status = 'ACCEPTED'` | Атомарно запрещает иметь > 1 принятого чека на заказ как при `INSERT`, так и при `UPDATE` (проверено локальной пробой) |
+| `trg_voucher_denominations_validate_insert` | `BEFORE INSERT ON voucher_denominations` | Блокирует `product_type != 'VOUCHER'` (`FIXED_PRODUCT`), отсутствие/несовпадение `voucher_details.(region, currency)` и неверную пару `TR/TRY` / `US/USD` |
+| `trg_voucher_denominations_validate_update` | `BEFORE UPDATE OF product_id, region, currency ON voucher_denominations` | То же для `NEW`, плюс запрет менять `region`/`currency` при наличии ссылающихся `order_items` или `inventory_items` |
+| `trg_inventory_items_prevent_direct_sold_insert` | `BEFORE INSERT ON inventory_items WHEN NEW.status = 'SOLD'` | Запрещает прямую SQL-вставку сразу в `'SOLD'` в обход пути `AVAILABLE -> RESERVED -> SOLD` |
+| `trg_inventory_items_validate_status_transition` | `BEFORE UPDATE OF status, reserved_order_id ON inventory_items` | **1)** Блокирует любой уход из `OLD.status = 'SOLD'` (и смену `reserved_order_id` у `SOLD`) *(либо разрешает только `SOLD -> QUARANTINED` без смены `reserved_order_id`, если выбрано `OD-06` B)*; **2)** Блокирует прямой прыжок `AVAILABLE -> SOLD`; **3)** Блокирует перепривязку `RESERVED` на другой `order_id`; **4)** Блокирует возврат `QUARANTINED`/`DISABLED` сразу в `RESERVED`/`SOLD` (или в `AVAILABLE` с не-`NULL` `reserved_order_id`) |
+| `trg_inventory_items_enforce_allocation_cap_insert` | `BEFORE INSERT ON inventory_items WHEN NEW.status IN ('RESERVED', 'SOLD')` | Отдельный `INSERT`-триггер **без** `id != NEW.id` (так как в `BEFORE INSERT` при `AUTOINCREMENT` `NEW.id IS NULL`): проверяет `COUNT(существующих RESERVED/SOLD по (order_id, product_id, denomination_id)) + 1 <= SUM(order_items.quantity)` и допустимый `orders.status` |
+| `trg_inventory_items_enforce_allocation_cap_update` | `BEFORE UPDATE OF product_id, denomination_id, status, reserved_order_id ON inventory_items WHEN NEW.status IN ('RESERVED', 'SOLD')` | Отдельный `UPDATE`-триггер **с** `AND id != OLD.id`: проверяет ту же границу квоты и допустимый `orders.status` (подтверждено пробой) |
+| `trg_orders_validate_status_transition` | `BEFORE UPDATE OF status ON orders` | **1)** Матрица допустимых переходов `OLD.status -> NEW.status` (`ALLOWED_ORDER_TRANSITIONS`); **2)** При `NEW.status = 'PAID'`: требует `NEW.paid_at IS NOT NULL`; **3)** При `NEW.status = 'COMPLETED'`: запрещает `RESERVED > 0`, проверяет `COUNT(SOLD) == SUM(quantity)` по инвентарным позициям и `COUNT(SOLD) == 0` по неинвентарным; **4)** При `NEW.status = 'CANCELLED'`: запрещает `RESERVED > 0` |
+| `trg_payment_receipts_validate_insert_status` | `BEFORE INSERT ON payment_receipts` | Запрещает прямую SQL-вставку чека сразу в статусе `ACCEPTED`/`REJECTED`/`DUPLICATE` (только `PENDING_REVIEW`) |
+| `trg_payment_receipts_validate_review_transition` | `BEFORE UPDATE OF review_status ON payment_receipts` | Запрещает любое изменение уже терминального `OLD.review_status IN ('ACCEPTED', 'REJECTED', 'DUPLICATE')` |
+| `trg_order_items_freeze_insert_after_pending` | `BEFORE INSERT ON order_items` | Запрещает добавлять строки, если `orders.status != 'PENDING_PAYMENT'` |
+| `trg_order_items_freeze_update_after_pending` | `BEFORE UPDATE ON order_items` | Запрещает менять строки заказа, если `orders.status != 'PENDING_PAYMENT'` |
+| `trg_order_items_freeze_delete_after_pending` | `BEFORE DELETE ON order_items` | Запрещает удалять строки заказа, если `orders.status != 'PENDING_PAYMENT'` |
 
 ### 7.4. Отдельное предложение по миграции `008` (`008_phase3_service_support.sql`)
 
-Для поддержки сервисного слоя Stage 3.2:
-1. Таблица `idempotency_keys` (`id`, `scope`, `actor_key`, `idempotency_key`, `request_hash`, `status` (`IN_PROGRESS`/`COMPLETED`/`FAILED`), `response_entity_type`, `response_entity_id`, `response_snapshot_json`, `created_at`, `expires_at`, `UNIQUE (scope, actor_key, idempotency_key)`).
-2. Таблица `order_deliveries` (`id`, `order_id REFERENCES orders(id) ON DELETE RESTRICT`, `channel`, `status` (`PENDING`/`SENT`/`FAILED`), `attempt_count`, `external_message_id`, `error_code`, `last_attempt_at`, `delivered_at`, `created_at`) — без хранения plaintext-кодов!
-3. Защита `audit_events` от мутации: триггеры `trg_audit_events_prevent_update` (`BEFORE UPDATE`) и `trg_audit_events_prevent_delete` (`BEFORE DELETE`) — append-only журнал.
+1. **`idempotency_keys`:** `(id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, actor_key TEXT NOT NULL, idempotency_key TEXT NOT NULL, request_hash TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED')), response_entity_type TEXT, response_entity_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMP NOT NULL, UNIQUE (scope, actor_key, idempotency_key))`. *(Статус `'FAILED'` убран, так как неудачная транзакция откатывается и не оставляет записи.)*
+2. **`order_deliveries` (под 4-стадийный delivery workflow):**
+   - Столбцы: `id INTEGER PRIMARY KEY AUTOINCREMENT`, `order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE RESTRICT`, `channel TEXT NOT NULL DEFAULT 'TELEGRAM'`, `delivery_kind TEXT NOT NULL CHECK (delivery_kind IN ('INITIAL', 'REDELIVERY', 'OPERATOR_RESEND'))`, `status TEXT NOT NULL CHECK (status IN ('DISPATCHING', 'SENT', 'FAILED', 'UNCERTAIN'))`, `attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1)`, `claim_token TEXT UNIQUE NOT NULL`, `claimed_by TEXT NOT NULL`, `lease_expires_at TIMESTAMP NOT NULL`, `external_message_id TEXT`, `error_code TEXT`, `created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`, `updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`, `delivered_at TIMESTAMP`.
+   - Индексы: `UNIQUE INDEX idx_order_deliveries_single_active_dispatch ON order_deliveries(order_id) WHERE status = 'DISPATCHING'`, `UNIQUE INDEX idx_order_deliveries_order_attempt ON order_deliveries(order_id, attempt_no)`, `idx_order_deliveries_lease ON order_deliveries(status, lease_expires_at)`. *(Никаких plaintext-кодов; каждая попытка append-only с новым `attempt_no`, история прошлых `SENT` никогда не затирается.)*
+3. **Индекс TTL-заказов:** `CREATE INDEX IF NOT EXISTS idx_orders_status_created_at ON orders(status, created_at);` для быстрого поиска просроченных `PENDING_PAYMENT` в `expire_stale_orders()`.
+4. **Неизменяемость `audit_events`:** `trg_audit_events_prevent_update` (`BEFORE UPDATE`) и `trg_audit_events_prevent_delete` (`BEFORE DELETE`).
 
-### 7.5. Согласованность Python-валидации и SQL-триггеров
+### 7.5. Согласованность Python и SQLite
 
-- Python-слой **всегда первым** проверяет бизнес-правила и бросает точные доменные исключения (`ValidationError`, `InvalidStateTransitionError`, `ConflictError`).
-- SQLite-триггеры служат рубежом defense-in-depth против прямого SQL или багов в коде.
-- В репозиториях (особенно `add_voucher_denomination()` — `SG-P2-008`) `except sqlite3.IntegrityError` обязан анализировать контекст ограничения (например, `UNIQUE` -> `ConflictError`, `CHECK`/триггер валидации -> `ValidationError`/проброс), а не маскировать любые ошибки в `ConflictError`.
-- **Обратная совместимость:** миграция `007` проверяется как на чистой БД (`001 -> ... -> 007`), так и в сценарии апгрейда (`001..006 -> 007`) с данными, созданными до Phase 3. Для невалидных legacy-строк (например, старых `COMPLETED`-заказов без инвентаря в тестовых фикстурах) обновление тестов и pre-flight регламент документируются заранее.
+- Вся валидация выполняется сначала в Python-репозиториях и сервисах (включая добавление проверок терминальности в `ReceiptRepository.update_review_status()`), выбрасывая типизированные доменные исключения.
+- В `CatalogRepository.add_voucher_denomination()` (`SG-P2-008`) `except sqlite3.IntegrityError` разделяет `UNIQUE` (`ConflictError`) и нарушения `CHECK`/триггеров (`ValidationError`).
+- Обратная совместимость миграции `007` тестируется и на чистом прогоне `001 -> ... -> 007`, и на апгрейде `006 -> 007`, включая негативные тесты на отказ pre-flight при битых данных.
 
 ---
 
@@ -625,160 +672,122 @@ sequenceDiagram
 
 | Операция | `USER` (`ACTIVE`) | `USER` (`BLOCKED`) | `OPERATOR` | `SYSTEM` |
 | :--- | :--- | :--- | :--- | :--- |
-| Просмотр каталога (`APPROVED`) | Разрешено | Разрешено / Запрещено *(см. `OD-01`)* | Разрешено (включая `DRAFT`/`DISABLED`) | Read-only для TTL/аналитики |
-| Создание заказа (`checkout_*`) | **Разрешено** (с лимитом активных заказов `OD-08`) | **СТРОГО ЗАПРЕЩЕНО** (`UserBlockedError`) | Не применимо (только по аккаунту покупателя запрещено) | Запрещено |
-| Подача чека (`submit_receipt`) | Разрешено только для своего `order_id` | **Открытый вопрос (`OD-02`)** *(рекомендуется запрет)* | Запрещено подменять пользователя | Запрещено |
-| Чтение своего оплаченного / завершённого заказа | Разрешено (`order.user_id == actor.user_id`) | **Открытый вопрос (`OD-01`)** | Разрешено (аудируемый просмотр тикета) | Для SLA-мониторинга |
-| Получение / повторная выдача купленных `SOLD`-кодов (`get_revealed_code`) | Разрешено для своих заказов в `REVEALABLE_ORDER_STATUSES` (`PAID`, `FULFILLING`, `COMPLETED`) + аудит + rate limit | **Открытый вопрос (`OD-01` — `SG-P2-013`)** | **Открытый вопрос (`OD-07`)**: слепая переотправка пользователю vs break-glass просмотр | Только диспатч доставки пользователю (при `ACTIVE`) |
-| Чтение чужих заказов / чужих кодов / чужих чеков | **СТРОГО ЗАПРЕЩЕНО** (единое anti-oracle сообщение) | **СТРОГО ЗАПРЕЩЕНО** | Только с явной ролью `OPERATOR` и записью в `audit_events` | Запрещено |
-| Одобрение / отклонение чека, перевод в `PAID`/`COMPLETED`/`REFUND_REVIEW` | **СТРОГО ЗАПРЕЩЕНО** (`PermissionDeniedError`) | **СТРОГО ЗАПРЕЩЕНО** | **Разрешено** (по `OPERATOR_TELEGRAM_IDS` allowlist + аудит) | Запрещено (кроме TTL-отмены `PENDING_PAYMENT`) |
-| Отмена заказа (`cancel_order`) | Разрешено в `PENDING_PAYMENT` *(в `PAYMENT_REVIEW` — `OD-05`)* | По `OD-01`/`OD-05` | Разрешено в `PENDING_PAYMENT`, `PAYMENT_REVIEW`, `REFUND_REVIEW` | Разрешено только в `PENDING_PAYMENT` (TTL) |
+| Просмотр одобренного каталога | Разрешено | Запрещено / Разрешено *(по `OD-01`)* | Разрешено (все статусы) | Read-only для TTL/мониторинга |
+| Создание заказа (`checkout_*`) | **Разрешено** (в пределах квоты `OD-08`) | **СТРОГО ЗАПРЕЩЕНО** (`UserBlockedError`) | **Неприменимо** (оператор не оформляет заказы от имени других лиц) | Запрещено |
+| Подача чека (`submit_payment_receipt`) | Разрешено только для своего заказа | **Открытый вопрос (`OD-02`)** | Запрещено подменять пользователя | Запрещено |
+| Чтение своего оплаченного / завершённого заказа | Разрешено | **Открытый вопрос (`OD-01`)** | Разрешено (с аудитом) | Read-only для SLA |
+| Получение/повторная доставка `SOLD`-кодов | Разрешено только для своих заказов (`REVEALABLE_ORDER_STATUSES`) + rate limit | **Открытый вопрос (`OD-01` — `SG-P2-013`)** | По `OD-07`: переотправка в чат покупателя (или break-glass с аудитом) | Только автодиспатч для заказа, разрешённого политикой `OD-01` |
+| Чтение чужих заказов / чеков / кодов | **СТРОГО ЗАПРЕЩЕНО** (единый anti-oracle `PermissionDeniedError`) | **СТРОГО ЗАПРЕЩЕНО** | Только по `OPERATOR_EXTERNAL_IDS` allowlist + аудит | Запрещено |
+| Подтверждение/отклонение чека, возврат, ручное завершение | **СТРОГО ЗАПРЕЩЕНО** (`PermissionDeniedError`) | **СТРОГО ЗАПРЕЩЕНО** | **Разрешено** + обязательный `actor_external_id` в `audit_events` | Запрещено |
+| Отмена заказа (`cancel_order`) | Разрешено в `PENDING_PAYMENT` *(в `PAYMENT_REVIEW` — `OD-05`)* | **Открытый вопрос (`OD-02`)** | Разрешено в `PENDING_PAYMENT`, `PAYMENT_REVIEW`, `REFUND_REVIEW` | Разрешено только в `PENDING_PAYMENT` (TTL) |
 
-### 8.2. Политика безопасности раскрытия кодов и защиты от оракулов
+### 8.2. Anti-oracle, `SG-P2-013` и безопасность секретов
 
-1. **Единые anti-oracle ошибки на сервисном и транспортном уровне (`SG-P2-013`):**
-   - В `InventoryRepository.get_revealed_code()` (и в `DeliveryService`) ошибки `"not assigned to any order"`, `"not assigned to the specified order"`, `"must be SOLD"`, `"does not belong to the specified user"` не должны отдаваться пользователю в сыром виде. Для конечного пользователя возвращается унифицированное сообщение (например, `"Order or digital item is unavailable for reveal"`), а детальная причина логируется внутренне без раскрытия `item_id`/статусов чужих заказов.
-2. **Контроль `users.status` в `get_revealed_code()` (`SG-P2-013`):**
-   - SQL-запрос `get_revealed_code()` должен делать `JOIN users u ON u.id = o.user_id` и проверять `u.status` (согласно итоговому решению по `OD-01`), чтобы проверка происходила в одном атомарном SQL-запросе без race condition между проверкой статуса пользователя и расшифровкой кода.
-3. **Запрет утечки секретов и plaintext-кодов:**
-   - Расшифрованные коды не сохраняются в `audit_events`, `order_deliveries`, кэшах или логах (`DeliveryCodeItem.__repr__` замаскирован).
-   - Отправка в Telegram выполняется с `protect_content=True` (запрет пересылки/копирования в рамках возможностей клиента Telegram).
-4. **Аутентификация операторов:**
-   - В Phase 3 MVP оператор идентифицируется по строгому внешнему allowlist (`OPERATOR_EXTERNAL_IDS` в конфигурации/env) с проверкой на входе в сервисный метод (`ActorType.OPERATOR` + непустой `external_id`), причём каждое операторское действие (одобрение/отклонение чека, отмена, возврат, ручное завершение, переотправка кода) обязательно фиксирует `actor_external_id` в `audit_events`.
+1. **Разделение слоёв в `SG-P2-013` (без ломки существующих тестов Phase 2):**
+   - Существующие тесты (`tests/test_phase2_remediation_followup.py:620, 647`, `tests/test_phase2_audit_remediation.py:692, 728`) напрямую проверяют точные типы исключений `InventoryRepository.get_revealed_code()` (`NotFoundError`, `ValidationError`, `InvalidStateTransitionError`).
+   - Поэтому на уровне **репозитория** (`get_revealed_code()`) сохраняется SQL `JOIN users u ON u.id = o.user_id` с проверкой `users.status` (по `OD-01`), сохраняются доменные классы исключений для внутренних вызовов, но детализирующие сообщения с перечислением статусов/принадлежности (`"not assigned to any order"`, `"not assigned to the specified order"`, `"does not belong to the specified user"`) заменяются на нейтральные формулировки без оракула чужих сущностей.
+   - На уровне **сервиса** (`DeliveryService`, `OrderService`, `PaymentService`) для всех запросов от `ActorType.USER` к несуществующему или чужому `order_id` / `item_id` выдаётся строго **идентичное** `PermissionDeniedError("Order or digital item is unavailable.")`.
+2. **Защита секретов доставки:** `protect_content=True` в Telegram, маскированный `DeliveryCodeItem.__repr__`, запрет сохранения plaintext в БД/логах/ошибках/аудите.
 
 ---
 
 ## 9. Idempotency and Concurrency
 
-### 9.1. Архитектура идемпотентности
+### 9.1. Идемпотентность
 
-- **Единый механизм в БД:** таблица `idempotency_keys` (миграция `008`) с уникальным ключом `(scope, actor_key, idempotency_key)`.
-- **Канонический хэш запроса (`request_hash`):** SHA-256 от детерминированного JSON параметров операции (например, `region`, `currency`, `target_amount_minor`, или `order_id` + `file_sha256` для чека, или `receipt_id` + `action` для оператора).
-- **Правило исполнения внутри `uow.write()`:**
-  1. Поиск по `(scope, actor_key, idempotency_key)`.
-  2. Если запись найдена и `status == 'COMPLETED'`:
-     - При совпадении `request_hash` -> вернуть сохранённый entity по `response_entity_id` без повторного изменения данных.
-     - При несовпадении `request_hash` -> выбросить `IdempotencyConflictError`.
-  3. Если записи нет -> вставить `IN_PROGRESS` (если параллельный поток успел вставить первым, `UNIQUE` отклонит гонку) -> выполнить бизнес-логику -> обновить в `COMPLETED` перед выходом из `BEGIN IMMEDIATE`. При любом исключении и rollback запись `IN_PROGRESS` **не фиксируется** в БД, поэтому клиент после сбоя может безопасно повторить запрос с тем же ключом!
-- **Источник ключей для Telegram / API:**
-  - Для нажатия inline-кнопок: `f"tg_cb:{callback_query.id}"` (защита от двойных нажатий) + для длительных сценариев вроде checkout — явный токен шага корзины (`checkout_token`), генерируемый при отображении подтверждения заказа.
-  - Для операторов: детерминированный ключ на карточке проверки `(operator_external_id, receipt_id, action)`.
-- **Особая связка с антифродом чеков:** даже без `idempotency_key` таблица `payment_receipts` сохраняет глобальную уникальность `file_sha256` и `(provider_name, provider_tx_id)`. `idempotency_key` разрешает безопасный retry именно *того же* запроса (`order_id + user_id + file_sha256`), но не ослабляет запрет повторного использования чека на другом заказе.
+- Таблица `idempotency_keys` (`UNIQUE (scope, actor_key, idempotency_key)`).
+- `request_hash` = SHA-256 от канонического JSON всех значимых аргументов:
+  - `CHECKOUT`: `(user_id, region, currency, target_amount_minor, expected_total_rub_kopecks, max_vouchers_per_order, max_allowed_overshoot_minor)` (или `product_id, quantity, expected_unit_price_rub_kopecks`).
+  - `RECEIPT_SUBMIT`: `(user_id, order_id, file_sha256, norm_provider_name, norm_provider_tx_id)`.
+  - `ORDER_CANCEL`: `(actor_type, actor_external_id, order_id, norm_reason)`.
+  - `RECEIPT_APPROVE` / `FULFILL` / `REJECT`: `(actor_external_id, receipt_id/order_id, action, norm_notes)`.
+- При откате транзакции строка `idempotency_keys` откатывается вместе со всей операцией — после сбоя повтор с тем же ключом выполнится заново.
+- **Срок жизни ключей (`expires_at`):** 24 часа (`TTL = 86400s`); истёкшие ключи очищаются фоновым системным сборщиком по батчам и не влияют на глобальный вечный антидубль чеков по `file_sha256` и `(provider_name, provider_tx_id)` в `payment_receipts`.
 
 ### 9.2. Модель конкурентности SQLite WAL
 
-1. **Чтение без блокировки записи:** режим `WAL` (`journal_mode = WAL`) позволяет множеству параллельных `uow.read()` читать согласованный снимок БД, не дожидаясь завершения единственного писателя `BEGIN IMMEDIATE`.
-2. **Сериализация записи и порядок блокировок:**
-   - Все изменяющие сценарии входят в `BEGIN IMMEDIATE` в самом начале (`uow.write()`), исключая deadlock при попытке повысить read-lock до write-lock.
-   - В многопозиционных сценариях (корзина с несколькими номиналами) резервирование идёт строго в отсортированном порядке `(product_id, denomination_id)`.
-   - Время удержания `BEGIN IMMEDIATE` ограничено долей миллисекунд (только локальные SQL-операции и быстрая Fernet/HMAC криптография в памяти).
-3. **Интеграция с `asyncio` (`aiogram 3.x` / `FastAPI`):**
-   - Синхронные вызовы `uow.write()` / `uow.read()` запускаются через выделенный пул потоков (`asyncio.to_thread` или одно-/малопоточный `ThreadPoolExecutor` для записи в SQLite). Использование 1–2 выделенных DB-write потоков на стороне приложения дополнительно сглаживает всплески `SQLITE_BUSY` при сохранении гарантий `busy_timeout`.
-4. **Анти-гонки на границе TTL и ручного ревью:**
-   - Если `TTL Worker` и пользовательский `submit_payment_receipt` срабатывают в одну миллисекунду, `BEGIN IMMEDIATE` сериализует их строго последовательно; проигравший видит актуальный статус (`CANCELLED` или `PAYMENT_REVIEW`) и завершается предсказуемо.
+- Чтения `uow.read()` используют `BEGIN DEFERRED` + `PRAGMA query_only = ON` + `SELECT 1;` для неблокирующего и полностью согласованного WAL-снимка.
+- Записи `uow.write()` используют `BEGIN IMMEDIATE` с коротким временем удержания (только локальный SQL и быстрый Fernet/HMAC), детерминированным порядком блокировки позиций `(product_id, denomination_id)` и выносом всей сети (`Telegram` API) наружу.
+- Интеграция с `asyncio` (`aiogram 3.x`): через `asyncio.to_thread` / ограниченный пул DB-потоков (1–2 потока записи).
 
 ---
 
 ## 10. SG-P2-004–SG-P2-016 Remediation Matrix
 
-> **Правило достоверности:** На текущем `HEAD` `a261edcd` закрытие проверяется строго по фактическому коду и тестам. В отчёте `HANDOFF_ARGON.md` замечания `SG-P2-007` и `SG-P2-009` отмечены как закрытые (`VERIFIED`); при фактической сверке с диском `SG-P2-009` подтверждён полностью, а по `SG-P2-007` выявлены **остаточные вызовы `time.sleep()`** в двух конкурентных тестах, которые необходимо устранить в Stage 3.1. Ни одно из открытых замечаний не считается закрытым до реализации исправления и прогона CI.
+> **Правило достоверности:** На `main @ a261edcd` закрытие фиксируется только по фактическому коду и тестам. Расхождение с `HANDOFF_ARGON.md`: `SG-P2-009` подтверждён закрытым в коде, а в `SG-P2-007` на диске остаются два `time.sleep()` (`test_phase2_remediation_followup.py:837` и `test_orders.py:817`).
 
-| ID | Severity | Фактический статус на `HEAD` `a261edcd` | Актуальность | Рекомендуемое исправление | Зависимости | Приоритет | Этап реализации | Необходимые тесты |
+| ID | Severity | Фактический статус на `main @ a261edcd` | Актуальность | Рекомендуемое исправление | Зависимости | Приоритет | Этап | Необходимые тесты |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`SG-P2-004`** | `MEDIUM` | **Открыто** (`connection.py:97-100`, `repositories.py:1140-1195`) | **Критическая** — блокер для атомарных сценариев Phase 3 | Управляемый `SAVEPOINT` в `transaction()` + `UnitOfWork`; блок `FULFILLING -> COMPLETED` при `RESERVED > 0` или неполном `SOLD`; обязательное снятие `RESERVED` перед `CANCELLED`; адаптация `finalize_order_sale()` для `MANUAL_REVIEW` | `SG-P2-006` (триггеры БД), `SG-P2-014` (чтение DTO в транзакции) | **P0** | **Stage 3.1** (фундамент) & **Stage 3.2** (сервисы) | Unit-тесты `SAVEPOINT`, rollback, эскалация блокировок, полная/частичная финализация, обновление 2 тестов Phase 2, конкурентные гонки |
-| **`SG-P2-005`** | `MEDIUM` *(report)* / `LOW` *(Argon)* | **Открыто** (`migrations.py:88-110`) | Низкая для текущих `001`–`006`, **средняя** для будущих миграций `007`/`008` | Переписать `_split_sql_statements()` на посимвольный / токенный разбор с поддержкой `;` внутри строки, строковых литералов и финальных `/* ... */` комментариев *(или держать строгий формат SQL в `007`/`008`, если остаётся в `DEFER` по `OD-09`)* | Нет | **P2** *(или `DEFER` по `OD-09`)* | **Stage 3.1** (опц. по `OD-09`) | Unit-тесты на 2 оператора в 1 строке, `/* ... */` в конце файла, триггеры `BEGIN ... END;` |
-| **`SG-P2-006`** | `MEDIUM` | **Частично закрыто в `005`** (`005` добавил `CHECK` и `status, reserved_order_id` в триггер обновления), **основные пробелы открыты** (`003:4-133`) | **Высокая** (defense-in-depth для Phase 3) | **Миграция `007`**: триггеры запрета `SOLD -> ...`, запрета `voucher_denominations -> FIXED_PRODUCT`, матрица статусов `orders` и `payment_receipts`, pre-flight проверки в `007` строго через `LEFT JOIN` (а для legacy `003` — оставлять checksum-неприкосновенным, закрыв актуальный риск в `007`) | `SG-P2-004` (правила `COMPLETED`/`CANCELLED`), `SG-P2-005` (валидный SQL-формат) | **P0** | **Stage 3.1** | Тесты миграции `006 -> 007`, pre-flight с битыми строками (`LEFT JOIN`), прямые SQL-эксплойты (`SOLD -> AVAILABLE`, `voucher_denominations -> FIXED_PRODUCT`) |
-| **`SG-P2-007`** | `MEDIUM` | **Частично закрыто** (`is_alive()` и race-тест `reserve_items_for_order` добавлены, но `time.sleep(0.15)` в `test_phase2_remediation_followup.py:837` и `time.sleep(0.05)` в `test_orders.py:817` **остаются на диске**; `test_inventory.py:1,31` без `threading`) | **Средняя** (риск флаков CI на Python 3.11/3.12) | Заменить оба остаточных `time.sleep` на детерминированную синхронизацию через `conn.set_trace_callback` + `threading.Event` (либо проверить состояние курсора/блокировки без слепых пауз); уточнить docstring/перекрёстную ссылку в `test_inventory.py` | Нет | **P1** | **Stage 3.1** | Повторные прогоны конкурентных тестов локально и в CI (Python 3.11/3.12) без `time.sleep` |
-| **`SG-P2-008`** | `LOW` | **Открыто** (`repositories.py:112-154`) | Средняя (админка каталога Phase 3) | В `add_voucher_denomination()` читать `voucher_details` и сверять совпадение `(region, currency)`; проверять допустимость строк `region`/`currency` до SQL; в `except sqlite3.IntegrityError` разделять `UNIQUE` (`ConflictError`) и `CHECK`/триггер (`ValidationError`) | `SG-P2-006` (триггер `007`) | **P1** | **Stage 3.1** | Негативные тесты на несовпадение `region`/`currency` с `voucher_details`, невалидную валюту -> `ValidationError`, дубликат -> `ConflictError` |
-| **`SG-P2-009`** | `LOW` | **Закрыто и подтверждено в коде** (`repositories.py:992-1012, 1073-1109`, тест `test_sg_p2_003_rejects_invalid_types_and_currencies`) | Закрыто (остаётся регрессионный контроль) | Дополнительно ничего в Python не требуется; опционально добавить `CHECK` на `order_items.currency` при пересборке/триггере в `007` | Нет | **Done** *(мониторинг)* | Подтверждено на `HEAD` | Уже покрыто `tests/test_phase2_security_gate_remediation.py` |
-| **`SG-P2-010`** | `LOW` | **Открыто** (`repositories.py:278-296, 398-404`) | Средняя (админка/блокировка пользователей Phase 3) | В `update_fixed_product_approval()` и `update_user_status()` проверять `cur.rowcount == 0` и кидать `NotFoundError` (для `update_fixed_product_approval` также проверять существование `fixed_product_details`, отсекая `VOUCHER`) | Нет | **P1** | **Stage 3.1** | Тесты на несуществующий `product_id`/`user_id` и передачу `VOUCHER` ID в `update_fixed_product_approval()` -> `NotFoundError` |
-| **`SG-P2-011`** | `LOW` | **Открыто** (`repositories.py:549-612`) | Низкая в Phase 3 MVP (`DEFER` по `HANDOFF_ARGON.md`) | Если `old_pepper is not None` передан в `rotate_fingerprint_pepper()`, сверять существующие `fingerprint` с `compute_fingerprint(plain, pepper=old_pepper)` (допускать легальное несовпадение или кидать `ValidationError` при рассинхроне) перед пересчётом под `new_pepper` | Решение по `OD-09` | **P2** *(или `DEFER`)* | **Stage 3.1** / Ops Hardening | Тесты ротации с валидным и невалидным `old_pepper` |
-| **`SG-P2-012`** | `LOW` | **Открыто** (`crypto.py:111-121, 138, 152`) | Средняя (защита конфигурации prod) | Заменить `key or get_encryption_key()` на `get_encryption_key() if key is None else key`; исправить чтение `FINGERPRINT_PEPPER` (пробельная переменная не должна блокировать `INVENTORY_FINGERPRINT_PEPPER`); ввести `MIN_PEPPER_LENGTH = 16` в `get_fingerprint_pepper()` | Совместимость с `tests/test_crypto*.py` (в `test_crypto.py:58` 23 байта, короткие `pepper_a/b` передаются напрямую) | **P1** | **Stage 3.1** | Тесты на `key=b""` (должен падать), пробельный `FINGERPRINT_PEPPER`, короткий env pepper `< 16` байт -> `CryptoConfigurationError` |
-| **`SG-P2-013`** | `LOW` | **Открыто** (`repositories.py:887-962`) | Высокая для политики доступа Phase 3 | В `get_revealed_code()` сделать `JOIN users u ON u.id = o.user_id`, применить политику `users.status` согласно `OD-01`, унифицировать пользовательские ошибки (без оракула статусов/владения); внутреннюю причину оставлять только для логов/диагностики при необходимости | **Решение `OD-01`** | **P1** | **Stage 3.1** (после `OD-01`) | Тесты для `BLOCKED` пользователя, чужого заказа, `RESERVED`/`QUARANTINED` позиции с проверкой равенства текста ошибки |
-| **`SG-P2-014`** | `LOW` | **Открыто** (`connection.py:232, 262, 295`; 7 методов в `repositories.py`) | Высокая (корректность UoW/SAVEPOINT и безопасное восстановление) | В `restore_database()` заменить `except Exception:` на `except BaseException:` в блоках очистки/отката (`L232`, `L262`, `L295`); в 7 методах записи (`create_voucher_product`, `add_voucher_denomination`, `create_fixed_product`, `create_order`, `transition_order_status`, `submit_receipt`, `update_review_status`) перенести `self.get_*()` внутрь `with transaction(...)` | Связано с `SG-P2-004` | **P0** (для `get_*` внутри tx) / **P1** (для `restore`) | **Stage 3.1** | Тесты на `BaseException` (`KeyboardInterrupt` / `_CustomBaseAbort`) во время `restore_database()`, тесты снапшота DTO внутри вложенного UoW |
-| **`SG-P2-015`** | `INFO` | **Открыто** (`repositories.py:1185`) | Средняя (аудируемость всех переходов) | В `transition_order_status()` всегда записывать JSON `{"from_status": ..., "to_status": ..., "notes": notes}` независимо от наличия `notes` | Нет | **P1** | **Stage 3.1** | Проверка `audit_events.details_json IS NOT NULL` и корректности JSON при `notes=None` |
-| **`SG-P2-016`** | `INFO` | **Открыто** (`repositories.py:156-199, 1269`) | Низкая/Средняя (чистота валидации) | В `create_fixed_product()` требовать непустые строки `display_name` и `supply_method`; в `submit_receipt()` проверять `isinstance(provider_name, str)` и `isinstance(provider_tx_id, str)` (если не `None`), бросая `ValidationError` вместо `AttributeError` | Нет | **P2** | **Stage 3.1** | Тесты на пробельные `display_name`/`supply_method` и нестроковые `provider_name=123` / `provider_tx_id=123` |
+| **`SG-P2-004`** | `MEDIUM` | **Открыто** (`connection.py:97-100`, `repositories.py:1140-1195`) | **Критическая** | Реестр `_ACTIVE_MANAGED_TX` по `id(conn)` со строгой очисткой + `SAVEPOINT`; `UnitOfWork` (`read`/`write`); инварианты `COMPLETED`/`CANCELLED`; фильтрация инвентарных позиций в `finalize_order_sale()`; адаптация 3 тестов Phase 2 | `SG-P2-006`, `SG-P2-014` | **P0** | **Stage 3.1** (DB/tx) & **Stage 3.2** (UoW) | Тесты `SAVEPOINT`, `read_only`/`DEFERRED` snapshot, эскалации, `COMPLETED`/`CANCELLED`, конкурентные гонки |
+| **`SG-P2-005`** | `MEDIUM` *(report)* / `LOW` *(Argon)* | **Открыто** (`migrations.py:88-110`) | Низкая для `001`–`006`, средняя для будущих миграций | Переписать `_split_sql_statements()` на токенный разбор (`;` на одной строке и завершающий `/* ... */`) *(либо оставить `DEFER` по `OD-09`)* | `OD-09` | **P2** *(или `DEFER`)* | **Stage 3.1** (по `OD-09`) | Unit-тесты 2 операторов в строке, trailing `/* ... */`, триггеров `BEGIN ... END;` |
+| **`SG-P2-006`** | `MEDIUM` | **Частично закрыто в `005`**, основные пробелы **открыты** (`003:4-133`) | **Высокая** | **Миграция `007` + Python pre-flight hooks (`LEFT JOIN`)** в `run_migrations()`: запрет отката/прямой вставки `SOLD`, запрет `voucher_denominations -> FIXED_PRODUCT`, парные триггеры cap для `INSERT`/`UPDATE`, триггеры `orders`/`payment_receipts`/`order_items`, mirror-проверки в `ReceiptRepository.update_review_status()` | `SG-P2-004` | **P0** | **Stage 3.1** | Апгрейд `006 -> 007`, негативные pre-flight тесты (`LEFT JOIN`), прямые SQL-атаки |
+| **`SG-P2-007`** | `MEDIUM` | **Частично закрыто** (`time.sleep` в `test_phase2_remediation_followup.py:837` и `test_orders.py:817` **остаются на диске**) | **Средняя** (флаки CI) | Заменить оба остаточных `time.sleep` на детерминированный `set_trace_callback` + `threading.Event`; актуализировать `test_inventory.py` | Нет | **P1** | **Stage 3.1** | Повторные прогоны конкурентных тестов без `time.sleep` в CI (`3.11`/`3.12`) |
+| **`SG-P2-008`** | `LOW` | **Открыто** (`repositories.py:112-154`) | Средняя | В `add_voucher_denomination()` проверять совпадение `(region, currency)` с `voucher_details` и допустимость значений до SQL; разделять `UNIQUE` (`ConflictError`) и `CHECK`/триггер (`ValidationError`) | `SG-P2-006` | **P1** | **Stage 3.1** | Тесты несовпадения с `voucher_details`, невалидной валюты (`ValidationError`), дубликата (`ConflictError`) |
+| **`SG-P2-009`** | `LOW` | **Закрыто и подтверждено в коде** (`repositories.py:992-1012, 1073-1109`) | Закрыто | Дополнительно в Python не требуется; опц. `CHECK` на `order_items.currency` при изменениях `order_items` | Нет | **Done** | На `HEAD` | Покрыто `test_sg_p2_003_rejects_invalid_types_and_currencies` |
+| **`SG-P2-010`** | `LOW` | **Открыто** (`repositories.py:278-296, 398-404`) | Средняя | Проверять `cur.rowcount == 0 -> NotFoundError` в `update_fixed_product_approval()` и `update_user_status()` | Нет | **P1** | **Stage 3.1** | Тесты на несуществующий ID и `VOUCHER` в `update_fixed_product_approval()` |
+| **`SG-P2-011`** | `LOW` | **Открыто** (`repositories.py:549-612`) | Низкая в MVP (`DEFER` по Argon) | При не-`None` `old_pepper` проверять совпадение существующих fingerprint перед ротацией | `OD-09` | **P2** *(или `DEFER`)* | **Stage 3.1** (по `OD-09`) | Тесты валидного/невалидного `old_pepper` |
+| **`SG-P2-012`** | `LOW` | **Открыто** (`crypto.py:111-121, 138, 152`) | Средняя | `get_encryption_key() if key is None else key`; `FINGERPRINT_PEPPER` не затеняет `INVENTORY_FINGERPRINT_PEPPER` пробелом; `MIN_PEPPER_LENGTH = 16` в `get_fingerprint_pepper()` | Совместимость с `tests/test_crypto*.py` | **P1** | **Stage 3.1** | Тесты на `key=b""`, пробельный env, короткий pepper `< 16` байт |
+| **`SG-P2-013`** | `LOW` | **Открыто** (`repositories.py:887-962`) | Высокая | В `get_revealed_code()` сделать `JOIN users`, применить политику `users.status` (`OD-01`), убрать оракул в текстах ошибок при сохранении классов исключений; на уровне сервиса — единый `PermissionDeniedError` | **`OD-01`** | **P1** | **Stage 3.1** + **3.2** | Тесты для `BLOCKED`, чужого заказа, `RESERVED`/`QUARANTINED`, равенство ошибок |
+| **`SG-P2-014`** | `LOW` | **Открыто** (`connection.py:232, 257, 295, 304`; 7 методов `repositories.py`) | **Высокая** | В `restore_database()` заменить `except Exception:` на `except BaseException:` (`L232`, `L257`, `L295`, плюс `L304` в rollback); во всех 7 методах записи перенести `self.get_*()` внутрь `with transaction(...)` | `SG-P2-004` | **P0** (DTO) / **P1** (restore) | **Stage 3.1** | Тесты `_CustomBaseAbort` при `restore_database()`, тесты снапшота DTO внутри вложенной транзакции |
+| **`SG-P2-015`** | `INFO` | **Открыто** (`repositories.py:1185`) | Средняя | В `transition_order_status()` всегда писать JSON (`from_status`, `to_status`, `notes`, `actor_type`, `actor_external_id`) даже при `notes=None` | Нет | **P1** | **Stage 3.1** | Проверка `details_json IS NOT NULL` и корректности полей при `notes=None` |
+| **`SG-P2-016`** | `INFO` | **Открыто** (`repositories.py:156-199, 1269`) | Средняя | Проверять непустые строки `display_name`/`supply_method` в `create_fixed_product()`; проверять `isinstance(..., str)` для `provider_name` и `provider_tx_id` в `submit_receipt()` | Нет | **P2** | **Stage 3.1** | Тесты на пустые строки и нестроковый `provider_name`/`provider_tx_id` |
 
 ---
 
 ## 11. Implementation Roadmap
 
-### 11.1. Карта затрагиваемых файлов (для будущего этапа реализации — НЕ изменяются сейчас)
+### 11.1. Карта затрагиваемых файлов (для этапа реализации — сейчас не изменяются)
 
 | Категория | Путь к файлу | Назначение изменений |
 | :--- | :--- | :--- |
-| **Неприкосновенно (Phase 1 & Legacy Migrations)** | `src/calculator.py`, `src/engine/__init__.py`, `src/engine/models.py`, `src/engine/knapsack.py` | **0 изменений** (строго сохраняется математическое ядро и контракты) |
-| **Неприкосновенно (Applied Migrations)** | `src/migrations/001`–`006` | **0 изменений** (защищено SHA-256 checksum в `schema_migrations`) |
-| **Модификация в Stage 3.1 (`src/db/` & `src/migrations/`)** | `src/db/connection.py` | Управляемый `SAVEPOINT` в `transaction()`, запрет эскалации lock mode, `except BaseException:` в `restore_database()` (`SG-P2-004`, `SG-P2-014`) |
-| | `src/db/crypto.py` | `key is None`, `MIN_PEPPER_LENGTH`, нормализация пробельных env (`SG-P2-012`) |
-| | `src/db/migrations.py` | Опц. по `OD-09`: фикс `_split_sql_statements()` (`SG-P2-005`) |
-| | `src/db/models.py` | Перечислимые типы аудита/доставки, уточнение констант при необходимости |
-| | `src/db/repositories.py` | `AuditRepository`, предусловия `COMPLETED`/`CANCELLED`, фильтр инвентарных позиций в `finalize_order_sale()`, `get_*()` внутри транзакции, фиксы `SG-P2-008`, `SG-P2-010`, `SG-P2-013`, `SG-P2-014`, `SG-P2-015`, `SG-P2-016` (опц. `SG-P2-011`) |
-| | `src/db/__init__.py` | Реэкспорт `AuditRepository`, `DatabaseError`, `ApprovalStatus` и новых символов |
-| | `src/migrations/007_phase3_integrity_guards.sql` *(новый)* | Pre-flight проверки (`LEFT JOIN`) + триггеры целостности `SG-P2-006`/`SG-P2-004` |
-| **Модификация существующих тестов в Stage 3.1** | `tests/test_orders.py`, `tests/test_phase2_security_gate_remediation.py`, `tests/test_phase2_remediation_followup.py`, `tests/test_inventory.py` | Адаптация 2 тестов под строгий `COMPLETED`/`CANCELLED` (`SG-P2-004`) + удаление остаточных `time.sleep()` (`SG-P2-007`) |
-| **Создание в Stage 3.2 (Service Layer & Migration 008)** | `src/migrations/008_phase3_service_support.sql` | Таблицы `idempotency_keys`, `order_deliveries`, защита `audit_events` |
-| | `src/services/__init__.py`, `actor.py`, `errors.py`, `uow.py`, `catalog_service.py`, `order_service.py`, `payment_service.py`, `delivery_service.py` | Полный сервисный слой, мост к Phase 1, идемпотентность, 4 атомарных сценария, двухфазная доставка |
-| | Новые тесты `tests/test_uow_savepoints.py`, `tests/test_migration_007.py`, `tests/test_services_workflows.py`, `tests/test_services_concurrency.py`, `tests/test_services_security.py` | Полное покрытие транзакций, миграций, откатов, конкурентности, безопасности и Phase 1 интеграции |
-| **Создание в Stage 3.3 (Transport)** | `requirements.txt`, `src/bot/...`, `src/app.py` | Добавление `aiogram`, хендлеры бота и админ-кнопки (только после Gate Stage 3.2!) |
+| **Неприкосновенно** | `src/calculator.py`, `src/engine/*`, `src/migrations/001`–`006` | **0 изменений** (ядро Phase 1 и checksum-защищённые миграции `001`–`006`) |
+| **Stage 3.1 (`src/db/`, `src/migrations/`)** | `src/db/connection.py` | Реестр `_ACTIVE_MANAGED_TX` (`id(conn)`), `SAVEPOINT`, `read_only` / lock-mode guard, `except BaseException:` в `restore_database()` (`L232, L257, L295, L304`) |
+| | `src/db/crypto.py` | Фиксы `SG-P2-012` |
+| | `src/db/migrations.py` | `MigrationPreflightError`, `MIGRATION_PREFLIGHT_CHECKS[7]`, вызов pre-flight до DDL в `BEGIN IMMEDIATE` (опц. `SG-P2-005` по `OD-09`) |
+| | `src/db/models.py` | Константы/enum для `AuditEvent`, при необходимости `DeliveryStatus` / `DeliveryKind` |
+| | `src/db/repositories.py` | `AuditRepository`, предусловия `COMPLETED`/`CANCELLED` и optional `actor_context` в `transition_order_status()`, фильтр инвентарных позиций в `finalize_order_sale()`, терминальность + single-`ACCEPTED` в `ReceiptRepository.update_review_status()`, `reject_pending_receipts_for_order()`, read-методы каталога с `APPROVED` и открытых/просроченных заказов, `get_*()` внутри транзакций, фиксы `SG-P2-008`, `010`, `013`, `014`, `015`, `016` (опц. `011` по `OD-09`) |
+| | `src/db/__init__.py` | Реэкспорт `AuditRepository`, `MigrationPreflightError`, `ApprovalStatus`, `DatabaseError` |
+| | `src/migrations/007_phase3_integrity_guards.sql` *(новый)* | Индекс `idx_receipts_single_accepted_per_order` и 12 триггеров целостности |
+| **Stage 3.1 (тесты)** | `tests/test_orders.py`, `tests/test_phase2_security_gate_remediation.py`, `tests/test_phase2_remediation_followup.py`, `tests/test_inventory.py` | Адаптация 2–3 тестов Phase 2 под `SG-P2-004` / `OD-03` / `OD-04`, удаление остаточных `time.sleep()` (`SG-P2-007`) |
+| | `tests/test_transaction_savepoints.py`, `tests/test_migration_007.py` *(новые)* | Тесты реестра `id(conn)`, `SAVEPOINT`, `read_only`, pre-flight и SQL-атак на триггеры `007` |
+| **Stage 3.2 (`src/services/`, `008`)** | `src/migrations/008_phase3_service_support.sql` *(новый)* | `idempotency_keys`, `order_deliveries` (4-stage lease), `idx_orders_status_created_at`, защита `audit_events` |
+| | `src/db/repositories.py` (расширение) | `IdempotencyRepository`, `DeliveryRepository` |
+| | `src/services/__init__.py`, `actor.py`, `errors.py`, `uow.py`, `catalog_service.py`, `order_service.py`, `payment_service.py`, `delivery_service.py` *(новые)* | Весь сервисный слой (`UnitOfWork`, 4 бизнес-сценария, 4-стадийная доставка, мост к Phase 1) |
+| | `tests/test_uow_and_read_snapshots.py`, `tests/test_services_workflows.py`, `tests/test_services_concurrency.py`, `tests/test_services_delivery_recovery.py`, `tests/test_services_security.py` *(новые)* | Тесты WAL-снимков, откатов, гонок, сбоев 4-стадийной доставки, access policy и интеграции с Phase 1 |
+| **Stage 3.3 (Transport)** | `requirements.txt`, `src/bot/...`, `src/app.py` | Зависимость `aiogram`, обработчики бота, операторская админка, `TelegramDeliveryAdapter` (`protect_content=True`), `TTL Worker`, `DeliveryLeaseReaper` |
 
-### 11.2. Поэтапный план реализации и критерии завершения
+### 11.2. Поэтапный план и критерии завершения
 
-1. **Stage 3.0 — Утверждение политик (Product Commander Gate):**
-   - *Вход:* `PHASE3_ARCHITECTURE_DESIGN.md`.
-   - *Критерий завершения:* письменные решения Product Commander по всем вопросам `OD-01`–`OD-09` (разблокирует Stage 3.1).
-2. **Stage 3.1 — Фундамент БД, `SAVEPOINT` и устранение остаточных замечаний Phase 2:**
-   - *Объём:* `connection.py`, `crypto.py`, `repositories.py`, `models.py`, `007_phase3_integrity_guards.sql`, обновление затронутых тестов и добавление тестов Stage 3.1.
-   - *Критерий завершения:*
-     - `0` изменений в `src/engine/`, `src/calculator.py`, `src/migrations/001`–`006`;
-     - Полный прогон `python -m unittest discover -v tests` локально **и в GitHub Actions CI (`Python 3.11` и `3.12`)** — 100% pass без `time.sleep()` в новых и исправленных тестах;
-     - Отчёт и diff-ревью Argon: явное подтверждение закрытия `SG-P2-004` (уровень транзакций/репозиториев), `SG-P2-006`, `SG-P2-007`, `SG-P2-008`, `SG-P2-010`, `SG-P2-012`–`SG-P2-016`.
-3. **Stage 3.2 — Сервисный слой (`src/services/`), Идемпотентность и Миграция `008`:**
-   - *Объём:* `008_phase3_service_support.sql`, `UnitOfWork`, `ActorContext`, `CatalogService`, `OrderService`, `PaymentService`, `DeliveryService`, интеграция с Phase 1, комплексные workflow/rollback/concurrency/security тесты.
-   - *Критерий завершения:*
-     - Проверена невозможность сетевых вызовов внутри `uow.write()` (архитектурно + mock/fault-injection тесты);
-     - Все 4 сценария и конкурентные гонки проходят в CI (`Python 3.11` и `3.12`);
-     - Независимый **Argon Security Gate** выдаёт `GO` на сервисный слой до подключения Telegram-бота.
-4. **Stage 3.3 — Адаптеры Telegram-бота (`aiogram 3.x`) и Entrypoint:**
-   - *Объём:* зависимость `aiogram`, FSM/callback handlers, операторская админ-панель, `TelegramDeliveryAdapter` (`protect_content=True`), фоновый `TTL Worker`.
-   - *Критерий завершения:* E2E интеграционные тесты с замоканным Telegram Bot API, прогон CI (`Python 3.11` и `3.12`), финальный Security Gate перед запуском в боевом окружении.
+1. **Stage 3.0 — Утверждение политик (Product Commander Gate):** письменные решения по `OD-01`–`OD-09`.
+2. **Stage 3.1 — Фундамент БД, реестр `transaction()` и миграция `007`:**
+   - Критерий завершения: `0` diff в `src/engine/`, `src/calculator.py`, `001`–`006`; `test_transaction_savepoints.py`, `test_migration_007.py` и вся база тестов зелёные локально **и в CI (`Python 3.11` & `3.12`)**; положительный вердикт Argon по `SG-P2-004` (уровень БД/tx), `SG-P2-006`–`008`, `010`, `012`–`016` (и `005`/`011`, если не оставлены в `DEFER` по `OD-09`).
+3. **Stage 3.2 — Сервисный слой (`src/services/`), `UnitOfWork`, миграция `008` и 4-стадийная доставка:**
+   - Критерий завершения: все 4 сценария, fault-injection rollback, краш-восстановление доставки (`Stage A–D`), согласованность `uow.read()`, конкурентные тесты без `time.sleep()` и проверка `access policy` проходят локально **и в CI (`Python 3.11` & `3.12`)**; Argon Security Gate выдает `GO` до начала интеграции Telegram.
+4. **Stage 3.3 — Адаптеры `aiogram 3.x`:**
+   - Критерий завершения: E2E-тесты с моками Telegram API, CI (`3.11`/`3.12`), финальный Gate.
 
 ---
 
 ## 12. Test Strategy
 
-> **Правило валидации среды:** Успешный прогон тестов локально (например, на Windows с `Python 3.14.7`) **не считается доказательством прохождения CI**. Для завершения каждого этапа реализации обязателен зелёный прогон матрицы GitHub Actions (`.github/workflows/ci.yml`: `ubuntu-latest`, `Python 3.11` и `Python 3.12`).
+> **Правило среды:** локальный успех (на Windows / `Python 3.14.7`) не является доказательством совместимости. Обязателен зелёный прогон матрицы GitHub Actions (`ubuntu-latest`, `Python 3.11` и `Python 3.12`) для каждого этапа.
 
-### 12.1. Матрица обязательных проверок
-
-1. **Транзакции и `SAVEPOINT` (`UnitOfWork` & `connection.py`):**
-   - Корневой commit и откат по `Exception` и `BaseException`.
-   - Вложенные `SAVEPOINT`: успешный `RELEASE`; исключение во внутреннем блоке при перехвате внешним откатывает **только** внутренний `SAVEPOINT` и снимает его (`RELEASE`), позволяя внешнему блоку корректно зафиксировать остальные изменения; неперехваченное исключение откатывает всю корневую транзакцию.
-   - Отказ присоединения к чужой транзакции (и при явном `BEGIN;`, и при неявном `INSERT` при `isolation_level=""`).
-   - Запрет эскалации блокировки (`DEFERRED` снаружи -> `IMMEDIATE` внутри -> `RuntimeError`).
-   - Запрет использования одной активной транзакции из другого потока.
-   - Запрет `backup_database()` и `run_migrations()` внутри управляемой транзакции.
-2. **Миграции `007` и `008`:**
-   - Накатка с нуля (`001`–`008`) и апгрейд (`006 -> 007 -> 008`).
-   - Негативные pre-flight тесты с использованием **битых legacy-данных без ссылки на `products`** (проверка `LEFT JOIN` из `SG-P2-006`) — миграция должна атомарно откатиться, не изменив схему и `schema_migrations`.
-   - Прямые SQL-атаки на триггеры `007`: `SOLD -> AVAILABLE/RESERVED/DISABLED`, привязка `voucher_denominations` к `FIXED_PRODUCT`, несовпадение `region`/`currency`, завершение `COMPLETED` при живом `RESERVED` или неполном `SOLD`, отмена `CANCELLED` при живом `RESERVED`, изменение `ACCEPTED` чека или создание второго `ACCEPTED` чека на заказ.
-3. **Fault-Injection Rollback-тесты для 4 бизнес-сценариев:**
-   - Внедрение искусственного сбоя на каждом промежуточном шаге (например, после `create_order()` на 2-м резерве; после `submit_receipt()` перед `PAYMENT_REVIEW`; после `ACCEPTED` в `finalize_order_sale()`; после `release_order_reservations()` перед `CANCELLED`) с проверкой 100% инвариантности БД после исключения.
-4. **Детерминированные конкурентные тесты (СТРОГО без `time.sleep`):**
-   - Механика: `threading.Barrier(N)`, `threading.Event`, `sqlite3.Connection.set_trace_callback(...)` для точной синхронизации входа в SQLite write lock, обязательный `t.join(timeout=10.0)` и `self.assertFalse(t.is_alive())`.
-   - Сценарии:
-     - Гонка 2 потоков при checkout последнего ваучера (`Barrier(2)`).
-     - Гонка `submit_payment_receipt` vs `cancel_order` / `TTL Worker`.
-     - Гонка 2 операторов на `approve_receipt_and_fulfill` одного чека.
-     - Гонка `approve_receipt_and_fulfill` vs `cancel_order`.
-     - Конкурентный replay с одинаковым `idempotency_key`.
-     - Очистка остаточных `time.sleep()` в `test_phase2_remediation_followup.py:837` и `test_orders.py:817` (`SG-P2-007`).
-5. **Безопасность, изоляция и отсутствие утечек:**
-   - Полная матрица `ACTIVE` vs `BLOCKED`, пользователь A против заказа/чека/кода пользователя B (проверка идентичности пользовательских сообщений об ошибках), попытка `USER` вызвать операторские методы.
-   - Тест с `assertLogs` и перехватом исключений/аудита: подтверждение, что расшифрованные коды (`plaintext`), ключи шифрования, pepper и сырые байты чеков **никогда** не появляются в логах, стектрейсах, `audit_events` и `order_deliveries`.
-6. **Интеграция с Phase 1:**
-   - E2E сценарии `TR/TRY` и `US/USD`: подбор нескольких номиналов через `CatalogService.quote_voucher_bundle()` -> `OrderService.checkout_voucher_bundle()` -> `PaymentService.approve_receipt_and_fulfill()` -> `DeliveryService.prepare_order_delivery()`.
-   - Исключение `DRAFT`/`DISABLED` продуктов и ограничение `stock_limit <= 1000`.
+1. **Транзакции и реестр `id(conn)`:**
+   - Корневой commit / rollback на `Exception` и `BaseException`, проверка `len(_ACTIVE_MANAGED_TX) == 0` после выхода (включая отказ `BEGIN` и `GeneratorExit`).
+   - Вложенные `SAVEPOINT` (частичный откат с последующим коммитом внешнего блока; каскадный откат при неперехваченном исключении), отклонение внешней транзакции, отклонение другого потока, отклонение `DEFERRED -> IMMEDIATE` и записи в `read_only`, проверка запрета `backup_database`/`run_migrations` внутри транзакции.
+2. **Согласованные чтения `UnitOfWork.read()`:**
+   - Двухпоточный WAL-тест: поток `reader` входит в `uow.read()`, читает цену/остаток; поток `writer` меняет цену и коммитит; `reader` делает второй `SELECT` в том же `uow.read()` и гарантированно видит **исходное** значение (единый snapshot); попытка записи внутри `uow.read()` падает с `RuntimeError`/`OperationalError`.
+3. **Миграция `007` и Python pre-flight hooks:**
+   - Накатка с нуля `001..007` и апгрейд `006 -> 007`; повторный идемпотентный вызов `run_migrations()`; неизменность `checksum` `001`–`006`.
+   - Тесты на каждый pre-flight check (включая битые строки с `LEFT JOIN`) — подтверждение `MigrationPreflightError`, 0 новых триггеров в `sqlite_master` и неизменности `schema_migrations`.
+   - Прямые SQL-атаки на триггеры `007` (`SOLD` insert/rollback, cap overflow на `INSERT` и `UPDATE`, `voucher_denominations -> FIXED_PRODUCT`, 2 `ACCEPTED` чека, `COMPLETED` с `RESERVED`, `CANCELLED` с `RESERVED`, мутация `order_items` после оплаты).
+4. **4-стадийная доставка и fault-injection:**
+   - Симуляция сбоя после Stage A, после Stage B, timeout в Stage C (`UNCERTAIN`), позднего ответа с тем же `claim_token` (`UNCERTAIN -> SENT`), перехвата истёкшего lease другим воркером + игнорирование устаревшего ответа, повторной выдачи `REDELIVERY` (история прежнего `SENT` не стирается, склад не трогается).
+5. **Детерминированные конкурентные тесты (СТРОГО без `time.sleep`):**
+   - Синхронизация исключительно через `threading.Barrier(N)`, `threading.Event` и `set_trace_callback`, с проверкой `join(timeout=10.0)` и `assertFalse(t.is_alive())`.
+   - Покрытие: гонка checkout за последний код, `submit_payment_receipt` vs `cancel_order`/TTL, 2 оператора на `approve_receipt_and_fulfill`, 2 воркера на `claim_delivery`, replay одного `idempotency_key`, зачистка `time.sleep` в `test_phase2_remediation_followup.py:837` и `test_orders.py:817`.
+6. **Безопасность, Phase 1 и логи:**
+   - Матрица `ACTIVE`/`BLOCKED`, изоляция чужих заказов (идентичные `PermissionDeniedError`), `assertLogs` на отсутствие plaintext кодов/ключей/байтов чеков в логах и `audit_events`, полный проход `quote_voucher_bundle -> checkout -> approve -> 4-stage delivery`.
 
 ---
 
@@ -786,66 +795,33 @@ sequenceDiagram
 
 ### 13.1. Технические и операционные риски
 
-| Риск | Вероятность | Влияние | Мера снижения в архитектуре |
+| Риск | Вероятность | Влияние | Смягчение |
 | :--- | :--- | :--- | :--- |
-| Контенция на единственном писателе SQLite (`SQLITE_BUSY`) под всплесками нагрузки | Средняя | Среднее | Короткие `uow.write()` (без сети внутри), `WAL` + `busy_timeout`, 1–2 выделенных worker-потока на запись, retry только до входа в корневую транзакцию |
-| Различия поведения `conn.in_transaction` / `SAVEPOINT` между `Python 3.11`, `3.12` и `3.14` | Низкая/Средняя | Высокое | Обязательный CI-прогон матрицы `3.11` и `3.12` на каждом этапе; явные юнит-тесты edge cases `SAVEPOINT` |
-| Блокировка склада неоплаченными заказами (Inventory Hoarding DoS) | Высокая | Среднее | Лимит открытых `PENDING_PAYMENT` заказов на пользователя + `TTL Worker` (15 мин) |
-| Сбой Telegram API уже после перевода заказа в `COMPLETED` и инвентаря в `SOLD` | Средняя | Высокое | Двухфазная доставка `order_deliveries`: `SOLD`-коды сохранены за заказом, пользователь или оператор может безопасно повторить доставку без списания нового товара |
-| Несоответствие полей цены: `voucher_denominations.cost_rub_kopecks` используется и как розничная цена в `OrderRepository.create_order()` | Высокая | Высокое | Зафиксировано в `OD-09`: требуется решение, хранит ли `cost_rub_kopecks` розничную цену или нужен отдельный столбец себестоимости/розницы |
-| Адаптация 2 существующих тестов Phase 2 под новые инварианты `SG-P2-004` | Гарантирована | Низкое | Потребует явного согласования изменения контракта именно этих 2 тестов на ревью |
+| Всплеск `SQLITE_BUSY` при пиках checkout / доставки | Средняя | Среднее | Сверхкороткие `uow.write()`, 4-стадийная доставка без блокировки БД во время Telegram API, retry только до входа в корневой `BEGIN` |
+| Различия поведения SQLite/CPython между `3.11`, `3.12` и `3.14` | Низкая/Средняя | Высокое | Матрица CI (`3.11`, `3.12`) обязательный gate на каждом этапе; отказ от `WeakKeyDictionary` |
+| Двойная доставка уведомления пользователю при `UNCERTAIN` в Telegram API | Низкая | Низкое | Честная модель **at-least-once** с lease-блокировкой; повторно доставляются **те же `SOLD`-коды**, склад не тратится повторно |
+| Захват склада неоплаченными заказами | Высокая | Среднее | Лимит открытых `PENDING_PAYMENT` + TTL `expire_stale_orders` |
+| Воздействие `SG-P2-004` и `OD-03`/`OD-04` на 3 существующих теста Phase 2 | Высокая | Низкое | Явная фиксация списка (`test_orders.py:232`, `test_phase2_security_gate_remediation.py:605`, `test_phase2_remediation_followup.py:218`) до начала Stage 3.1 |
 
-### 13.2. Открытые вопросы для решения Product Commander (`OD-01`–`OD-09`)
+### 13.2. Открытые решения Product Commander (`OD-01`–`OD-09`)
 
-Реализация Stage 3.1/3.2 в затронутых областях не может принимать самовольных допущений и требует явного утверждения по следующим пунктам:
-
-1. **`OD-01` — Доступ `BLOCKED`-пользователя к истории оплаченных заказов и ранее купленным `SOLD`-кодам (`SG-P2-013`):**
-   - *Вариант A (Strict Lockout — максимальная защита при фроде/абьюзе):* `BLOCKED`-пользователю запрещены и история заказов, и повторное раскрытие ранее купленных кодов; разблокировка/ручная проверка — только через поддержку/оператора.
-   - *Вариант B (Grandfathered Fulfillment):* запрещены новые заказы и чеки, но разрешено чтение уже завершённых заказов и раскрытие собственных ранее оплаченных `SOLD`-кодов.
-   - *Рекомендация для безопасности:* **Вариант A** (либо A + выдача через оператора после разбора инцидента).
-
-2. **`OD-02` — Подача чека `BLOCKED`-пользователем по ранее созданному `PENDING_PAYMENT` заказу:**
-   - *Вариант A (Рекомендуемый):* Запретить (`UserBlockedError`) в `submit_payment_receipt()` и отменить зависшие `PENDING_PAYMENT` заказы при блокировке пользователя.
-   - *Вариант B:* Разрешить, если заказ создан до блокировки.
-
-3. **`OD-03` — Модель склада для `FIXED_PRODUCT` с `delivery_method = 'OFFICIAL_ACTIVATION'`:**
-   - Использует ли `OFFICIAL_ACTIVATION` зашифрованный `inventory_items` (`InventoryType.ACTIVATION_DATA`) при checkout, или выполняется оператором вручную без `inventory_items` (как `MANUAL_REVIEW`), или нужен явный булев флаг `requires_inventory` в `fixed_product_details` (миграция `007`/`008`)?
-
-4. **`OD-04` — Смешанные заказы (инвентарные + ручные неинвентарные позиции в одном `order_id`):**
-   - *Вариант A (Рекомендуемый для Phase 3 MVP):* Строго запретить смешивать в одном заказе `VOUCHER`/`CODE` и неинвентарные `MANUAL_REVIEW` позиции (отдельный заказ на каждый тип).
-   - *Вариант B:* Разрешить и усложнить состояние `FULFILLING -> COMPLETED` двойным условием.
-
-5. **`OD-05` — Самостоятельная отмена пользователем в статусе `PAYMENT_REVIEW` и судьба `PENDING_REVIEW` чеков при отмене:**
-   - Может ли пользователь сам отменить заказ после отправки чека (`PAYMENT_REVIEW`), или отмена из `PAYMENT_REVIEW` доступна только оператору?
-   - При отмене заказа с висящим чеком в `PENDING_REVIEW`: переводить ли этот чек в `REJECTED` (с сохранением его `file_sha256` в вечном антидубле или без)?
-
-6. **`OD-06` — Состояние `SOLD`-инвентаря при отмене после возврата (`REFUND_REVIEW -> CANCELLED`):**
-   - *Вариант A (Рекомендуемый по `SG-P2-006`):* `SOLD` строго терминальный навсегда; скомпрометированный/возвращённый цифровой код никогда не возвращается в продажу.
-   - *Вариант B:* Разрешить единственный переход `SOLD -> QUARANTINED` (при обязательном сохранении `reserved_order_id` для форензики).
-
-7. **`OD-07` — Видимость расшифрованных `SOLD`-кодов для оператора:**
-   - *Вариант A (Рекомендуемый по принципу наименьших привилегий):* Оператор может инициировать повторную отправку (`DeliveryService`) только в Telegram-чат покупателя, но **не видит** открытый 12-значный код в админ-интерфейсе.
-   - *Вариант B:* Оператор имеет break-glass кнопку просмотра расшифрованного кода с усиленным аудитом в `audit_events`.
-
-8. **`OD-08` — Лимиты анти-хоардинга и ретраев:**
-   - Какой максимальный лимит одновременных неоплаченных `PENDING_PAYMENT` заказов на одного `ACTIVE`-пользователя (например, `2` или `3`)?
-   - Подтвердить TTL резерва `15 минут` (из `project_context.md`) и политику: разрешено ли загружать более 1 чека на заказ, пока заказ находится в `PAYMENT_REVIEW` (сейчас `ReceiptRepository.submit_receipt` допускает `PAYMENT_REVIEW`)?
-   - Лимит повторных запросов пользователя на повторную отправку уже купленного кода (rate limit / cooldown).
-
-9. **`OD-09` — Семантика цен каталога и объём исправлений `SG-P2-005`/`SG-P2-011`:**
-   - Используется ли `voucher_denominations.cost_rub_kopecks` в Phase 3 как клиентская розничная цена в рублях (как сейчас проверяет `OrderRepository.create_order()`), или в Phase 3 требуется разделение `procurement_cost_rub_kopecks` и `retail_price_rub_kopecks`?
-   - Включать ли исправление `SG-P2-005` (парсер миграций) и `SG-P2-011` (`old_pepper` в `rotate_fingerprint_pepper`) уже в Stage 3.1, либо оставить их в статусе `DEFER` согласно `HANDOFF_ARGON.md`?
+1. **`OD-01` (`SG-P2-013`):** Политика для `BLOCKED`-пользователя: полный запрет на чтение старых оплаченных заказов и раскрытие ранее купленных `SOLD`-кодов (Вариант A, рекомендуется для антифрода) или разрешение доступа к уже завершённым покупкам (Вариант B)?
+2. **`OD-02`:** Может ли `BLOCKED`-пользователь подавать чек (`submit_payment_receipt`) или отменять (`cancel_order`) существующий `PENDING_PAYMENT` заказ (рекомендуется: запретить подачу чека и автоматически отменять зависшие `PENDING_PAYMENT` при блокировке пользователя)?
+3. **`OD-03`:** Является ли `FIXED_PRODUCT` с `delivery_method = 'OFFICIAL_ACTIVATION'` инвентарным (`ACTIVATION_DATA`, как в тесте `test_phase2_remediation_followup.py:78, 228`), неинвентарным (`MANUAL_REVIEW`) или нужен отдельный флаг `requires_inventory` в `fixed_product_details`?
+4. **`OD-04`:** Запретить ли смешанные заказы (инвентарные + ручные неинвентарные позиции в одном `order_id`, рекомендуется для Phase 3 MVP) или поддерживать их в одной транзакции финализации/завершения?
+5. **`OD-05`:** Разрешена ли самостоятельная отмена заказа покупателем после отправки чека (`PAYMENT_REVIEW`), и переводить ли висящие `PENDING_REVIEW` чеки в `REJECTED` при отмене заказа (с сохранением `file_sha256` в вечном антидубле)?
+6. **`OD-06`:** При `REFUND_REVIEW -> CANCELLED` после выдачи кода оставлять ли инвентарь строго вечно `SOLD` (Вариант A, рекомендуется) или разрешить `SOLD -> QUARANTINED` с сохранением `reserved_order_id` (Вариант B)?
+7. **`OD-07`:** Имеет ли оператор только «слепую» переотправку `SOLD`-кодов в Telegram-чат покупателя (Вариант A, рекомендуется) или break-glass просмотр открытого кода в админке (Вариант B)?
+8. **`OD-08`:** Числовые пороги MVP: лимит одновременных `PENDING_PAYMENT` заказов на пользователя (напр., `2–3`), TTL резерва (`15 мин`?), разрешение повторной загрузки чека пока заказ в `PAYMENT_REVIEW`, таймаут lease доставки (напр., `60 сек`) и cooldown на повторную отправку кода.
+9. **`OD-09`:** Является ли `voucher_denominations.cost_rub_kopecks` розничной ценой клиента в Phase 3 (без изменений Phase 1) или требуется разделение `procurement_cost` / `retail_price` (что потребует адаптации оценки стоимости в Phase 1 или отдельной наценки в сервисе)? И включать ли `SG-P2-005` + `SG-P2-011` в Stage 3.1 или оставить в `DEFER` согласно `HANDOFF_ARGON.md`?
 
 ---
 
 ## 14. Explicit Out-of-Scope Items
 
-В рамки настоящего этапа проектирования **и** базового фундамента Phase 3 (Stage 3.1/3.2) **явно НЕ входят**:
-
-1. Любое изменение рабочего кода Python, SQL-миграций, зависимостей (`requirements.txt`), файлов Phase 1 (`src/engine/`, `src/calculator.py`) или фиксация коммитов/PR в рамках текущей задачи проектирования.
-2. Автоматические платежные шлюзы и авто-подтверждение оплаты (`AUTO-PAID` по webhook СБП / CryptoBot без ручной проверки или отдельной криптографической верификации провайдера).
-3. Интеграции с внешними API оптовых поставщиков (Plati.market, Digiseller, SEAGM, Turgame) и авто-закупка кодов в фоне.
-4. Авто-парсер турецкого/американского PS Store и детектор библиотеки PS Plus Extra / Deluxe (**Phase 4**).
-5. Telegram Mini App фронтенд (HTML/Tailwind/JS), AI-консультант «Утилизатор сдачи» и AI-маркетолог (**Phase 5**).
-6. Миграция с SQLite на PostgreSQL/Supabase и распределённый горизонтальный шардинг.
-7. CLI/автоматизация ротации основного ключа шифрования `INVENTORY_ENCRYPTION_KEY` (операционный регламент описан в `AUDIT_README.md`; при необходимости выносится отдельной сервисной задачей).
+1. Любое изменение Python-кода, SQL-миграций, схемы БД, `requirements.txt` или Phase 1 до явного одобрения Stage 3.1.
+2. Автоматические платёжные шлюзы и авто-`PAID` по webhook без ручной проверки/подписанной верификации.
+3. Интеграции с внешними API бирж/поставщиков (Plati/Digiseller/SEAGM/Turgame).
+4. Парсер PS Store и база PS Plus Extra/Deluxe (**Phase 4**).
+5. Telegram Mini App фронтенд, AI-консультант и AI-маркетолог (**Phase 5**).
+6. Миграция на PostgreSQL/Supabase и CLI ротации `INVENTORY_ENCRYPTION_KEY`.
