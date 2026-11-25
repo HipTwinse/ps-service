@@ -1,9 +1,9 @@
-# Phase 3 Architecture & Implementation Design (Revision 1) — «Сервис для PS» (`HipTwinse/ps-service`)
+# Phase 3 Architecture & Implementation Design (Revision 2) — «Сервис для PS» (`HipTwinse/ps-service`)
 
 - **Repository:** `https://github.com/HipTwinse/ps-service`
 - **Source Code Baseline:** `main` @ `a261edcd2154e524426d6a258da1862c92ce297d` (`origin/main` синхронизирован; Python-код, SQL-миграции и схема БД не изменялись)
-- **Documentation Branch:** `docs/phase3-architecture-design` (Revision 1 поверх коммита `f284924edbcbdd0cc01b846b3cd0952f8c91aa45`)
-- **Статус документа:** `DESIGN ONLY (Revision 1) — IMPLEMENTATION BLOCKED PENDING PRODUCT COMMANDER APPROVAL`
+- **Documentation Branch:** `docs/phase3-architecture-design` (Revision 2 поверх коммита `5042374237660eec202dffd879ac23d19b2a1af7`)
+- **Статус документа:** `DESIGN ONLY (Revision 2) — IMPLEMENTATION BLOCKED PENDING PRODUCT COMMANDER APPROVAL`
 - **Статус Phase 1 (`src/engine/`, `src/calculator.py`):** не изменена (`0` diff относительно `main`)
 - **Статус Phase 2 (`src/db/`, `src/migrations/001`–`006`):** закрыта Security Gate (`GO`), PR #1 влит в `main`, CI (`Python 3.11` / `3.12`) и локальный прогон (`147` тестов на `Python 3.14.7`) — зелёные.
 
@@ -11,12 +11,12 @@
 
 ## 1. Executive Summary
 
-Настоящий документ (Revision 1) фиксирует уточнённую целевую архитектуру **Phase 3 (Service Layer, Transaction Coordination, DB Hardening & Security Policy)** для принятия решения Product Commander о старте реализации. Документ основан на фактическом коде на `main @ a261edcd` и эмпирических проверках совместимости Python / SQLite (`Python 3.14.7` / `SQLite 3.50.4`, с обязательным последующим прогоном в CI на `Python 3.11` и `3.12`).
+Настоящий документ (Revision 2) фиксирует уточнённую целевую архитектуру **Phase 3 (Service Layer, Transaction Coordination, DB Hardening & Security Policy)** для принятия решения Product Commander о старте реализации. Документ основан на фактическом коде на `main @ a261edcd`; совместимость технических механизмов требует обязательного подтверждения в матрице CI на `Python 3.11` и `3.12` (локальные пробы выполнены на `Python 3.14.7` / `SQLite 3.50.4`).
 
-Ключевые архитектурные решения (с учётом исправлений Revision 1):
+Ключевые архитектурные решения (с учётом исправлений Revision 1 и Revision 2):
 
 1. **Механизм координации транзакций без `WeakKeyDictionary` (`SG-P2-004`):** стандартный `sqlite3.Connection` в CPython не поддерживает слабые ссылки (`TypeError: cannot create weak reference to 'sqlite3.Connection' object`). Вместо `WeakKeyDictionary` и вместо удаления `transaction()` из репозиториев выбирается **реестр активных управляемых транзакций `_ACTIVE_MANAGED_TX: dict[int, _ManagedTxEntry]` (ключ `id(conn)`) со строгой проверкой `entry.conn is conn`, сильной ссылкой строго на время активной корневой транзакции и гарантированной очисткой в `finally:`**. Вложенные управляемые вызовы используют `SAVEPOINT`; неуправляемые внешние транзакции, кросс-поточный доступ и эскалация режима блокировки (`DEFERRED -> IMMEDIATE`) жёстко отклоняются с `RuntimeError`.
-2. **Согласованные чтения в `UnitOfWork` (`uow.read()` vs `uow.write()`):** `uow.read()` всегда открывает явный `BEGIN DEFERRED` в режиме `PRAGMA query_only = ON` и сразу выполняет `SELECT 1;` для фиксации единого WAL-снимка на всю серию `SELECT` (каталог, цены, остатки склада, статус пользователя). Скрытая эскалация `DEFERRED -> IMMEDIATE` и любые записи внутри `uow.read()` блокируются на трёх уровнях (`ReadSession` API, Python-реестр `transaction()`, SQLite `PRAGMA query_only = ON`). `uow.write()` открывает корневой `BEGIN IMMEDIATE` (или `EXCLUSIVE`) на одном соединении для всех репозиториев.
+2. **Согласованные чтения в `UnitOfWork` (`uow.read()` vs `uow.write()`):** `uow.read()` всегда открывает явный `BEGIN DEFERRED` в режиме `PRAGMA query_only = ON` и **до передачи `ReadSession` выполняет реальное чтение существующей таблицы БД** (`SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1;`). Сам по себе `BEGIN DEFERRED` только начинает транзакцию логически, а константные выражения вида `SELECT 1;` не обращаются к таблицам и не устанавливают WAL read snapshot; реальное чтение таблицы гарантирует явную фиксацию единого WAL-снимка для всех последующих `SELECT` через `ReadSession` на том же соединении и в той же транзакции. Скрытая эскалация `DEFERRED -> IMMEDIATE` и любые записи внутри `uow.read()` блокируются на трёх уровнях (`ReadSession` API, Python-реестр `transaction()`, SQLite `PRAGMA query_only = ON`). `uow.write()` открывает корневой `BEGIN IMMEDIATE` (или `EXCLUSIVE`) на одном соединении для всех репозиториев.
 3. **Рабочая схема pre-flight для миграции `007` (`SG-P2-006`):** автономный `SELECT RAISE(ABORT, ...)` в SQLite вне триггеров синтаксически нелегален (`OperationalError: RAISE() may only be used within a trigger-program`). Вместо него проектируется **Python pre-flight hook (`MIGRATION_PREFLIGHT_CHECKS[7]`) в `run_migrations()`**, выполняющийся внутри **той же** транзакции `BEGIN IMMEDIATE` строго **до** миграционного DDL. Проверка выполняется через `SELECT` с `LEFT JOIN`; при нарушении выбрасывается `MigrationPreflightError`, транзакция откатывается без единого DDL-изменения, старые checksum `001`–`006` не затрагиваются, повторный запуск безопасен.
 4. **4-стадийный Delivery Workflow (без ложных гарантий `exactly-once`):** выдача цифровых товаров разделяется на независимые фазы: **A. `Claim delivery`** (короткая write-транзакция с lease-токеном и защитой от гонок), **B. `Prepare payload`** (после коммита claim: короткий `uow.read()` для выборки и расшифровки `SOLD`-кодов в памяти с маскированным `__repr__`), **C. `External delivery`** (Telegram Bot API `protect_content=True` полностью вне БД и SQLite-блокировок), **D. `Record outcome`** (отдельная короткая write-транзакция CAS-фиксации `SENT` / `FAILED` / `UNCERTAIN`). Поскольку Telegram Bot API не даёт распределённых транзакций, система честно гарантирует **at-least-once внешнюю доставку с однопоточной lease-дедупликацией и нулевым риском двойного списания со склада**.
 5. **Сохранение Phase 1 и открытые решения:** `src/engine/` и `src/calculator.py` не изменяются; спорные продуктовые/безопасностные политики вынесены в **Раздел 13 (`OD-01`–`OD-09`)**.
@@ -90,7 +90,7 @@ flowchart TD
     SVC_PAY --> UOW
     SVC_DLV --> UOW
 
-    UOW --> READ["uow.read(): BEGIN DEFERRED + PRAGMA query_only=ON"]
+    UOW --> READ["uow.read(): BEGIN DEFERRED + query_only=ON + table read"]
     UOW --> WRITE["uow.write(): Root BEGIN IMMEDIATE + Managed SAVEPOINT"]
 
     READ --> REPOS["Phase 2 Repositories + AuditRepository"]
@@ -275,13 +275,16 @@ class UnitOfWork:
 ```
 
 - **`uow.read()` (согласованный WAL snapshot без записи):**
-  1. Получает `conn` (из фабрики или заимствованный в тестах) и проверяет, что `not conn.in_transaction` (если передано заимствованное соединение с чужой открытой транзакцией — `RuntimeError`).
-  2. Читает текущее значение `prev_qo = conn.execute("PRAGMA query_only;").fetchone()[0]` и включает `conn.execute("PRAGMA query_only = ON;")`.
-  3. **Всегда** открывает `with transaction(conn, mode="DEFERRED", read_only=True):`.
-  4. **Немедленно выполняет `conn.execute("SELECT 1;").fetchone()`**! *(Критично для SQLite: сам по себе `BEGIN DEFERRED;` откладывает захват WAL read-маркера до первого запроса; только после первого `SELECT` все последующие `SELECT` каталога, цен и склада видят абсолютно один и тот же снимок БД, даже если параллельный писатель закоммитил изменения между 1-м и 2-м `SELECT` — подтверждено локальной пробой `WAL_DEFERRED_SNAPSHOT`.)*
-  5. Передаёт `ReadSession(conn)` (экспонирует только read-методы).
-  6. При выходе сбрасывает транзакцию (`rollback()`), в `finally:` восстанавливает `PRAGMA query_only = {prev_qo};` и закрывает соединение, если оно создано фабрикой.
-  7. Любая случайная попытка записи или вызова метода репозитория с `transaction(mode="IMMEDIATE")` внутри `uow.read()` блокируется **тройной защитой**: интерфейсом `ReadSession`, Python-проверкой `read_only`/`DEFERRED -> IMMEDIATE` (`RuntimeError`) и SQLite `PRAGMA query_only = ON` (`OperationalError: attempt to write a readonly database`).
+  - *Реальный механизм SQLite WAL:* `BEGIN DEFERRED;` сам по себе лишь переводит соединение в транзакционный контекст логически, **не** устанавливая read snapshot в WAL. WAL read-маркер (snapshot) фиксируется только в момент **первого фактического чтения данных из таблиц БД** внутри транзакции. Константные выражения без обращения к таблицам (например, `SELECT 1;`) исполняются виртуальной машиной SQLite без чтения страниц БД и поэтому **не устанавливают WAL snapshot** и не должны использоваться как механизм или доказательство фиксации снимка.
+  - *Выбранный вариант фиксации snapshot (предпочтительный):* до передачи `ReadSession` вызывающему коду `uow.read()` выполняет явное чтение существующей системной таблицы (`SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1;`), гарантированно присутствующей в любой инициализированной БД проекта. Альтернатива (не делать предварительного запроса, полагаясь на первый пользовательский `SELECT` внутри `ReadSession`) отклонена, поскольку предварительный запрос к таблице делает границу snapshot детерминированной, явной и проверяемой до начала бизнес-запросов, а все последующие чтения через `ReadSession` выполняются на **том же соединении** и в **той же транзакции `BEGIN DEFERRED`**.
+  - *Пошаговый порядок выполнения `uow.read()`:*
+    1. Получает `conn` (из фабрики или заимствованный в тестах) и проверяет, что `not conn.in_transaction` (если передано заимствованное соединение с чужой открытой транзакцией — `RuntimeError`).
+    2. Читает текущее значение `prev_qo = conn.execute("PRAGMA query_only;").fetchone()[0]` и включает `conn.execute("PRAGMA query_only = ON;")`.
+    3. **Всегда** открывает `with transaction(conn, mode="DEFERRED", read_only=True):`.
+    4. **До передачи `ReadSession`** выполняет реальное чтение таблицы БД: `conn.execute("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1;").fetchone()` — этот запрос фиксирует WAL read snapshot до выполнения первого прикладного запроса.
+    5. Передаёт `ReadSession(conn)` (экспонирует только read-методы; все последующие `SELECT` каталога, цен и доступного `inventory` обязаны идти через этот `ReadSession` на одном и том же `conn` внутри одной транзакции).
+    6. При выходе сбрасывает транзакцию (`rollback()`), освобождая WAL read-маркер; в `finally:` восстанавливает `PRAGMA query_only = {prev_qo};` и закрывает соединение, если оно создано фабрикой.
+    7. Любая попытка записи или вызова метода репозитория с `transaction(mode="IMMEDIATE")` внутри `uow.read()` (скрытая эскалация `DEFERRED -> IMMEDIATE`) блокируется **тройной защитой**: интерфейсом `ReadSession`, Python-проверкой `read_only`/`DEFERRED -> IMMEDIATE` (`RuntimeError`) и SQLite `PRAGMA query_only = ON` (`OperationalError: attempt to write a readonly database`).
 - **`uow.write(mode="IMMEDIATE")`:**
   - Принимает только `"IMMEDIATE"` или `"EXCLUSIVE"` (попытка передать `"DEFERRED"` в `uow.write()` отклоняется с `ValueError`).
   - Открывает корневой `with transaction(conn, mode=mode, read_only=False):`, отдаёт `WriteSession(conn)` (все репозитории используют одно и то же соединение `conn` и вложенные `SAVEPOINT`).
@@ -513,7 +516,7 @@ sequenceDiagram
     rect rgb(245, 245, 245)
         Note over AdminBot,Session: Stage B: Prepare payload (после коммита Stage A, read-only snapshot)
         AdminBot->>DlvSvc: prepare_payload(actor=OPERATOR, delivery_id, claim_token)
-        DlvSvc->>Session: with uow.read() [BEGIN DEFERRED + query_only=ON]
+        DlvSvc->>Session: with uow.read() [BEGIN DEFERRED + query_only=ON + table read]
         DlvSvc->>Session: Проверить активный claim_token; get_revealed_code() по всем SOLD позициям
         DlvSvc-->>Session: ROLLBACK (read tx закрыта)
         DlvSvc-->>AdminBot: DeliveryPayload (in-memory, masked __repr__)
@@ -706,7 +709,7 @@ sequenceDiagram
 
 ### 9.2. Модель конкурентности SQLite WAL
 
-- Чтения `uow.read()` используют `BEGIN DEFERRED` + `PRAGMA query_only = ON` + `SELECT 1;` для неблокирующего и полностью согласованного WAL-снимка.
+- Чтения `uow.read()` используют `BEGIN DEFERRED` + `PRAGMA query_only = ON` + предварительное реальное чтение таблицы (`SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1;`) для явной фиксации согласованного WAL-снимка до передачи `ReadSession`; все запросы одного чтения выполняются на одном соединении и в одной read-транзакции без скрытой эскалации в `IMMEDIATE`.
 - Записи `uow.write()` используют `BEGIN IMMEDIATE` с коротким временем удержания (только локальный SQL и быстрый Fernet/HMAC), детерминированным порядком блокировки позиций `(product_id, denomination_id)` и выносом всей сети (`Telegram` API) наружу.
 - Интеграция с `asyncio` (`aiogram 3.x`): через `asyncio.to_thread` / ограниченный пул DB-потоков (1–2 потока записи).
 
@@ -775,8 +778,17 @@ sequenceDiagram
 1. **Транзакции и реестр `id(conn)`:**
    - Корневой commit / rollback на `Exception` и `BaseException`, проверка `len(_ACTIVE_MANAGED_TX) == 0` после выхода (включая отказ `BEGIN` и `GeneratorExit`).
    - Вложенные `SAVEPOINT` (частичный откат с последующим коммитом внешнего блока; каскадный откат при неперехваченном исключении), отклонение внешней транзакции, отклонение другого потока, отклонение `DEFERRED -> IMMEDIATE` и записи в `read_only`, проверка запрета `backup_database`/`run_migrations` внутри транзакции.
-2. **Согласованные чтения `UnitOfWork.read()`:**
-   - Двухпоточный WAL-тест: поток `reader` входит в `uow.read()`, читает цену/остаток; поток `writer` меняет цену и коммитит; `reader` делает второй `SELECT` в том же `uow.read()` и гарантированно видит **исходное** значение (единый snapshot); попытка записи внутри `uow.read()` падает с `RuntimeError`/`OperationalError`.
+2. **Согласованные чтения `UnitOfWork.read()` и WAL snapshot:**
+   - **Положительный WAL snapshot тест:**
+     1. Открыть `uow.read()`.
+     2. Убедиться (через `set_trace_callback` / инспекцию выполненного SQL), что предварительный запрос реально обращается к таблице БД (`SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1;`), а не является константным выражением.
+     3. После входа в `ReadSession` параллельный `writer` изменяет и коммитит значение в таблице (например, цену/остаток).
+     4. `Reader` выполняет последующий `SELECT` на **том же соединении** в рамках того же `ReadSession` и обязан увидеть значение из snapshot, установленного **до** коммита `writer`.
+     5. После закрытия read-транзакции новый вызов `uow.read()` обязан увидеть обновлённое значение.
+     6. Попытка записи или эскалации `DEFERRED -> IMMEDIATE` внутри `uow.read()` отклоняется (`RuntimeError` / `OperationalError`).
+   - **Отрицательный контроль (`SELECT 1`):**
+     - `BEGIN DEFERRED` + `SELECT 1;` + коммит параллельного `writer` + первый реальный `SELECT` ридера **не** гарантируют чтение старого значения (ридер видит обновлённое значение после коммита `writer`), что наглядно демонстрирует причину отказа от константного `SELECT 1;` и перехода к чтению реальной таблицы.
+   - *(Напоминание: локальная проверка на `Python 3.14.7` не подтверждает `Python 3.11`/`3.12` — обязателен прогон CI.)*
 3. **Миграция `007` и Python pre-flight hooks:**
    - Накатка с нуля `001..007` и апгрейд `006 -> 007`; повторный идемпотентный вызов `run_migrations()`; неизменность `checksum` `001`–`006`.
    - Тесты на каждый pre-flight check (включая битые строки с `LEFT JOIN`) — подтверждение `MigrationPreflightError`, 0 новых триггеров в `sqlite_master` и неизменности `schema_migrations`.
