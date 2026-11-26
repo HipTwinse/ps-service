@@ -1092,10 +1092,25 @@ class TestStage31RemediationsAndPrimitives(unittest.TestCase):
             "delivery_safety_margin_seconds",
         )
         for field_name in float_fields:
-            for bad_val in (float("nan"), float("inf"), float("-inf"), True, False, 0.0, -1.0):
-                with self.subTest(field=field_name, value=bad_val):
-                    with self.assertRaises(ValueError):
+            for bad_val in (
+                float("nan"),
+                float("inf"),
+                float("-inf"),
+                True,
+                False,
+                0,
+                0.0,
+                -1,
+                -1.0,
+                10**1000,
+                -(10**1000),
+                10**5000,
+                -(10**5000),
+            ):
+                with self.subTest(field=field_name, value=type(bad_val).__name__):
+                    with self.assertRaises(ValueError) as ctx:
                         OperationalDefaults(**{field_name: bad_val})  # type: ignore[arg-type]
+                    self.assertIs(type(ctx.exception), ValueError)
 
         valid_cfg = OperationalDefaults(
             delivery_lease_seconds=90,

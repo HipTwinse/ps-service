@@ -59,29 +59,32 @@ class OperationalDefaults:
             "delivery_http_timeout_seconds",
             "delivery_safety_margin_seconds",
         )
+        float_values: dict[str, float] = {}
         for field_name in float_fields:
             val = getattr(self, field_name)
-            if (
-                isinstance(val, bool)
-                or not isinstance(val, (int, float))
-                or not math.isfinite(val)
-                or val <= 0
-            ):
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
                 raise ValueError(f"{field_name} must be a finite positive number (got {val!r}).")
+            try:
+                fval = float(val)
+            except OverflowError as exc:
+                raise ValueError(f"{field_name} must be a finite positive number (value overflows float).") from exc
+            if not math.isfinite(fval) or fval <= 0:
+                raise ValueError(f"{field_name} must be a finite positive number (got {val!r}).")
+            float_values[field_name] = fval
 
-        if self.delivery_min_send_budget_seconds < (
-            float(self.delivery_http_timeout_seconds) + float(self.delivery_safety_margin_seconds)
-        ):
+        min_send_budget = float_values["delivery_min_send_budget_seconds"]
+        http_timeout = float_values["delivery_http_timeout_seconds"]
+        safety_margin = float_values["delivery_safety_margin_seconds"]
+
+        if min_send_budget < (http_timeout + safety_margin):
             raise ValueError(
                 "delivery_min_send_budget_seconds must be >= delivery_http_timeout_seconds + delivery_safety_margin_seconds."
             )
-        if self.delivery_min_send_budget_seconds >= float(self.delivery_lease_seconds):
+        if min_send_budget >= self.delivery_lease_seconds:
             raise ValueError(
                 "delivery_min_send_budget_seconds must be strictly less than delivery_lease_seconds."
             )
-        if (float(self.delivery_http_timeout_seconds) + float(self.delivery_safety_margin_seconds)) >= float(
-            self.delivery_lease_seconds
-        ):
+        if (http_timeout + safety_margin) >= self.delivery_lease_seconds:
             raise ValueError(
                 "delivery_http_timeout_seconds + delivery_safety_margin_seconds must be strictly less than delivery_lease_seconds."
             )
