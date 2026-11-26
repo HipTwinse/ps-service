@@ -1085,6 +1085,94 @@ class TestStage31RemediationsAndPrimitives(unittest.TestCase):
         self.assertEqual(ca_payload["released_inventory_count"], 1)
         self.assertEqual(ca_payload["rejected_pending_receipts"], 1)
 
+    def test_sg_p31_nb_002_operational_defaults_finite_float_validation(self) -> None:
+        float_fields = (
+            "delivery_min_send_budget_seconds",
+            "delivery_http_timeout_seconds",
+            "delivery_safety_margin_seconds",
+        )
+        for field_name in float_fields:
+            for bad_val in (float("nan"), float("inf"), float("-inf"), True, False, 0.0, -1.0):
+                with self.subTest(field=field_name, value=bad_val):
+                    with self.assertRaises(ValueError):
+                        OperationalDefaults(**{field_name: bad_val})  # type: ignore[arg-type]
+
+        valid_cfg = OperationalDefaults(
+            delivery_lease_seconds=90,
+            delivery_min_send_budget_seconds=25.0,
+            delivery_http_timeout_seconds=18.0,
+            delivery_safety_margin_seconds=7.0,
+        )
+        self.assertEqual(valid_cfg.delivery_min_send_budget_seconds, 25.0)
+        self.assertEqual(valid_cfg.delivery_http_timeout_seconds, 18.0)
+        self.assertEqual(valid_cfg.delivery_safety_margin_seconds, 7.0)
+
+        valid_int_cfg = OperationalDefaults(
+            delivery_lease_seconds=90,
+            delivery_min_send_budget_seconds=25,  # type: ignore[arg-type]
+            delivery_http_timeout_seconds=18,  # type: ignore[arg-type]
+            delivery_safety_margin_seconds=7,  # type: ignore[arg-type]
+        )
+        self.assertEqual(valid_int_cfg.delivery_min_send_budget_seconds, 25)
+
+    def test_sg_p31_006_explicit_fingerprint_pepper_min_length_and_rotation(self) -> None:
+        self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.min_fingerprint_pepper_bytes, 16)
+
+        # compute_fingerprint rejects empty, 1-byte, and 15-byte explicit peppers without leaking secret bytes
+        for short_pepper in (b"", b"a", b"x" * 15):
+            with self.assertRaises(CryptoConfigurationError) as cm:
+                compute_fingerprint("SG-P31-006-CODE", pepper=short_pepper)
+            if short_pepper:
+                self.assertNotIn(short_pepper.decode("ascii"), str(cm.exception))
+
+        # Exact 16-byte pepper is accepted
+        exact_16_pepper = b"p" * 16
+        fp_16 = compute_fingerprint("SG-P31-006-CODE", pepper=exact_16_pepper)
+        self.assertEqual(len(fp_16), 64)
+
+        # Seed inventory items and snapshot baseline fingerprints
+        prod = self.catalog.create_voucher_product("V SG-P31-006", "TR", "TRY", status=ProductStatus.APPROVED)
+        denom = self.catalog.add_voucher_denomination(prod.id, "TR", "TRY", 1000, 3000)
+        self.inv.import_items(prod.id, ["PEPPER-CODE-1", "PEPPER-CODE-2"], InventoryType.VOUCHER_CODE, denom.id)
+
+        baseline_fps = [
+            (r["id"], r["fingerprint"])
+            for r in self.conn.execute("SELECT id, fingerprint FROM inventory_items ORDER BY id ASC").fetchall()
+        ]
+        current_pepper = get_fingerprint_pepper()
+
+        # Short new_pepper or short old_pepper must fail BEFORE starting any DB transaction
+        with patch("src.db.repositories.transaction") as mock_tx:
+            for bad_new in (b"", b"a", b"y" * 15):
+                with self.assertRaises(CryptoConfigurationError):
+                    self.inv.rotate_fingerprint_pepper(bad_new)
+            for bad_old in (b"", b"b", b"z" * 15):
+                with self.assertRaises(CryptoConfigurationError):
+                    self.inv.rotate_fingerprint_pepper(b"valid_new_pepper_16", old_pepper=bad_old)
+            mock_tx.assert_not_called()
+
+        after_reject_fps = [
+            (r["id"], r["fingerprint"])
+            for r in self.conn.execute("SELECT id, fingerprint FROM inventory_items ORDER BY id ASC").fetchall()
+        ]
+        self.assertEqual(after_reject_fps, baseline_fps)
+
+        # Rotation with exact 16-byte new_pepper and valid old_pepper succeeds
+        new_16_pepper = b"n" * 16
+        rotated = self.inv.rotate_fingerprint_pepper(new_16_pepper, old_pepper=current_pepper)
+        self.assertEqual(rotated, 2)
+        for item_id, fp in self.conn.execute("SELECT id, fingerprint FROM inventory_items ORDER BY id ASC").fetchall():
+            raw_code = decrypt_payload(
+                self.conn.execute("SELECT encrypted_payload FROM inventory_items WHERE id = ?", (item_id,)).fetchone()[
+                    "encrypted_payload"
+                ]
+            )
+            self.assertEqual(fp, compute_fingerprint(raw_code, pepper=new_16_pepper))
+
+        # Fernet encryption/decryption remains unchanged
+        ciphertext = encrypt_payload("FERNET-CHECK-006")
+        self.assertEqual(decrypt_payload(ciphertext), "FERNET-CHECK-006")
+
 
 if __name__ == "__main__":
     unittest.main()

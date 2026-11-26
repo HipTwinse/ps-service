@@ -4,6 +4,7 @@ All timeouts, limits, and security thresholds live here so they are auditable,
 immutable at runtime, and cleanly overridable in unit tests (OD-08, OD-09).
 """
 
+import math
 from dataclasses import dataclass
 
 
@@ -60,8 +61,13 @@ class OperationalDefaults:
         )
         for field_name in float_fields:
             val = getattr(self, field_name)
-            if isinstance(val, bool) or not isinstance(val, (int, float)) or val <= 0:
-                raise ValueError(f"{field_name} must be a positive number (got {val!r}).")
+            if (
+                isinstance(val, bool)
+                or not isinstance(val, (int, float))
+                or not math.isfinite(val)
+                or val <= 0
+            ):
+                raise ValueError(f"{field_name} must be a finite positive number (got {val!r}).")
 
         if self.delivery_min_send_budget_seconds < (
             float(self.delivery_http_timeout_seconds) + float(self.delivery_safety_margin_seconds)

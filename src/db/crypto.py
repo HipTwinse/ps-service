@@ -97,6 +97,18 @@ def get_encryption_key() -> bytes:
     )
 
 
+def validate_fingerprint_pepper(pepper: bytes, label: str = "Explicit fingerprint pepper") -> bytes:
+    """Validates fingerprint pepper bytes against type and minimum length policy (SG-P2-012, SG-P31-006)."""
+    if not isinstance(pepper, bytes) or len(pepper) == 0:
+        raise CryptoConfigurationError(f"{label} must be non-empty bytes.")
+    min_len = DEFAULT_OPERATIONAL_CONFIG.min_fingerprint_pepper_bytes
+    if len(pepper) < min_len:
+        raise CryptoConfigurationError(
+            f"{label} is too short ({len(pepper)} bytes; minimum {min_len} bytes required)."
+        )
+    return pepper
+
+
 def get_fingerprint_pepper() -> bytes:
     """Retrieves the HMAC pepper secret from environment.
 
@@ -119,12 +131,7 @@ def get_fingerprint_pepper() -> bytes:
 
     if raw_pepper is not None:
         pepper_bytes = raw_pepper.encode("utf-8")
-        min_len = DEFAULT_OPERATIONAL_CONFIG.min_fingerprint_pepper_bytes
-        if len(pepper_bytes) < min_len:
-            raise CryptoConfigurationError(
-                f"Configured fingerprint pepper is too short ({len(pepper_bytes)} bytes; minimum {min_len} bytes required)."
-            )
-        return pepper_bytes
+        return validate_fingerprint_pepper(pepper_bytes, label="Configured fingerprint pepper")
 
     if is_dev_or_test_environment():
         return _DEV_FALLBACK_PEPPER
@@ -199,9 +206,7 @@ def compute_fingerprint(plaintext: str, pepper: Optional[bytes] = None) -> str:
     if pepper is None:
         pepper_bytes = get_fingerprint_pepper()
     else:
-        if not isinstance(pepper, bytes) or len(pepper) == 0:
-            raise CryptoConfigurationError("Explicit fingerprint pepper must be non-empty bytes.")
-        pepper_bytes = pepper
+        pepper_bytes = validate_fingerprint_pepper(pepper, label="Explicit fingerprint pepper")
     return hmac.new(pepper_bytes, cleaned, hashlib.sha256).hexdigest()
 
 

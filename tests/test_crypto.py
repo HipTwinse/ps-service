@@ -77,8 +77,8 @@ class TestCryptoSecurityAndConfiguration(unittest.TestCase):
     def test_hmac_fingerprint_deterministic_and_keyed(self):
         """HMAC fingerprint must be deterministic for same pepper, but different for different peppers."""
         code = "ABCD-1234-EFGH"
-        pepper_a = b"pepper_alpha_1"
-        pepper_b = b"pepper_beta_2"
+        pepper_a = b"pepper_alpha_0001"
+        pepper_b = b"pepper_beta_00002"
 
         fp1 = compute_fingerprint(code, pepper=pepper_a)
         fp2 = compute_fingerprint(code, pepper=pepper_a)

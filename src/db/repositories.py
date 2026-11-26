@@ -16,6 +16,7 @@ from src.db.crypto import (
     compute_receipt_sha256,
     decrypt_payload,
     encrypt_payload,
+    validate_fingerprint_pepper,
 )
 from src.db.models import (
     ALLOWED_ORDER_TRANSITIONS,
@@ -726,6 +727,8 @@ class InventoryRepository:
 
         Canonicalizes raw codes, preserves all encrypted payloads, keeps records intact, and executes atomically.
         """
+        if pepper is not None:
+            validate_fingerprint_pepper(pepper, label="pepper")
         with transaction(self.conn, mode="IMMEDIATE"):
             cur = self.conn.cursor()
             cur.execute("SELECT id, encrypted_payload, fingerprint FROM inventory_items")
@@ -789,10 +792,9 @@ class InventoryRepository:
         Returns:
             Number of rotated inventory items.
         """
-        if not new_pepper or not isinstance(new_pepper, bytes):
-            raise ValueError("new_pepper must be non-empty bytes.")
-        if old_pepper is not None and (not isinstance(old_pepper, bytes) or not old_pepper):
-            raise ValueError("old_pepper must be non-empty bytes when provided.")
+        validate_fingerprint_pepper(new_pepper, label="new_pepper")
+        if old_pepper is not None:
+            validate_fingerprint_pepper(old_pepper, label="old_pepper")
 
         with transaction(self.conn, mode="IMMEDIATE"):
             cur = self.conn.cursor()
