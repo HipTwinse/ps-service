@@ -197,7 +197,9 @@ class TestPhase2RemediationFollowup(unittest.TestCase):
             self.inv_repo.reserve_items_for_order(order_a.id, self.voucher_a.id, 1, self.denom_a.id)
         self.assertEqual(self._snapshot_state(order_a.id), snap_after_two)
 
-        # 2d. Even if one item were SOLD (accounting for both RESERVED and SOLD), cannot exceed ordered qty
+        # 2d. Even if one item is SOLD (accounting for both RESERVED and SOLD), cannot exceed ordered qty
+        self.order_repo.transition_order_status(order_a.id, OrderStatus.PAYMENT_REVIEW)
+        self.order_repo.transition_order_status(order_a.id, OrderStatus.PAID)
         self.conn.execute("UPDATE inventory_items SET status = 'SOLD' WHERE id = ?", (res_1[0],))
         self.conn.commit()
         snap_with_sold = self._snapshot_state(order_a.id)
@@ -761,8 +763,8 @@ class TestPhase2RemediationFollowup(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(results), 2)
         combined = results[0] + results[1]
-        self.assertEqual(len(combined), 6)
-        self.assertEqual(sorted(combined), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(len(combined), 7)
+        self.assertEqual(sorted(combined), [1, 2, 3, 4, 5, 6, 7])
         self.assertEqual(results[0], sorted(results[0]))
         self.assertEqual(results[1], sorted(results[1]))
 
@@ -771,7 +773,7 @@ class TestPhase2RemediationFollowup(unittest.TestCase):
             mig_rows = verify_conn.execute(
                 "SELECT version, name, checksum FROM schema_migrations ORDER BY version ASC"
             ).fetchall()
-            self.assertEqual([r["version"] for r in mig_rows], [1, 2, 3, 4, 5, 6])
+            self.assertEqual([r["version"] for r in mig_rows], [1, 2, 3, 4, 5, 6, 7])
             for r in mig_rows:
                 self.assertIsNotNone(r["checksum"])
                 self.assertEqual(len(r["checksum"]), 64)
@@ -798,7 +800,6 @@ class TestPhase2RemediationFollowup(unittest.TestCase):
 
     def test_concurrent_run_migrations_waits_on_immediate_lock_and_skips_applied(self):
         import hashlib
-        import time
 
         conc_db = os.path.join(self.temp_dir.name, "concurrent_lock_wait.db")
         mig_dir = Path(self.temp_dir.name) / "single_mig"
@@ -818,23 +819,29 @@ class TestPhase2RemediationFollowup(unittest.TestCase):
 
             results = []
             errors = []
-            started = threading.Event()
+            entered_immediate = threading.Event()
 
             def runner2():
                 c2 = create_connection(conc_db, timeout_seconds=10.0)
+
+                def _trace(stmt):
+                    if "BEGIN IMMEDIATE" in stmt.upper() and not entered_immediate.is_set():
+                        entered_immediate.set()
+
+                c2.set_trace_callback(_trace)
                 try:
-                    started.set()
                     results.append(run_migrations(c2, migrations_dir=mig_dir))
                 except BaseException as exc:
                     errors.append(exc)
                 finally:
+                    c2.set_trace_callback(None)
                     c2.close()
 
             t2 = threading.Thread(target=runner2)
             t2.start()
-            started.wait(timeout=5.0)
-            # Give runner2 time to enter run_migrations and block on BEGIN IMMEDIATE
-            time.sleep(0.15)
+            # Deterministically wait until runner2 actually reaches BEGIN IMMEDIATE in SQLite
+            self.assertTrue(entered_immediate.wait(timeout=5.0))
+            self.assertTrue(t2.is_alive())
 
             conn1.execute(
                 "INSERT INTO schema_migrations (version, name, checksum) VALUES (1, 'lock_test', ?)",

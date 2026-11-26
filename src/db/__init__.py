@@ -1,12 +1,17 @@
 """Database package for PlayStation Digital Vouchers & Products Service.
 
-Provides connection management, cryptographic functions, schema migrations,
-domain models, and transactional repositories.
+Provides connection management, Unit of Work, operational defaults, cryptographic functions,
+schema migrations, domain models, and transactional repositories.
 """
 
+from src.db.config import (
+    DEFAULT_OPERATIONAL_CONFIG,
+    OperationalDefaults,
+)
 from src.db.connection import (
     backup_database,
     create_connection,
+    get_active_managed_transaction_count,
     get_connection_context,
     restore_database,
     transaction,
@@ -21,6 +26,7 @@ from src.db.crypto import (
     encrypt_payload,
 )
 from src.db.migrations import (
+    MigrationPreflightError,
     get_applied_migrations,
     run_migrations,
 )
@@ -31,11 +37,25 @@ from src.db.models import (
     RELEASABLE_ORDER_STATUSES,
     RESERVABLE_ORDER_STATUSES,
     REVEALABLE_ORDER_STATUSES,
+    ApprovalStatus,
     AuditEvent,
     ConflictError,
+    DatabaseError,
+    DeliveryAttempt,
+    DeliveryClaim,
+    DeliveryCooldownError,
+    DeliveryInProgressError,
+    DeliveryKind,
+    DeliveryLeaseExpiredError,
     DeliveryMethod,
+    DeliveryStatus,
     DuplicateReceiptError,
     FixedProductDetails,
+    IdempotencyClaimResult,
+    IdempotencyConflictError,
+    IdempotencyInProgressError,
+    IdempotencyRecord,
+    IdempotencyStatus,
     InsufficientInventoryError,
     InvalidStateTransitionError,
     InventoryItem,
@@ -51,27 +71,45 @@ from src.db.models import (
     ProductType,
     ReceiptReviewStatus,
     User,
+    UserBlockedError,
     UserStatus,
     ValidationError,
     VoucherDenomination,
     VoucherDetails,
+    is_inventory_backed_item,
     validate_inventory_type_for_product,
 )
 from src.db.repositories import (
+    AuditRepository,
     CatalogRepository,
+    DeliveryRepository,
+    IdempotencyRepository,
     InventoryRepository,
     OrderRepository,
     ReceiptRepository,
     UserRepository,
 )
+from src.db.uow import (
+    ReadSession,
+    UnitOfWork,
+    WriteSession,
+)
 
 __all__ = [
-    # Connection & migrations
+    # Config
+    "OperationalDefaults",
+    "DEFAULT_OPERATIONAL_CONFIG",
+    # Connection, UoW & migrations
     "create_connection",
     "get_connection_context",
+    "get_active_managed_transaction_count",
     "transaction",
+    "ReadSession",
+    "WriteSession",
+    "UnitOfWork",
     "backup_database",
     "restore_database",
+    "MigrationPreflightError",
     "run_migrations",
     "get_applied_migrations",
     # Crypto
@@ -86,11 +124,15 @@ __all__ = [
     "ProductType",
     "ProductStatus",
     "DeliveryMethod",
+    "ApprovalStatus",
     "InventoryType",
     "InventoryStatus",
     "OrderStatus",
     "ReceiptReviewStatus",
     "UserStatus",
+    "DeliveryStatus",
+    "DeliveryKind",
+    "IdempotencyStatus",
     "User",
     "Product",
     "VoucherDetails",
@@ -101,24 +143,39 @@ __all__ = [
     "InventoryItem",
     "PaymentReceipt",
     "AuditEvent",
+    "DeliveryAttempt",
+    "DeliveryClaim",
+    "IdempotencyRecord",
+    "IdempotencyClaimResult",
     "ALLOWED_ORDER_TRANSITIONS",
     "ALLOWED_INVENTORY_TYPES_BY_PRODUCT_TYPE",
     "RESERVABLE_ORDER_STATUSES",
     "RELEASABLE_ORDER_STATUSES",
     "FINALIZABLE_ORDER_STATUSES",
     "REVEALABLE_ORDER_STATUSES",
+    "is_inventory_backed_item",
     "validate_inventory_type_for_product",
     # Exceptions
+    "DatabaseError",
     "NotFoundError",
     "ConflictError",
     "ValidationError",
+    "UserBlockedError",
     "InsufficientInventoryError",
     "InvalidStateTransitionError",
     "DuplicateReceiptError",
+    "IdempotencyConflictError",
+    "IdempotencyInProgressError",
+    "DeliveryInProgressError",
+    "DeliveryLeaseExpiredError",
+    "DeliveryCooldownError",
     # Repositories
     "CatalogRepository",
     "UserRepository",
     "InventoryRepository",
     "OrderRepository",
     "ReceiptRepository",
+    "AuditRepository",
+    "DeliveryRepository",
+    "IdempotencyRepository",
 ]

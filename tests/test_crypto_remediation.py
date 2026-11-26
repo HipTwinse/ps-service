@@ -348,7 +348,7 @@ class TestCryptoRemediation(unittest.TestCase):
 
             inv_repo = InventoryRepository(conn)
             with self.assertRaises(RuntimeError) as cm:
-                inv_repo.rotate_fingerprint_pepper(b"new_pepper_123")
+                inv_repo.rotate_fingerprint_pepper(b"new_pepper_123456")
 
             self.assertIn("active uncommitted transaction", str(cm.exception))
 

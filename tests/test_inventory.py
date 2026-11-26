@@ -365,6 +365,80 @@ class TestInventoryManagement(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 self.inv_repo.get_revealed_code(bad_id)
 
+    def test_concurrent_reserve_items_for_order_last_unit_race(self):
+        """Multi-threaded Barrier(2) race for the last available inventory item (SG-P2-007)."""
+        import threading
+
+        self.inv_repo.import_items(
+            product_id=self.product.id,
+            raw_codes=["LAST-INV-RACE-CODE"],
+            inventory_type=InventoryType.VOUCHER_CODE,
+            denomination_id=self.denom.id,
+        )
+        u2, _ = self.user_repo.get_or_create_user("tg_inv_race_2", "race_user_2")
+
+        item_spec = [
+            {
+                "product_id": self.product.id,
+                "denomination_id": self.denom.id,
+                "product_type_snapshot": "VOUCHER",
+                "quantity": 1,
+                "unit_price_minor": 32000,
+                "currency": "RUB",
+            }
+        ]
+        order_1 = self.order_repo.create_order(self.user.id, 32000, "RUB", item_spec)
+        order_2 = self.order_repo.create_order(u2.id, 32000, "RUB", item_spec)
+
+        barrier = threading.Barrier(2)
+        successes = []
+        insufficient = []
+        unexpected = []
+        lock = threading.Lock()
+
+        def worker(target_order_id: int) -> None:
+            c = create_connection(self.db_path, timeout_seconds=10.0)
+            repo = InventoryRepository(c)
+            try:
+                barrier.wait(timeout=5.0)
+                ids = repo.reserve_items_for_order(
+                    order_id=target_order_id,
+                    product_id=self.product.id,
+                    quantity=1,
+                    denomination_id=self.denom.id,
+                )
+                with lock:
+                    successes.append((target_order_id, ids))
+            except InsufficientInventoryError:
+                with lock:
+                    insufficient.append(target_order_id)
+            except BaseException as exc:
+                with lock:
+                    unexpected.append(exc)
+            finally:
+                c.close()
+
+        t1 = threading.Thread(target=worker, args=(order_1.id,))
+        t2 = threading.Thread(target=worker, args=(order_2.id,))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10.0)
+        t2.join(timeout=10.0)
+        self.assertFalse(t1.is_alive())
+        self.assertFalse(t2.is_alive())
+
+        self.assertEqual(unexpected, [])
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(insufficient), 1)
+
+        winner_order_id, reserved_ids = successes[0]
+        row = self.conn.execute(
+            "SELECT status, reserved_order_id FROM inventory_items WHERE id = ?",
+            (reserved_ids[0],),
+        ).fetchone()
+        self.assertEqual(row["status"], InventoryStatus.RESERVED.value)
+        self.assertEqual(row["reserved_order_id"], winner_order_id)
+
 
 if __name__ == "__main__":
     unittest.main()
