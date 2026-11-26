@@ -349,14 +349,21 @@ class TestStage31RemediationsAndPrimitives(unittest.TestCase):
         self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.max_open_pending_payment_orders_per_user, 3)
         self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.pending_payment_ttl_seconds, 900)
         self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.delivery_lease_seconds, 60)
-        self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.delivery_min_send_budget_seconds, 10.0)
+        self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.delivery_min_send_budget_seconds, 20.0)
         self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.delivery_http_timeout_seconds, 15.0)
+        self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.delivery_safety_margin_seconds, 5.0)
         self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.redelivery_cooldown_seconds, 60)
         self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.idempotency_ttl_seconds, 86_400)
         self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.idempotency_in_progress_stale_seconds, 120)
         self.assertEqual(DEFAULT_OPERATIONAL_CONFIG.min_fingerprint_pepper_bytes, 16)
         with self.assertRaises(ValueError):
             OperationalDefaults(delivery_min_send_budget_seconds=60.0, delivery_lease_seconds=60)
+        with self.assertRaises(ValueError):
+            OperationalDefaults(delivery_min_send_budget_seconds=18.0, delivery_http_timeout_seconds=15.0, delivery_safety_margin_seconds=5.0)
+        with self.assertRaises(ValueError):
+            OperationalDefaults(delivery_safety_margin_seconds=0.0)
+        with self.assertRaises(ValueError):
+            OperationalDefaults(delivery_safety_margin_seconds=True)  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             OperationalDefaults(idempotency_in_progress_stale_seconds=200, idempotency_ttl_seconds=100)
 
@@ -525,27 +532,28 @@ class TestStage31RemediationsAndPrimitives(unittest.TestCase):
             delivery_kind=DeliveryKind.INITIAL,
             lease_seconds=60,
             cooldown_seconds=60,
-            min_send_budget_seconds=10.0,
+            min_send_budget_seconds=20.0,
             http_timeout_seconds=15.0,
+            safety_margin_seconds=5.0,
             now_utc=t0,
             now_monotonic=1000.0,
         )
         self.assertEqual(claim1.attempt_no, 1)
 
-        # Sufficient monotonic budget returns bounded HTTP timeout
-        timeout_val = self.deliveries.check_pre_send_lease_budget(claim1, now_monotonic=1020.0, now_utc=t0)
+        # Sufficient monotonic & UTC budget returns bounded HTTP timeout
+        timeout_val = self.deliveries.check_pre_send_lease_budget(claim1, now_monotonic=1020.0, now_utc=t0 + timedelta(seconds=20))
         self.assertEqual(timeout_val, 15.0)
 
         # Active lease blocks second claim
         with self.assertRaises(DeliveryInProgressError):
             self.deliveries.claim_delivery(order.id, claimed_by="worker-2", now_utc=t0 + timedelta(seconds=30))
 
-        # Insufficient monotonic budget triggers LEASE_EXPIRED_BEFORE_SEND -> UNCERTAIN
+        # Insufficient monotonic budget (< 20.0s required for 15.0s HTTP + 5.0s margin) triggers LEASE_EXPIRED_BEFORE_SEND -> UNCERTAIN
         with self.assertRaises(DeliveryLeaseExpiredError):
             self.deliveries.check_pre_send_lease_budget(
                 claim1,
-                now_monotonic=1052.0,  # remaining = 8.0s < 10.0s
-                now_utc=t0 + timedelta(seconds=52),
+                now_monotonic=1042.0,  # remaining = 18.0s < 20.0s
+                now_utc=t0 + timedelta(seconds=42),
             )
         attempt1 = self.deliveries.get_delivery(claim1.delivery_id)
         self.assertEqual(attempt1.status, DeliveryStatus.UNCERTAIN)
@@ -577,7 +585,7 @@ class TestStage31RemediationsAndPrimitives(unittest.TestCase):
         stale_ev = self.audit.list_events(entity_type="DELIVERY", entity_id=claim1.delivery_id, event_type="DELIVERY_STALE_OUTCOME_IGNORED")
         self.assertEqual(len(stale_ev), 1)
 
-        # Late SENT on UNCERTAIN attempt1 updates ONLY attempt1 and audits DELIVERY_LATE_SENT_AFTER_RECLAIM; attempt2 stays untouched
+        # Late SENT on UNCERTAIN attempt1 clears stale error_code=NULL, audits previous_error_code, leaves attempt2 untouched
         res_late = self.deliveries.record_outcome(
             claim1.delivery_id,
             claim1.claim_token,
@@ -587,11 +595,16 @@ class TestStage31RemediationsAndPrimitives(unittest.TestCase):
         )
         self.assertEqual(res_late.status, DeliveryStatus.SENT)
         self.assertEqual(res_late.external_message_id, "tg-msg-late-1")
+        self.assertIsNone(res_late.error_code)
+        self.assertIsInstance(res_late.delivered_at, datetime)
         claim2_after = self.deliveries.get_delivery(claim2.delivery_id)
         self.assertEqual(claim2_after.status, DeliveryStatus.DISPATCHING)
         self.assertEqual(claim2_after.claim_token, claim2.claim_token)
         late_ev = self.audit.list_events(entity_type="DELIVERY", entity_id=claim1.delivery_id, event_type="DELIVERY_LATE_SENT_AFTER_RECLAIM")
         self.assertEqual(len(late_ev), 1)
+        late_details = json.loads(late_ev[0].details_json or "{}")
+        self.assertEqual(late_details["previous_error_code"], "LEASE_EXPIRED_BEFORE_SEND")
+        self.assertEqual(late_details["external_message_id"], "tg-msg-late-1")
         self.assertEqual(self.inv.get_item(item_id).status, InventoryStatus.SOLD)
 
         # reap_expired_leases transitions expired attempt2 -> UNCERTAIN
@@ -770,6 +783,307 @@ class TestStage31RemediationsAndPrimitives(unittest.TestCase):
         self.assertEqual(unexpected, [])
         self.assertEqual(outcomes, ["CLAIMED"])
         self.assertEqual(len(in_progress_errs), 1)
+
+    # ------------------------------------------------------------------
+    # SG-P31-001..005 Dedicated Remediation Regression Tests
+    # ------------------------------------------------------------------
+
+    def test_sg_p31_001_pre_send_lease_budget_db_checks_margin_and_concurrent_reaper(self) -> None:
+        _u, _p, _d, order, _inv_id = self._seed_voucher_and_order(ext_id="sg_p31_001_u", raw_code="SG-P31-001-CODE")
+        self.orders.transition_order_status(order.id, OrderStatus.PAYMENT_REVIEW)
+        self.orders.transition_order_status(order.id, OrderStatus.PAID)
+        self.inv.finalize_order_sale(order.id)
+
+        t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        # Inconsistent claim config rejected: min_send_budget < http_timeout + safety_margin
+        with self.assertRaises(ValidationError):
+            self.deliveries.claim_delivery(
+                order.id,
+                claimed_by="w-bad",
+                lease_seconds=60,
+                min_send_budget_seconds=18.0,
+                http_timeout_seconds=15.0,
+                safety_margin_seconds=5.0,
+                now_utc=t0,
+                now_monotonic=100.0,
+            )
+
+        # 1. Lease not expired vs http_timeout (18s > 15s), but insufficient for http_timeout (15s) + margin (5s) = 20s
+        c_margin = self.deliveries.claim_delivery(
+            order.id,
+            claimed_by="w-margin",
+            delivery_kind=DeliveryKind.INITIAL,
+            lease_seconds=60,
+            cooldown_seconds=0,
+            min_send_budget_seconds=20.0,
+            http_timeout_seconds=15.0,
+            safety_margin_seconds=5.0,
+            now_utc=t0,
+            now_monotonic=1000.0,
+        )
+        # With sufficient remaining (22s >= 20s), returns min(15.0, 22.0 - 5.0) = 15.0
+        self.assertEqual(
+            self.deliveries.check_pre_send_lease_budget(
+                c_margin, now_monotonic=1038.0, now_utc=t0 + timedelta(seconds=38)
+            ),
+            15.0,
+        )
+        # With 18.0s remaining (< 20.0s), transitions to UNCERTAIN (LEASE_EXPIRED_BEFORE_SEND) and rejects send
+        with self.assertRaises(DeliveryLeaseExpiredError):
+            self.deliveries.check_pre_send_lease_budget(
+                c_margin, now_monotonic=1042.0, now_utc=t0 + timedelta(seconds=42)
+            )
+        self.assertEqual(self.deliveries.get_delivery(c_margin.delivery_id).status, DeliveryStatus.UNCERTAIN)
+        self.assertEqual(self.deliveries.get_delivery(c_margin.delivery_id).error_code, "LEASE_EXPIRED_BEFORE_SEND")
+
+        # 2. Record already UNCERTAIN prior to pre-send check refuses HTTP call without overwriting error_code
+        with self.assertRaises(DeliveryLeaseExpiredError):
+            self.deliveries.check_pre_send_lease_budget(c_margin, now_monotonic=1010.0, now_utc=t0 + timedelta(seconds=10))
+        self.assertEqual(self.deliveries.get_delivery(c_margin.delivery_id).error_code, "LEASE_EXPIRED_BEFORE_SEND")
+        stale_ev = self.audit.list_events(
+            entity_type="DELIVERY", entity_id=c_margin.delivery_id, event_type="DELIVERY_PRE_SEND_REJECTED_STALE_STATE"
+        )
+        self.assertEqual(len(stale_ev), 1)
+
+        # 3. Stale/mismatched claim_token refuses HTTP call cleanly without mutating DB
+        c_valid = self.deliveries.claim_delivery(
+            order.id,
+            claimed_by="w-valid",
+            delivery_kind=DeliveryKind.INITIAL,
+            lease_seconds=60,
+            cooldown_seconds=0,
+            min_send_budget_seconds=20.0,
+            http_timeout_seconds=15.0,
+            safety_margin_seconds=5.0,
+            now_utc=t0 + timedelta(seconds=70),
+            now_monotonic=2000.0,
+        )
+        fake_claim = c_valid.__class__(
+            delivery_id=c_valid.delivery_id,
+            order_id=c_valid.order_id,
+            target_user_id=c_valid.target_user_id,
+            attempt_no=c_valid.attempt_no,
+            claim_token="0" * 32,
+            delivery_kind=c_valid.delivery_kind,
+            lease_expires_at=c_valid.lease_expires_at,
+            lease_monotonic_deadline=c_valid.lease_monotonic_deadline,
+            min_send_budget_seconds=c_valid.min_send_budget_seconds,
+            http_timeout_seconds=c_valid.http_timeout_seconds,
+            safety_margin_seconds=c_valid.safety_margin_seconds,
+        )
+        with self.assertRaises(DeliveryLeaseExpiredError):
+            self.deliveries.check_pre_send_lease_budget(
+                fake_claim, now_monotonic=2005.0, now_utc=t0 + timedelta(seconds=75)
+            )
+        self.assertEqual(self.deliveries.get_delivery(c_valid.delivery_id).status, DeliveryStatus.DISPATCHING)
+
+        # 4. Lease expired by UTC clock (even if monotonic clock looks early, and with non-UTC tzinfo) refuses send
+        plus3_tz = timezone(timedelta(hours=3))
+        utc_expired_time = (t0 + timedelta(seconds=135)).astimezone(plus3_tz)  # +65s after claim (+70s -> expires +130s)
+        with self.assertRaises(DeliveryLeaseExpiredError):
+            self.deliveries.check_pre_send_lease_budget(c_valid, now_monotonic=2005.0, now_utc=utc_expired_time)
+        self.assertEqual(self.deliveries.get_delivery(c_valid.delivery_id).error_code, "LEASE_EXPIRED_BEFORE_SEND")
+
+        # 5. Lease expired purely by monotonic clock before UTC expiry also refuses send
+        c_mono = self.deliveries.claim_delivery(
+            order.id,
+            claimed_by="w-mono",
+            delivery_kind=DeliveryKind.INITIAL,
+            lease_seconds=60,
+            cooldown_seconds=0,
+            now_utc=t0 + timedelta(seconds=200),
+            now_monotonic=3000.0,
+        )
+        with self.assertRaises(DeliveryLeaseExpiredError):
+            self.deliveries.check_pre_send_lease_budget(
+                c_mono, now_monotonic=3061.0, now_utc=t0 + timedelta(seconds=210)
+            )
+        self.assertEqual(self.deliveries.get_delivery(c_mono.delivery_id).error_code, "LEASE_EXPIRED_BEFORE_SEND")
+
+        # 6. Concurrent reaper runs on a second thread BETWEEN claim_delivery and check_pre_send_lease_budget
+        c_race = self.deliveries.claim_delivery(
+            order.id,
+            claimed_by="w-race",
+            delivery_kind=DeliveryKind.INITIAL,
+            lease_seconds=60,
+            cooldown_seconds=0,
+            now_utc=t0 + timedelta(seconds=300),
+            now_monotonic=4000.0,
+        )
+        reaped_counts: list[int] = []
+        reap_errors: list[Exception] = []
+        reaper_done = threading.Event()
+
+        def reaper_worker() -> None:
+            rc = get_connection(self.db_path, timeout_seconds=5.0)
+            try:
+                cnt = DeliveryRepository(rc).reap_expired_leases(now_utc=t0 + timedelta(seconds=361))
+                reaped_counts.append(cnt)
+            except Exception as exc:
+                reap_errors.append(exc)
+            finally:
+                rc.close()
+                reaper_done.set()
+
+        t_reap = threading.Thread(target=reaper_worker)
+        t_reap.start()
+        self.assertTrue(reaper_done.wait(timeout=10.0))
+        t_reap.join(timeout=10.0)
+        self.assertFalse(t_reap.is_alive())
+        self.assertEqual(reap_errors, [])
+        self.assertEqual(reaped_counts, [1])
+
+        # Even if local monotonic clock looks healthy, live DB check rejects because reaper marked UNCERTAIN
+        with self.assertRaises(DeliveryLeaseExpiredError):
+            self.deliveries.check_pre_send_lease_budget(
+                c_race, now_monotonic=4005.0, now_utc=t0 + timedelta(seconds=305)
+            )
+        after_race = self.deliveries.get_delivery(c_race.delivery_id)
+        self.assertEqual(after_race.status, DeliveryStatus.UNCERTAIN)
+        self.assertEqual(after_race.error_code, "LEASE_EXPIRED")
+
+    def test_sg_p31_003_idempotency_mark_completed_validation_and_replay(self) -> None:
+        t0 = datetime(2026, 9, 2, 8, 0, 0, tzinfo=timezone.utc)
+        req_hash = hashlib.sha256(b"sg-p31-003-payload").hexdigest()
+        claimed = self.idempotency.claim("CREATE_ORDER", "u:31", "key-31", req_hash, now_utc=t0)
+
+        with self.assertRaises(TypeError):
+            self.idempotency.mark_completed("CREATE_ORDER", "u:31", "key-31", claimed.owner_token)  # type: ignore[call-arg]
+        with self.assertRaises(TypeError):
+            self.idempotency.mark_completed(
+                "CREATE_ORDER", "u:31", "key-31", claimed.owner_token, response_entity_type="ORDER"  # type: ignore[call-arg]
+            )
+        with self.assertRaises(TypeError):
+            self.idempotency.mark_completed(
+                "CREATE_ORDER", "u:31", "key-31", claimed.owner_token, response_entity_id=10  # type: ignore[call-arg]
+            )
+
+        for bad_type, bad_id in [
+            (None, 10),
+            ("", 10),
+            ("   ", 10),
+            (123, 10),
+            ("ORDER", None),
+            ("ORDER", 0),
+            ("ORDER", -5),
+            ("ORDER", True),
+            ("ORDER", False),
+            ("ORDER", 1.5),
+            ("ORDER", "10"),
+        ]:
+            with self.assertRaises(ValidationError):
+                self.idempotency.mark_completed(
+                    "CREATE_ORDER",
+                    "u:31",
+                    "key-31",
+                    claimed.owner_token,
+                    response_entity_type=bad_type,  # type: ignore[arg-type]
+                    response_entity_id=bad_id,  # type: ignore[arg-type]
+                )
+            rec_still_in_progress = self.idempotency.get_record("CREATE_ORDER", "u:31", "key-31")
+            self.assertEqual(rec_still_in_progress.status, IdempotencyStatus.IN_PROGRESS)
+            self.assertIsNone(rec_still_in_progress.response_entity_type)
+            self.assertIsNone(rec_still_in_progress.response_entity_id)
+
+        done = self.idempotency.mark_completed(
+            "CREATE_ORDER",
+            "u:31",
+            "key-31",
+            claimed.owner_token,
+            response_entity_type="ORDER",
+            response_entity_id=555,
+            now_utc=t0 + timedelta(seconds=2),
+        )
+        self.assertEqual(done.status, IdempotencyStatus.COMPLETED)
+        self.assertEqual(done.response_entity_type, "ORDER")
+        self.assertEqual(done.response_entity_id, 555)
+
+        replay = self.idempotency.claim(
+            "CREATE_ORDER", "u:31", "key-31", req_hash, now_utc=t0 + timedelta(seconds=10)
+        )
+        self.assertEqual(replay.outcome, "REPLAY")
+        self.assertEqual(replay.record.response_entity_type, "ORDER")
+        self.assertEqual(replay.record.response_entity_id, 555)
+
+    def test_sg_p31_004_utc_timezone_aware_dto_timestamp_contracts(self) -> None:
+        _u, _p, _d, order, _inv_id = self._seed_voucher_and_order(ext_id="sg_p31_004_u", raw_code="SG-P31-004-CODE")
+        self.orders.transition_order_status(order.id, OrderStatus.PAYMENT_REVIEW)
+        self.orders.transition_order_status(order.id, OrderStatus.PAID)
+        self.inv.finalize_order_sale(order.id)
+
+        plus4 = timezone(timedelta(hours=4))
+        local_claim_time = datetime(2026, 9, 3, 14, 30, 0, tzinfo=plus4)  # == 10:30:00 UTC
+
+        claim = self.deliveries.claim_delivery(
+            order.id,
+            claimed_by="w-utc",
+            lease_seconds=60,
+            now_utc=local_claim_time,
+            now_monotonic=5000.0,
+        )
+        self.assertIsInstance(claim.lease_expires_at, datetime)
+        self.assertEqual(claim.lease_expires_at.tzinfo, timezone.utc)
+        self.assertEqual(claim.lease_expires_at.utcoffset(), timedelta(0))
+        self.assertEqual(claim.lease_expires_at, datetime(2026, 9, 3, 10, 31, 0, tzinfo=timezone.utc))
+
+        attempt_dispatching = self.deliveries.get_delivery(claim.delivery_id)
+        for ts in (attempt_dispatching.lease_expires_at, attempt_dispatching.created_at, attempt_dispatching.updated_at):
+            self.assertIsInstance(ts, datetime)
+            self.assertEqual(ts.tzinfo, timezone.utc)
+            self.assertEqual(ts.utcoffset(), timedelta(0))
+        self.assertIsNone(attempt_dispatching.delivered_at)
+
+        attempt_sent = self.deliveries.record_outcome(
+            claim.delivery_id,
+            claim.claim_token,
+            DeliveryStatus.SENT,
+            external_message_id="tg-utc-1",
+            now_utc=local_claim_time + timedelta(seconds=5),
+        )
+        self.assertIsInstance(attempt_sent.delivered_at, datetime)
+        assert attempt_sent.delivered_at is not None
+        self.assertEqual(attempt_sent.delivered_at.tzinfo, timezone.utc)
+        self.assertEqual(attempt_sent.delivered_at, datetime(2026, 9, 3, 10, 30, 5, tzinfo=timezone.utc))
+
+        idem_res = self.idempotency.claim(
+            "TEST_UTC",
+            "u:utc",
+            "k-utc",
+            hashlib.sha256(b"utc").hexdigest(),
+            ttl_seconds=300,
+            stale_after_seconds=60,
+            now_utc=local_claim_time,
+        )
+        rec = idem_res.record
+        for ts in (rec.stale_after, rec.expires_at, rec.created_at, rec.updated_at):
+            self.assertIsInstance(ts, datetime)
+            self.assertEqual(ts.tzinfo, timezone.utc)
+            self.assertEqual(ts.utcoffset(), timedelta(0))
+        self.assertEqual(rec.stale_after, datetime(2026, 9, 3, 10, 31, 0, tzinfo=timezone.utc))
+        self.assertEqual(rec.expires_at, datetime(2026, 9, 3, 10, 35, 0, tzinfo=timezone.utc))
+
+    def test_sg_p31_005_cancel_order_atomically_audit_contract(self) -> None:
+        user, _p, _d, order, _inv_id = self._seed_voucher_and_order(ext_id="sg_p31_005_u", raw_code="SG-P31-005-CODE")
+        self.receipts.submit_receipt(order.id, user.id, b"rcpt_sg_p31_005", provider_tx_id="tx_005")
+        self.orders.transition_order_status(order.id, OrderStatus.PAYMENT_REVIEW, actor_type="USER", actor_id=user.id)
+
+        self.orders.cancel_order_atomically(
+            order.id,
+            actor_type="OPERATOR",
+            actor_id=99,
+            notes="manual operator cancel",
+        )
+        events = self.audit.list_events(entity_type="ORDER", entity_id=order.id)
+        # Expect: initial PENDING_PAYMENT->PAYMENT_REVIEW + PAYMENT_REVIEW->CANCELLED + ORDER_CANCELLED_ATOMIC
+        cancel_phase_events = events[1:]
+        self.assertEqual([e.event_type for e in cancel_phase_events], ["ORDER_STATUS_TRANSITION", "ORDER_CANCELLED_ATOMIC"])
+        tr_payload = json.loads(cancel_phase_events[0].details_json or "{}")
+        ca_payload = json.loads(cancel_phase_events[1].details_json or "{}")
+        self.assertEqual(tr_payload["from_status"], "PAYMENT_REVIEW")
+        self.assertEqual(tr_payload["to_status"], "CANCELLED")
+        self.assertEqual(ca_payload["released_inventory_count"], 1)
+        self.assertEqual(ca_payload["rejected_pending_receipts"], 1)
 
 
 if __name__ == "__main__":

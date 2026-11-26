@@ -22,8 +22,9 @@ class OperationalDefaults:
 
     # OD-08 & AR-P3-001 delivery attempt lease defaults
     delivery_lease_seconds: int = 60
-    delivery_min_send_budget_seconds: float = 10.0
+    delivery_min_send_budget_seconds: float = 20.0
     delivery_http_timeout_seconds: float = 15.0
+    delivery_safety_margin_seconds: float = 5.0
     redelivery_cooldown_seconds: int = 60
 
     # AR-P3-006 idempotency retention & stale lock recovery defaults
@@ -55,19 +56,28 @@ class OperationalDefaults:
         float_fields = (
             "delivery_min_send_budget_seconds",
             "delivery_http_timeout_seconds",
+            "delivery_safety_margin_seconds",
         )
         for field_name in float_fields:
             val = getattr(self, field_name)
             if isinstance(val, bool) or not isinstance(val, (int, float)) or val <= 0:
                 raise ValueError(f"{field_name} must be a positive number (got {val!r}).")
 
+        if self.delivery_min_send_budget_seconds < (
+            float(self.delivery_http_timeout_seconds) + float(self.delivery_safety_margin_seconds)
+        ):
+            raise ValueError(
+                "delivery_min_send_budget_seconds must be >= delivery_http_timeout_seconds + delivery_safety_margin_seconds."
+            )
         if self.delivery_min_send_budget_seconds >= float(self.delivery_lease_seconds):
             raise ValueError(
                 "delivery_min_send_budget_seconds must be strictly less than delivery_lease_seconds."
             )
-        if self.delivery_http_timeout_seconds >= float(self.delivery_lease_seconds):
+        if (float(self.delivery_http_timeout_seconds) + float(self.delivery_safety_margin_seconds)) >= float(
+            self.delivery_lease_seconds
+        ):
             raise ValueError(
-                "delivery_http_timeout_seconds must be strictly less than delivery_lease_seconds."
+                "delivery_http_timeout_seconds + delivery_safety_margin_seconds must be strictly less than delivery_lease_seconds."
             )
         if self.idempotency_in_progress_stale_seconds > self.idempotency_ttl_seconds:
             raise ValueError(

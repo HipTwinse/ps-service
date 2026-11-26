@@ -86,15 +86,52 @@ _FORBIDDEN_AUDIT_DETAIL_KEYS = frozenset(
 )
 
 
+def _ensure_utc(dt: datetime) -> datetime:
+    """Normalizes a naive or aware datetime into timezone-aware UTC."""
+    if not isinstance(dt, datetime):
+        raise ValidationError(f"Timestamp must be a datetime instance (got {type(dt).__name__}).")
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _format_utc_ts(dt: datetime) -> str:
-    """Formats a timezone-aware or UTC datetime into SQLite CURRENT_TIMESTAMP format."""
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    """Formats a naive or timezone-aware datetime into SQLite UTC timestamp text."""
+    return _ensure_utc(dt).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _parse_utc_ts(raw: str) -> datetime:
-    return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+def _parse_utc_ts(raw: Any) -> datetime:
+    """Parses SQLite timestamp strings or datetimes into timezone-aware UTC datetime."""
+    if isinstance(raw, datetime):
+        return _ensure_utc(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValidationError(f"Invalid UTC timestamp value: {raw!r}")
+    text = raw.strip()
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            return _ensure_utc(datetime.fromisoformat(normalized))
+        except ValueError as e:
+            raise ValidationError(f"Invalid UTC timestamp format: {raw!r}") from e
+
+
+def _parse_optional_utc_ts(raw: Any) -> Optional[datetime]:
+    """Parses an optional SQLite timestamp into timezone-aware UTC datetime or None."""
+    if raw is None:
+        return None
+    return _parse_utc_ts(raw)
+
+
+def _validate_positive_float(val: Any, name: str) -> float:
+    """Strictly validates a finite positive int/float, rejecting booleans."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValidationError(f"{name} must be a positive number (got {type(val).__name__}: {val!r}).")
+    res = float(val)
+    if not (0.0 < res < float("inf")):
+        raise ValidationError(f"{name} must be a finite positive number (got {val!r}).")
+    return res
 
 
 def _validate_audit_details(details: Optional[Dict[str, Any]]) -> None:
@@ -1672,6 +1709,14 @@ class OrderRepository:
         - USER cannot self-cancel while order is in PAYMENT_REVIEW (OD-05).
         - Pending receipts in PAYMENT_REVIEW are automatically marked REJECTED in the same transaction (OD-05).
         - RESERVED inventory returns to AVAILABLE; SOLD inventory remains immutable (OD-06).
+
+        Audit contract (SG-P31-005):
+        - `ORDER_STATUS_TRANSITION` (emitted inside `transition_order_status()`) is the primary canonical
+          lifecycle transition event.
+        - `ORDER_CANCELLED_ATOMIC` is the mandatory cancellation side-effect summary event recording
+          `released_inventory_count` and `rejected_pending_receipts`.
+        - Stage 3.2 `OrderService.cancel_order()` MUST delegate to this method and MUST NOT write a
+          third duplicate cancellation audit event.
         """
         order_id = _validate_int(order_id, "order_id", min_value=1)
         actor_norm = actor_type.strip().upper() if isinstance(actor_type, str) else ""
@@ -2156,12 +2201,12 @@ class DeliveryRepository:
             attempt_no=row["attempt_no"],
             claim_token=row["claim_token"],
             claimed_by=row["claimed_by"],
-            lease_expires_at=row["lease_expires_at"],
+            lease_expires_at=_parse_utc_ts(row["lease_expires_at"]),
             external_message_id=row["external_message_id"],
             error_code=row["error_code"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            delivered_at=row["delivered_at"],
+            created_at=_parse_utc_ts(row["created_at"]),
+            updated_at=_parse_utc_ts(row["updated_at"]),
+            delivered_at=_parse_optional_utc_ts(row["delivered_at"]),
         )
 
     def get_delivery(self, delivery_id: int) -> DeliveryAttempt:
@@ -2190,6 +2235,7 @@ class DeliveryRepository:
         cooldown_seconds: Optional[int] = None,
         min_send_budget_seconds: Optional[float] = None,
         http_timeout_seconds: Optional[float] = None,
+        safety_margin_seconds: Optional[float] = None,
         now_utc: Optional[datetime] = None,
         now_monotonic: Optional[float] = None,
     ) -> DeliveryClaim:
@@ -2212,25 +2258,45 @@ class DeliveryRepository:
             if cooldown_seconds is not None
             else DEFAULT_OPERATIONAL_CONFIG.redelivery_cooldown_seconds
         )
-        min_budget = (
-            float(min_send_budget_seconds)
+        min_budget = _validate_positive_float(
+            min_send_budget_seconds
             if min_send_budget_seconds is not None
-            else DEFAULT_OPERATIONAL_CONFIG.delivery_min_send_budget_seconds
+            else DEFAULT_OPERATIONAL_CONFIG.delivery_min_send_budget_seconds,
+            "min_send_budget_seconds",
         )
-        http_timeout = (
-            float(http_timeout_seconds)
+        http_timeout = _validate_positive_float(
+            http_timeout_seconds
             if http_timeout_seconds is not None
-            else DEFAULT_OPERATIONAL_CONFIG.delivery_http_timeout_seconds
+            else DEFAULT_OPERATIONAL_CONFIG.delivery_http_timeout_seconds,
+            "http_timeout_seconds",
         )
-        if min_budget <= 0 or min_budget >= float(lease_sec):
-            raise ValidationError("min_send_budget_seconds must be positive and < lease_seconds.")
-        if http_timeout <= 0 or http_timeout >= float(lease_sec):
-            raise ValidationError("http_timeout_seconds must be positive and < lease_seconds.")
+        safety_margin = _validate_positive_float(
+            safety_margin_seconds
+            if safety_margin_seconds is not None
+            else DEFAULT_OPERATIONAL_CONFIG.delivery_safety_margin_seconds,
+            "safety_margin_seconds",
+        )
+        if min_budget < http_timeout + safety_margin:
+            raise ValidationError(
+                "min_send_budget_seconds must be >= http_timeout_seconds + safety_margin_seconds."
+            )
+        if min_budget >= float(lease_sec):
+            raise ValidationError("min_send_budget_seconds must be strictly less than lease_seconds.")
+        if (http_timeout + safety_margin) >= float(lease_sec):
+            raise ValidationError(
+                "http_timeout_seconds + safety_margin_seconds must be strictly less than lease_seconds."
+            )
 
-        ref_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+        ref_now = _ensure_utc(now_utc) if now_utc is not None else datetime.now(timezone.utc)
         now_str = _format_utc_ts(ref_now)
         lease_expires_str = _format_utc_ts(ref_now + timedelta(seconds=lease_sec))
-        base_mono = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        base_mono = (
+            time.monotonic()
+            if now_monotonic is None
+            else _validate_positive_float(now_monotonic, "now_monotonic")
+            if isinstance(now_monotonic, (int, float)) and not isinstance(now_monotonic, bool) and now_monotonic > 0
+            else (0.0 if now_monotonic == 0 and not isinstance(now_monotonic, bool) else _validate_positive_float(now_monotonic, "now_monotonic"))
+        )
         claim_token = secrets.token_hex(16)
         audit_repo = AuditRepository(self.conn)
 
@@ -2367,10 +2433,11 @@ class DeliveryRepository:
                 attempt_no=attempt_no,
                 claim_token=claim_token,
                 delivery_kind=delivery_kind,
-                lease_expires_at=lease_expires_str,  # type: ignore[arg-type]
+                lease_expires_at=_parse_utc_ts(lease_expires_str),
                 lease_monotonic_deadline=base_mono + float(lease_sec),
                 min_send_budget_seconds=min_budget,
                 http_timeout_seconds=http_timeout,
+                safety_margin_seconds=safety_margin,
             )
 
     def check_pre_send_lease_budget(
@@ -2380,42 +2447,101 @@ class DeliveryRepository:
         now_monotonic: Optional[float] = None,
         now_utc: Optional[datetime] = None,
     ) -> float:
-        """Checks monotonic clock budget before external HTTP send (AR-P3-001).
+        """Verifies live DB claim ownership/status and monotonic+UTC lease budget before external HTTP send (SG-P31-001).
 
-        If remaining lease time is below `min_send_budget_seconds`, records
-        `LEASE_EXPIRED_BEFORE_SEND` and raises `DeliveryLeaseExpiredError`.
-        Otherwise returns a bounded HTTP timeout <= remaining lease seconds.
+        Guarantees:
+        - Reads the live `order_deliveries` row by `(delivery_id, claim_token)` inside `BEGIN IMMEDIATE`.
+        - Refuses send if the row is missing (`claim_token` stale) or no longer `DISPATCHING`
+          (records `DELIVERY_PRE_SEND_REJECTED_STALE_STATE` without altering existing state).
+        - Requires both UTC `lease_expires_at` and monotonic deadline to provide at least
+          `max(min_send_budget_seconds, http_timeout_seconds + safety_margin_seconds)` remaining.
+        - Conditionally transitions `DISPATCHING -> UNCERTAIN` (`LEASE_EXPIRED_BEFORE_SEND`) ONLY when
+          still owned by `(delivery_id, claim_token)` and still in `DISPATCHING`.
+        - Does NOT claim exactly-once delivery; only reduces duplicate-send probability within leases.
         """
+        if now_monotonic is not None and (
+            isinstance(now_monotonic, bool)
+            or not isinstance(now_monotonic, (int, float))
+            or not (-float("inf") < float(now_monotonic) < float("inf"))
+        ):
+            raise ValidationError(f"now_monotonic must be a finite number (got {now_monotonic!r}).")
+
         current_mono = time.monotonic() if now_monotonic is None else float(now_monotonic)
-        remaining = claim.lease_monotonic_deadline - current_mono
-        if remaining < claim.min_send_budget_seconds:
-            now_str = _format_utc_ts(now_utc if now_utc is not None else datetime.now(timezone.utc))
-            with transaction(self.conn, mode="IMMEDIATE"):
-                cur = self.conn.execute(
-                    """
-                    UPDATE order_deliveries
-                    SET status = 'UNCERTAIN', error_code = 'LEASE_EXPIRED_BEFORE_SEND', updated_at = ?
-                    WHERE id = ? AND claim_token = ? AND status = 'DISPATCHING'
-                    """,
-                    (now_str, claim.delivery_id, claim.claim_token),
+        ref_now = _ensure_utc(now_utc) if now_utc is not None else datetime.now(timezone.utc)
+        now_str = _format_utc_ts(ref_now)
+        rejected_message: Optional[str] = None
+        bounded_timeout: Optional[float] = None
+
+        with transaction(self.conn, mode="IMMEDIATE"):
+            row = self.conn.execute(
+                "SELECT * FROM order_deliveries WHERE id = ? AND claim_token = ?",
+                (claim.delivery_id, claim.claim_token),
+            ).fetchone()
+            if not row:
+                rejected_message = (
+                    f"Delivery claim {claim.delivery_id} does not match any active record for the supplied claim_token."
                 )
+            elif row["status"] != DeliveryStatus.DISPATCHING.value:
                 AuditRepository(self.conn).record_event(
-                    "LEASE_EXPIRED_BEFORE_SEND",
+                    "DELIVERY_PRE_SEND_REJECTED_STALE_STATE",
                     "DELIVERY",
                     claim.delivery_id,
                     details={
-                        "order_id": claim.order_id,
-                        "attempt_no": claim.attempt_no,
-                        "remaining_seconds": round(max(remaining, 0.0), 3),
-                        "updated_status": cur.rowcount == 1,
+                        "order_id": row["order_id"],
+                        "attempt_no": row["attempt_no"],
+                        "current_status": row["status"],
                     },
                 )
-            raise DeliveryLeaseExpiredError(
-                f"Delivery lease {claim.delivery_id} lacks sufficient budget before external send "
-                f"(remaining={remaining:.3f}s < min={claim.min_send_budget_seconds:.3f}s)."
-            )
+                rejected_message = (
+                    f"Delivery claim {claim.delivery_id} is no longer DISPATCHING (status='{row['status']}')."
+                )
+            else:
+                db_expires_at = _parse_utc_ts(row["lease_expires_at"])
+                utc_remaining = (db_expires_at - ref_now).total_seconds()
+                mono_remaining = claim.lease_monotonic_deadline - current_mono
+                effective_remaining = min(mono_remaining, utc_remaining)
+                required_budget = max(
+                    claim.min_send_budget_seconds,
+                    claim.http_timeout_seconds + claim.safety_margin_seconds,
+                )
 
-        return min(claim.http_timeout_seconds, remaining)
+                if utc_remaining <= 0 or mono_remaining <= 0 or effective_remaining < required_budget:
+                    cur = self.conn.execute(
+                        """
+                        UPDATE order_deliveries
+                        SET status = 'UNCERTAIN', error_code = 'LEASE_EXPIRED_BEFORE_SEND', updated_at = ?
+                        WHERE id = ? AND claim_token = ? AND status = 'DISPATCHING'
+                        """,
+                        (now_str, claim.delivery_id, claim.claim_token),
+                    )
+                    AuditRepository(self.conn).record_event(
+                        "LEASE_EXPIRED_BEFORE_SEND",
+                        "DELIVERY",
+                        claim.delivery_id,
+                        details={
+                            "order_id": claim.order_id,
+                            "attempt_no": claim.attempt_no,
+                            "mono_remaining_seconds": round(max(mono_remaining, 0.0), 3),
+                            "utc_remaining_seconds": round(max(utc_remaining, 0.0), 3),
+                            "effective_remaining_seconds": round(max(effective_remaining, 0.0), 3),
+                            "required_budget_seconds": round(required_budget, 3),
+                            "updated_status": cur.rowcount == 1,
+                        },
+                    )
+                    rejected_message = (
+                        f"Delivery lease {claim.delivery_id} lacks sufficient budget before external send "
+                        f"(effective_remaining={effective_remaining:.3f}s < required={required_budget:.3f}s)."
+                    )
+                else:
+                    bounded_timeout = min(
+                        claim.http_timeout_seconds,
+                        effective_remaining - claim.safety_margin_seconds,
+                    )
+
+        if rejected_message is not None:
+            raise DeliveryLeaseExpiredError(rejected_message)
+        assert bounded_timeout is not None
+        return bounded_timeout
 
     def record_outcome(
         self,
@@ -2460,13 +2586,14 @@ class DeliveryRepository:
 
             if current_status == DeliveryStatus.DISPATCHING:
                 delivered_at = now_str if outcome == DeliveryStatus.SENT else None
+                persisted_error = None if outcome == DeliveryStatus.SENT else norm_err
                 cur.execute(
                     """
                     UPDATE order_deliveries
                     SET status = ?, external_message_id = ?, error_code = ?, delivered_at = ?, updated_at = ?
                     WHERE id = ? AND claim_token = ? AND status = 'DISPATCHING'
                     """,
-                    (outcome.value, norm_msg_id, norm_err, delivered_at, now_str, delivery_id, claim_token.strip()),
+                    (outcome.value, norm_msg_id, persisted_error, delivered_at, now_str, delivery_id, claim_token.strip()),
                 )
                 if cur.rowcount == 0:
                     raise ConflictError(f"Concurrent update on delivery attempt {delivery_id}.")
@@ -2478,7 +2605,7 @@ class DeliveryRepository:
                         "order_id": order_id,
                         "attempt_no": row["attempt_no"],
                         "external_message_id": norm_msg_id,
-                        "error_code": norm_err,
+                        "error_code": persisted_error,
                     },
                 )
                 return self.get_delivery(delivery_id)
@@ -2488,7 +2615,7 @@ class DeliveryRepository:
                     cur.execute(
                         """
                         UPDATE order_deliveries
-                        SET status = 'SENT', external_message_id = ?, delivered_at = ?, updated_at = ?
+                        SET status = 'SENT', external_message_id = ?, error_code = NULL, delivered_at = ?, updated_at = ?
                         WHERE id = ? AND claim_token = ? AND status = 'UNCERTAIN'
                         """,
                         (norm_msg_id, now_str, now_str, delivery_id, claim_token.strip()),
@@ -2588,10 +2715,10 @@ class IdempotencyRepository:
             owner_token=row["owner_token"],
             response_entity_type=row["response_entity_type"],
             response_entity_id=row["response_entity_id"],
-            stale_after=row["stale_after"],
-            expires_at=row["expires_at"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+            stale_after=_parse_utc_ts(row["stale_after"]),
+            expires_at=_parse_utc_ts(row["expires_at"]),
+            created_at=_parse_utc_ts(row["created_at"]),
+            updated_at=_parse_utc_ts(row["updated_at"]),
         )
 
     @staticmethod
@@ -2749,13 +2876,18 @@ class IdempotencyRepository:
         idempotency_key: str,
         owner_token: str,
         *,
-        response_entity_type: Optional[str] = None,
-        response_entity_id: Optional[int] = None,
+        response_entity_type: str,
+        response_entity_id: int,
         now_utc: Optional[datetime] = None,
     ) -> IdempotencyRecord:
+        """Marks an IN_PROGRESS idempotency record COMPLETED with mandatory validated response metadata (SG-P31-003)."""
         s, a, k = self._validate_key_parts(scope, actor_key, idempotency_key)
         if not isinstance(owner_token, str) or not owner_token.strip():
             raise ValidationError("owner_token must be non-empty.")
+        if not isinstance(response_entity_type, str) or not response_entity_type.strip():
+            raise ValidationError("response_entity_type must be a non-empty string.")
+        norm_entity_type = response_entity_type.strip()
+        validated_entity_id = _validate_int(response_entity_id, "response_entity_id", min_value=1)
         now_str = _format_utc_ts(now_utc if now_utc is not None else datetime.now(timezone.utc))
 
         with transaction(self.conn, mode="IMMEDIATE"):
@@ -2765,7 +2897,7 @@ class IdempotencyRepository:
                 SET status = 'COMPLETED', response_entity_type = ?, response_entity_id = ?, updated_at = ?
                 WHERE scope = ? AND actor_key = ? AND idempotency_key = ? AND owner_token = ? AND status = 'IN_PROGRESS'
                 """,
-                (response_entity_type, response_entity_id, now_str, s, a, k, owner_token.strip()),
+                (norm_entity_type, validated_entity_id, now_str, s, a, k, owner_token.strip()),
             )
             if cur.rowcount == 0:
                 raise ConflictError(

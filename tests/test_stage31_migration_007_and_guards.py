@@ -17,6 +17,7 @@ from src.db.models import (
     InventoryType,
     OrderStatus,
     ProductStatus,
+    ReceiptReviewStatus,
 )
 from src.db.repositories import CatalogRepository, InventoryRepository, OrderRepository, ReceiptRepository, UserRepository
 
@@ -725,6 +726,227 @@ class TestStage31Migration007AndGuards(unittest.TestCase):
                 "UPDATE order_deliveries SET error_code = 'TAMPERED' WHERE id = ?",
                 (deliv_id,),
             )
+        finally:
+            conn.close()
+
+    def test_clean_install_001_to_007_and_idempotency(self) -> None:
+        conn = self._new_007_conn("clean_install_007.db")
+        try:
+            self.assertEqual(get_applied_migrations(conn), [1, 2, 3, 4, 5, 6, 7])
+            self.assertEqual(run_migrations(conn), [])
+            tables = {
+                r["name"]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            self.assertIn("order_deliveries", tables)
+            self.assertIn("idempotency_keys", tables)
+            triggers = {
+                r["name"]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()
+            }
+            self.assertIn("trg_order_items_freeze_non_pending_insert", triggers)
+            self.assertIn("trg_order_items_freeze_non_pending_update", triggers)
+            self.assertIn("trg_order_items_freeze_non_pending_delete", triggers)
+        finally:
+            conn.close()
+
+    def test_sg_p31_002_order_items_frozen_outside_pending_payment_and_delivery_error_code_cleared(self) -> None:
+        conn = self._new_007_conn("sg_p31_002_freeze.db")
+        try:
+            cat = CatalogRepository(conn)
+            u, _ = UserRepository(conn).get_or_create_user("freeze_u1")
+            v = cat.create_voucher_product("V Freeze", "TR", "TRY", status=ProductStatus.APPROVED)
+            d = cat.add_voucher_denomination(v.id, "TR", "TRY", 1000, 5000)
+            mr = cat.create_fixed_product(
+                "MR Freeze",
+                3000,
+                DeliveryMethod.MANUAL_REVIEW,
+                "MAN",
+                approval_status=ApprovalStatus.APPROVED,
+                status=ProductStatus.APPROVED,
+            )
+            inv = InventoryRepository(conn)
+            inv.import_items(v.id, ["FRZ-1", "FRZ-2", "FRZ-3", "FRZ-4"], InventoryType.VOUCHER_CODE, d.id)
+            ord_repo = OrderRepository(conn)
+            rcpt_repo = ReceiptRepository(conn)
+
+            pending_target = ord_repo.create_order(
+                u.id, 3000, "RUB", [{"product_id": mr.id, "product_type_snapshot": "FIXED_PRODUCT", "quantity": 1, "unit_price_minor": 3000}]
+            )
+            pending_oi_id = ord_repo.get_order_items(pending_target.id)[0].id
+
+            # Build orders in all 6 non-PENDING_PAYMENT states
+            o_pr = ord_repo.create_order(
+                u.id, 3000, "RUB", [{"product_id": mr.id, "product_type_snapshot": "FIXED_PRODUCT", "quantity": 1, "unit_price_minor": 3000}]
+            )
+            ord_repo.transition_order_status(o_pr.id, OrderStatus.PAYMENT_REVIEW)
+
+            o_paid = ord_repo.create_order(
+                u.id, 5000, "RUB", [{"product_id": v.id, "denomination_id": d.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 5000}]
+            )
+            inv.reserve_items_for_order(o_paid.id, v.id, 1, d.id)
+            r_paid = rcpt_repo.submit_receipt(o_paid.id, u.id, b"r_p", provider_tx_id="tx_paid_frz")
+            rcpt_repo.review_receipt(r_paid.id, ReceiptReviewStatus.ACCEPTED)
+            ord_repo.transition_order_status(o_paid.id, OrderStatus.PAYMENT_REVIEW)
+            ord_repo.transition_order_status(o_paid.id, OrderStatus.PAID)
+
+            o_ful = ord_repo.create_order(
+                u.id, 5000, "RUB", [{"product_id": v.id, "denomination_id": d.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 5000}]
+            )
+            inv.reserve_items_for_order(o_ful.id, v.id, 1, d.id)
+            ord_repo.transition_order_status(o_ful.id, OrderStatus.PAYMENT_REVIEW)
+            ord_repo.transition_order_status(o_ful.id, OrderStatus.PAID)
+            ord_repo.transition_order_status(o_ful.id, OrderStatus.FULFILLING)
+
+            o_comp = ord_repo.create_order(
+                u.id, 5000, "RUB", [{"product_id": v.id, "denomination_id": d.id, "product_type_snapshot": "VOUCHER", "quantity": 1, "unit_price_minor": 5000}]
+            )
+            inv.reserve_items_for_order(o_comp.id, v.id, 1, d.id)
+            ord_repo.transition_order_status(o_comp.id, OrderStatus.PAYMENT_REVIEW)
+            ord_repo.transition_order_status(o_comp.id, OrderStatus.PAID)
+            inv.finalize_order_sale(o_comp.id)
+            ord_repo.transition_order_status(o_comp.id, OrderStatus.FULFILLING)
+            ord_repo.transition_order_status(o_comp.id, OrderStatus.COMPLETED)
+
+            o_ref = ord_repo.create_order(
+                u.id, 3000, "RUB", [{"product_id": mr.id, "product_type_snapshot": "FIXED_PRODUCT", "quantity": 1, "unit_price_minor": 3000}]
+            )
+            ord_repo.transition_order_status(o_ref.id, OrderStatus.PAYMENT_REVIEW)
+            ord_repo.transition_order_status(o_ref.id, OrderStatus.PAID)
+            ord_repo.transition_order_status(o_ref.id, OrderStatus.REFUND_REVIEW)
+
+            o_can = ord_repo.create_order(
+                u.id, 3000, "RUB", [{"product_id": mr.id, "product_type_snapshot": "FIXED_PRODUCT", "quantity": 1, "unit_price_minor": 3000}]
+            )
+            ord_repo.transition_order_status(o_can.id, OrderStatus.CANCELLED)
+
+            non_pending_cases = [
+                (o_pr.id, mr.id, None, "FIXED_PRODUCT", 3000),
+                (o_paid.id, v.id, d.id, "VOUCHER", 5000),
+                (o_ful.id, v.id, d.id, "VOUCHER", 5000),
+                (o_comp.id, v.id, d.id, "VOUCHER", 5000),
+                (o_ref.id, mr.id, None, "FIXED_PRODUCT", 3000),
+                (o_can.id, mr.id, None, "FIXED_PRODUCT", 3000),
+            ]
+            for oid, pid, did, ptype, price in non_pending_cases:
+                oi_id = ord_repo.get_order_items(oid)[0].id
+                # Direct INSERT blocked
+                self._assert_sql_integrity_error(
+                    conn,
+                    "INSERT INTO order_items (order_id, product_id, denomination_id, product_type_snapshot, quantity, unit_price_minor, currency) "
+                    "VALUES (?, ?, ?, ?, 1, ?, 'RUB')",
+                    (oid, pid, did, ptype, price),
+                )
+                # Direct UPDATE of quantity/price blocked
+                self._assert_sql_integrity_error(
+                    conn,
+                    "UPDATE order_items SET quantity = 9, unit_price_minor = 1 WHERE id = ?",
+                    (oi_id,),
+                )
+                # Move non-pending item -> PENDING_PAYMENT order blocked (checks OLD.order_id)
+                self._assert_sql_integrity_error(
+                    conn,
+                    "UPDATE order_items SET order_id = ? WHERE id = ?",
+                    (pending_target.id, oi_id),
+                )
+                # Move PENDING_PAYMENT item -> non-pending order blocked (checks NEW.order_id!)
+                self._assert_sql_integrity_error(
+                    conn,
+                    "UPDATE order_items SET order_id = ? WHERE id = ?",
+                    (oid, pending_oi_id),
+                )
+                # Direct DELETE blocked
+                self._assert_sql_integrity_error(
+                    conn,
+                    "DELETE FROM order_items WHERE id = ?",
+                    (oi_id,),
+                )
+
+            # Move between two non-pending orders blocked
+            self._assert_sql_integrity_error(
+                conn,
+                "UPDATE order_items SET order_id = ? WHERE id = ?",
+                (o_ref.id, ord_repo.get_order_items(o_pr.id)[0].id),
+            )
+
+            # PENDING_PAYMENT allows modification, and ON DELETE CASCADE cleanup on CANCELLED without inventory/receipts works
+            conn.execute("UPDATE order_items SET quantity = 2 WHERE id = ?", (pending_oi_id,))
+            conn.commit()
+            self.assertEqual(ord_repo.get_order_items(pending_target.id)[0].quantity, 2)
+            conn.execute("DELETE FROM orders WHERE id = ?", (o_can.id,))
+            conn.commit()
+
+            # Direct SQL trigger guard on order_deliveries SENT error_code IS NULL
+            conn.execute(
+                "INSERT INTO order_deliveries (order_id, channel, delivery_kind, status, attempt_no, claim_token, claimed_by, lease_expires_at, error_code) "
+                "VALUES (?, 'TELEGRAM', 'INITIAL', 'UNCERTAIN', 1, 'tok-err-1', 'w1', '2099-01-01 00:00:00', 'LEASE_EXPIRED')",
+                (o_comp.id,),
+            )
+            d_unc_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.commit()
+            # Failing to clear error_code when transitioning UNCERTAIN -> SENT is rejected by DB trigger
+            self._assert_sql_integrity_error(
+                conn,
+                "UPDATE order_deliveries SET status = 'SENT', delivered_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (d_unc_id,),
+            )
+            # Clearing error_code = NULL passes
+            conn.execute(
+                "UPDATE order_deliveries SET status = 'SENT', error_code = NULL, delivered_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (d_unc_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_sg_p31_003_idempotency_keys_sql_check_enforces_completed_metadata(self) -> None:
+        conn = self._new_007_conn("sg_p31_003_sql_check.db")
+        try:
+            h = hashlib.sha256(b"sql-check").hexdigest()
+            # IN_PROGRESS without response metadata is permitted
+            conn.execute(
+                "INSERT INTO idempotency_keys (scope, actor_key, idempotency_key, request_hash, status, owner_token, stale_after, expires_at) "
+                "VALUES ('CREATE_ORDER', 'u:1', 'k-sql', ?, 'IN_PROGRESS', 'tok-1', '2099-01-01 00:01:00', '2099-01-02 00:00:00')",
+                (h,),
+            )
+            conn.commit()
+
+            invalid_completed_cases = [
+                (None, 10),
+                ("", 10),
+                ("   ", 10),
+                ("ORDER", None),
+                ("ORDER", 0),
+                ("ORDER", -1),
+                ("ORDER", "not_int"),
+                ("ORDER", 1.5),
+            ]
+            for idx, (etype, eid) in enumerate(invalid_completed_cases):
+                self._assert_sql_integrity_error(
+                    conn,
+                    "UPDATE idempotency_keys SET status = 'COMPLETED', response_entity_type = ?, response_entity_id = ? "
+                    "WHERE scope = 'CREATE_ORDER' AND actor_key = 'u:1' AND idempotency_key = 'k-sql'",
+                    (etype, eid),
+                )
+                self._assert_sql_integrity_error(
+                    conn,
+                    "INSERT INTO idempotency_keys (scope, actor_key, idempotency_key, request_hash, status, owner_token, response_entity_type, response_entity_id, stale_after, expires_at) "
+                    "VALUES ('CREATE_ORDER', 'u:1', ?, ?, 'COMPLETED', 'tok-bad', ?, ?, '2099-01-01 00:01:00', '2099-01-02 00:00:00')",
+                    (f"k-ins-{idx}", h, etype, eid),
+                )
+
+            # Valid COMPLETED succeeds
+            conn.execute(
+                "UPDATE idempotency_keys SET status = 'COMPLETED', response_entity_type = 'ORDER', response_entity_id = 42 "
+                "WHERE scope = 'CREATE_ORDER' AND actor_key = 'u:1' AND idempotency_key = 'k-sql'"
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT status, response_entity_type, response_entity_id FROM idempotency_keys WHERE idempotency_key = 'k-sql'"
+            ).fetchone()
+            self.assertEqual(row["status"], "COMPLETED")
+            self.assertEqual(row["response_entity_type"], "ORDER")
+            self.assertEqual(row["response_entity_id"], 42)
         finally:
             conn.close()
 

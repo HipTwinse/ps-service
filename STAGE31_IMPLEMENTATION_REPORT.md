@@ -51,9 +51,9 @@ Stage 3.2 намеренно не начат. Мерж в `main` и открыт
 | `004` | `004_order_item_denomination.sql` | `beac060c3b3fa6f7f8ba8f9b5359d096d93a4d089a8c74627cfef1127c450f5a` | Неизменна (baseline) |
 | `005` | `005_inventory_order_delete_restrict.sql` | `1c157e36c888897e5626ab19816659aca7c710fc2ea93539626a277a72b94f72` | Неизменна (baseline) |
 | `006` | `006_order_items_update_and_product_type_guards.sql` | `9ac4528903fd9e00128791710ea346f58935e65c229cddc70e95949cd8d7c92e` | Неизменна (baseline) |
-| `007` | `007_phase3_integrity_and_foundation.sql` | `20bcf9a7fa4eda4f0ad88159c26f1c2fa532968b42c1979b1659514047a17b72` | Новая (Stage 3.1) |
+| `007` | `007_phase3_integrity_and_foundation.sql` | `6beaf34991ab1fa3d59f22aefd823e602ac53ef1a4c5b6b68b4d3e645ae3b921` | Новая (Stage 3.1 + Remediation SG-P31-002/003) |
 
-*Примечание о line endings:* для `002`–`006` baseline checksums соответствуют сырым байтам файлов из репозитория; для `007` файл записан с `LF`, поэтому `read_bytes()` и UTF-8 текст дают идентичный хеш `20bcf9a7...`.
+*Примечание о line endings:* для `002`–`006` baseline checksums соответствуют сырым байтам файлов из репозитория; для `007` файл записан с `LF`, поэтому `read_bytes()` и UTF-8 текст дают идентичный хеш `6beaf349...`.
 
 ---
 
@@ -61,7 +61,7 @@ Stage 3.2 намеренно не начат. Мерж в `main` и открыт
 
 - **Python 3.14.7 (SQLite 3.50.4, локально):**
   - Команда: `python -m unittest discover -v tests`
-  - Результат: **174 tests run, 0 failures, 0 errors, 0 skipped (OK)**.
+  - Результат (с учётом remediation `SG-P31-001`–`005`, см. `STAGE31_REMEDIATION_REPORT.md`): **181 tests run, 0 failures, 0 errors, 0 skipped (OK)**.
 - **Python 3.11 и Python 3.12:**
   - Статус: **НЕ ЗАПУСКАЛИСЬ ЛОКАЛЬНО** (`py -0p` подтверждает наличие только `Python 3.14` на данной Windows-машине).
   - Инфраструктура: `.github/workflows/ci.yml` настроен на матрицу `["3.11", "3.12"]` для ветки `main`; подтверждение на `3.11`/`3.12` должно быть получено через GitHub Actions или соответствующее окружение перед мержем. Локальный прогон на `3.14.7` **не** выдаётся за прохождение CI на `3.11`/`3.12`.
@@ -72,10 +72,10 @@ Stage 3.2 намеренно не начат. Мерж в `main` и открыт
 
 Целевые прогоны модулей безопасности:
 - `tests/test_stage31_transactions_and_uow.py`: **9 / 9 OK** (`AR-P3-002`, `AR-P3-003`, `SG-P2-004`).
-- `tests/test_stage31_migration_007_and_guards.py`: **7 / 7 OK** (`AR-P3-004`, `AR-P3-005`, `AR-P3-007`, `OD-04`, `OD-06`, `SG-P2-006`, SQL bypass-тесты).
-- `tests/test_stage31_remediations_and_primitives.py`: **10 / 10 OK** (`SG-P2-005`..`016`, `OD-01`..`08`, `AR-P3-001`, `AR-P3-006`, `AR-P3-008`).
+- `tests/test_stage31_migration_007_and_guards.py`: **10 / 10 OK** (`AR-P3-004`, `AR-P3-005`, `AR-P3-007`, `OD-04`, `OD-06`, `SG-P2-006`, `SG-P31-002`, `SG-P31-003`, clean install & SQL bypass-тесты).
+- `tests/test_stage31_remediations_and_primitives.py`: **14 / 14 OK** (`SG-P2-005`..`016`, `OD-01`..`08`, `AR-P3-001`, `AR-P3-006`, `AR-P3-008`, `SG-P31-001`, `SG-P31-003`, `SG-P31-004`, `SG-P31-005`).
 - `tests/test_phase2_security_gate_remediation.py`: **17 / 17 OK**.
-- Все остальные наборы (`test_engine.py`, `test_db_schema.py`, `test_crypto*.py`, `test_backup.py`, `test_restore_safety.py`, `test_inventory.py`, `test_orders.py`, `test_receipts*.py`, `test_migrations_remediation.py`, `test_phase2_*.py`): включены в общий прогон **174 / 174 OK**.
+- Все остальные наборы (`test_engine.py`, `test_db_schema.py`, `test_crypto*.py`, `test_backup.py`, `test_restore_safety.py`, `test_inventory.py`, `test_orders.py`, `test_receipts*.py`, `test_migrations_remediation.py`, `test_phase2_*.py`): включены в общий прогон **181 / 181 OK**.
 
 ---
 

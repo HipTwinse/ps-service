@@ -381,6 +381,7 @@ class DeliveryClaim:
     lease_monotonic_deadline: float
     min_send_budget_seconds: float
     http_timeout_seconds: float
+    safety_margin_seconds: float = 5.0
 
 
 @dataclass(frozen=True)

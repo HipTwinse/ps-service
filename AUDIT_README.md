@@ -63,7 +63,7 @@ pip install -r requirements.txt
 python -m unittest discover -v tests
 ```
 
-Фактический результат на локальном окружении (`Python 3.14.7`): `Ran 174 tests ... OK` (включая `147` базовых/адаптированных тестов Phase 2, `1` новый race-тест `SG-P2-007` в `tests/test_inventory.py` и `26` новых Stage 3.1 тестов в `tests/test_stage31_*.py`).
+Фактический результат на локальном окружении (`Python 3.14.7`, `SQLite 3.50.4`): `Ran 181 tests ... OK` (включая `147` базовых/адаптированных тестов Phase 2, `1` race-тест `SG-P2-007` в `tests/test_inventory.py` и `33` новых Stage 3.1 + remediation тестов в `tests/test_stage31_*.py`).
 *Примечание:* локально установлен только Python 3.14.7 (`py -0p`); прогон на Python 3.11 и 3.12 требует запуска через CI.
 
 ---
@@ -94,10 +94,10 @@ python -c "from src.db import create_connection, run_migrations; conn = create_c
   - 9 pre-flight проверок (`_preflight_migration_007` с `LEFT JOIN` для обнаружения сиротских строк, отсутствующих/некорректных detail rows, смешанных заказов `OD-04`, `CANCELLED+RESERVED`, двусторонних инвариантов `COMPLETED`, множественных `ACCEPTED` чеков и некорректных forensic-ссылок `AR-P3-007`).
   - Backfill `orders.paid_at` для legacy `PAID`/`FULFILLING`/`COMPLETED` заказов перед установкой триггеров `AR-P3-005`.
   - Индексы `idx_receipts_single_accepted_per_order`, `idx_orders_status_created_at`, `idx_inventory_order_status`.
-  - Триггеры целостности `voucher_details`, `fixed_product_details`, `voucher_denominations`, `order_items` (включая запрет смешивания `MANUAL_REVIEW` и inventory-backed позиций `OD-04` и заморозку `order_items` терминальных заказов).
+  - Триггеры целостности `voucher_details`, `fixed_product_details`, `voucher_denominations`, `order_items` (включая запрет смешивания `MANUAL_REVIEW` и inventory-backed позиций `OD-04` и строгую заморозку `INSERT`/`UPDATE`/`DELETE` для `order_items` при любом статусе заказа кроме `PENDING_PAYMENT`, `SG-P31-002`).
   - Триггеры `inventory_items`: терминальность `SOLD` (`OD-06`, с сохранением возможности ротации `fingerprint` и `updated_at`), запрет прямой вставки `SOLD`, запрет `AVAILABLE -> SOLD`, семантика `QUARANTINED`/`DISABLED` и forensic-ссылок (`AR-P3-007`), парный контроль `INSERT`/`UPDATE` квот резервирования.
   - Триггеры `orders` и `payment_receipts` (`AR-P3-005`, `SG-P2-004`) + append-only защита `audit_events`.
-  - Таблицы `order_deliveries` (с append-only триггерами и уникальным индексом активной попытки `DISPATCHING`, `AR-P3-001`) и `idempotency_keys` (`AR-P3-006`).
+  - Таблицы `order_deliveries` (с append-only триггерами, запретом non-NULL `error_code` в статусе `SENT` и уникальным индексом активной попытки `DISPATCHING`, `AR-P3-001`, `SG-P31-002`) и `idempotency_keys` (`CHECK`-инвариант обязательных `response_entity_type` и `response_entity_id >= 1` для `COMPLETED`, `AR-P3-006`, `SG-P31-003`).
 
 ---
 
@@ -109,14 +109,14 @@ python -c "from src.db import create_connection, run_migrations; conn = create_c
 - **Продуктовые решения (`OD-01`–`OD-09`):**
   - `OD-01` / `OD-02`: `BLOCKED` пользователи блокируются на серверной стороне (`UserBlockedError`) при создании заказов, загрузке чеков, получении `get_revealed_code()` и `DeliveryRepository.claim_delivery()`. Неоплаченные заказы могут быть атомарно отменены с возвратом `RESERVED` инвентаря в `AVAILABLE`.
   - `OD-03` / `OD-04`: `OFFICIAL_ACTIVATION` работает с `InventoryType.ACTIVATION_DATA`; разрешены совместные заказы `VOUCHER` + inventory-backed `FIXED_PRODUCT`, а смешивание с `MANUAL_REVIEW` запрещено и в Python (`OrderRepository.create_order`, `InventoryRepository.finalize_order_sale`), и SQL-триггерами `007`.
-  - `OD-05`: Пользователь не может отменить заказ в `PAYMENT_REVIEW`; `OrderRepository.cancel_order_atomically()` при отмене оператором атомарно освобождает `RESERVED` инвентарь, переводит ожидающие `PENDING_REVIEW` чеки в `REJECTED` и записывает аудит.
+  - `OD-05`: Пользователь не может отменить заказ в `PAYMENT_REVIEW`; `OrderRepository.cancel_order_atomically()` при отмене оператором атомарно освобождает `RESERVED` инвентарь, переводит ожидающие `PENDING_REVIEW` чеки в `REJECTED` и записывает пару событий аудита (`ORDER_STATUS_TRANSITION` как основное событие перехода + `ORDER_CANCELLED_ATOMIC` со сводкой побочных эффектов). Stage 3.2 `OrderService.cancel_order()` обязан делегировать в этот метод без создания третьего дублирующего audit-события (`SG-P31-005`).
   - `OD-06` / `OD-07`: `SOLD` терминален и защищён триггером от отката или подмены payload/product/order; операторский интерфейс в Stage 3.1 не имеет break-glass просмотра plaintext и использует примитивы слепой доставки.
-  - `OD-08` / `OD-09`: Пороги (`3` открытых заказа, `900s` TTL, `60s` lease, `60s` redelivery cooldown) сосредоточены в `OperationalDefaults`; `voucher_denominations.cost_rub_kopecks` трактуется как розничная цена без изменения Phase 1.
-- **Семантика доставки (`DeliveryRepository`, `AR-P3-001`):**
-  - Система честно моделирует **at-least-once delivery**: каждая попытка создаёт отдельную append-only запись с уникальными `delivery_id`, `attempt_no`, `claim_token`. Перед внешним HTTP-вызовом проверяется monotonic-бюджет (`check_pre_send_lease_budget()` -> `LEASE_EXPIRED_BEFORE_SEND` при нехватке `< 10.0s`), HTTP timeout ограничен.
-  - Поздний `SENT` после reclaim сохраняется только на старой записи с аудитом `DELIVERY_LATE_SENT_AFTER_RECLAIM`, не затрагивая новую попытку и `SOLD` инвентарь; устаревший `FAILED` игнорируется (`DELIVERY_STALE_OUTCOME_IGNORED`). Дублирование доставки при сетевом таймауте или паузе процесса после pre-send проверки математически исключить нельзя, и `exactly-once` НЕ заявляется.
-- **Семантика идемпотентности (`IdempotencyRepository`, `AR-P3-006`):**
-  - `claim()` атомарно фиксирует `(scope, actor_key, idempotency_key)` в статусе `IN_PROGRESS` с `owner_token`, возвращает `REPLAY` при `COMPLETED` и совпадающем `request_hash`, отклоняет конфликт хеша (`IdempotencyConflictError`), допускает reclaim просроченного `IN_PROGRESS` после `stale_after` (старый `owner_token` при этом отклоняется) и выселяет/очищает истёкшие ключи (`expires_at`). SQLite не ограничивает `IN_PROGRESS` на уровне commit-time CHECK — жизненный цикл управляется протоколом `claim` / `mark_completed` / `release_in_progress`.
+  - `OD-08` / `OD-09`: Пороги (`3` открытых заказа, `900s` TTL, `60s` lease, `20.0s` min send budget при `15.0s` HTTP timeout + `5.0s` safety margin, `60s` redelivery cooldown) сосредоточены в `OperationalDefaults`; `voucher_denominations.cost_rub_kopecks` трактуется как розничная цена без изменения Phase 1.
+- **Семантика доставки (`DeliveryRepository`, `AR-P3-001`, `SG-P31-001`, `SG-P31-002`, `SG-P31-004`):**
+  - Система честно моделирует **at-least-once delivery**: каждая попытка создаёт отдельную append-only запись с уникальными `delivery_id`, `attempt_no`, `claim_token`; все timestamp-поля DTO (`DeliveryClaim`, `DeliveryAttempt`, `IdempotencyRecord`) возвращаются как timezone-aware UTC `datetime`. Перед внешним HTTP-вызовом `check_pre_send_lease_budget()` внутри транзакции сверяет живую запись `(delivery_id, claim_token)` в БД, проверяет статус `DISPATCHING` (отказ `DELIVERY_PRE_SEND_REJECTED_STALE_STATE` при `UNCERTAIN`/чужом токене), оценивает `min(mono_remaining, utc_remaining)` с учётом safety margin (`>= max(min_send_budget_seconds, http_timeout_seconds + safety_margin_seconds)`) и переводит в `UNCERTAIN (LEASE_EXPIRED_BEFORE_SEND)` только условным `UPDATE` для активного владельца.
+  - Поздний `SENT` (`UNCERTAIN -> SENT`) сохраняет `external_message_id` и `delivered_at`, очищает `error_code = NULL`, фиксирует прежнюю ошибку в аудите `DELIVERY_LATE_SENT_AFTER_RECLAIM` и не затрагивает новую попытку или `SOLD` инвентарь; устаревший `FAILED` игнорируется (`DELIVERY_STALE_OUTCOME_IGNORED`). Дублирование доставки при сетевом таймауте или длительной паузе процесса после pre-send проверки математически исключить нельзя, и `exactly-once` НЕ заявляется.
+- **Семантика идемпотентности (`IdempotencyRepository`, `AR-P3-006`, `SG-P31-003`):**
+  - `claim()` атомарно фиксирует `(scope, actor_key, idempotency_key)` в статусе `IN_PROGRESS` с `owner_token`, возвращает `REPLAY` при `COMPLETED` и совпадающем `request_hash`, отклоняет конфликт хеша (`IdempotencyConflictError`), допускает reclaim просроченного `IN_PROGRESS` после `stale_after` (старый `owner_token` при этом отклоняется) и выселяет/очищает истёкшие ключи (`expires_at`). SQLite не ограничивает фиксацию `IN_PROGRESS` на уровне commit-time `CHECK`, однако табличный `CHECK` в `007` и `mark_completed()` гарантируют, что `COMPLETED` всегда имеет непустой `response_entity_type` и положительный целочисленный `response_entity_id >= 1` (с явным отклонением `bool`).
 
 ---
 
@@ -146,7 +146,7 @@ python -c "from src.db import create_connection, run_migrations; conn = create_c
 2. **Операционный регламент `restore_database()`:** обязательная полная остановка всех процессов приложения и закрытие соединений до восстановления.
 3. **Операционный регламент `rotate_fingerprint_pepper()`:** требует остановки писателей (`quiesce`) и синхронной выкатки нового `FINGERPRINT_PEPPER`.
 4. **At-least-once delivery (`AR-P3-001`):** редкие дубликаты сообщений возможны при сетевом сбое/паузе процесса после pre-send проверки.
-5. **Версии Python в CI vs локально:** локально протестировано на `Python 3.14.7` (`174 tests OK`); прогон матрицы `Python 3.11` / `3.12` (`.github/workflows/ci.yml`) остаётся задачей CI.
+5. **Версии Python в CI vs локально:** локально протестировано на `Python 3.14.7` (`181 tests OK`); прогон матрицы `Python 3.11` / `3.12` (`.github/workflows/ci.yml`) остаётся задачей CI.
 
 ---
 
@@ -160,4 +160,4 @@ python -c "from src.db import create_connection, run_migrations; conn = create_c
 
 - **Phase 2 Verified Baseline (`a261edcd2154e524426d6a258da1862c92ce297d`):** `Merge pull request #1 from HipTwinse/security/phase2-remediation` (`main`, `origin/main`).
 - **Phase 3 Architecture Design Revision 2 (`71025e6f2b114d1df6eb23c5810fbddafeb2401c`):** ветка `docs/phase3-architecture-design`.
-- **Phase 3 Stage 3.1 Foundation (`feat/phase3-stage31-foundation`):** реализация фундамента Stage 3.1, миграции `007`, исправлений `AR-P3-001`–`008` и `SG-P2-005`–`016`, `OD-01`–`09`, а также 27 новых детерминированных тестов (`1` `SG-P2-007` + `26` Stage 3.1).
+- **Phase 3 Stage 3.1 Foundation (`feat/phase3-stage31-foundation`):** реализация фундамента Stage 3.1, миграции `007`, исправлений `AR-P3-001`–`008`, `SG-P2-005`–`016`, `OD-01`–`09` и remediation-замечаний `SG-P31-001`–`005` (`34` новых детерминированных теста: `1` `SG-P2-007` + `33` Stage 3.1 / remediation).

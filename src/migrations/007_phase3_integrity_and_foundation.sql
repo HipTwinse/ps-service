@@ -226,25 +226,26 @@ BEGIN
     );
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_order_items_freeze_terminal_insert
+CREATE TRIGGER IF NOT EXISTS trg_order_items_freeze_non_pending_insert
 BEFORE INSERT ON order_items
-WHEN EXISTS (SELECT 1 FROM orders o WHERE o.id = NEW.order_id AND o.status IN ('COMPLETED', 'CANCELLED'))
+WHEN EXISTS (SELECT 1 FROM orders o WHERE o.id = NEW.order_id AND o.status != 'PENDING_PAYMENT')
 BEGIN
-    SELECT RAISE(ABORT, 'Cannot insert order_items for COMPLETED or CANCELLED order');
+    SELECT RAISE(ABORT, 'Cannot insert order_items once order has left PENDING_PAYMENT');
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_order_items_freeze_terminal_update
+CREATE TRIGGER IF NOT EXISTS trg_order_items_freeze_non_pending_update
 BEFORE UPDATE ON order_items
-WHEN EXISTS (SELECT 1 FROM orders o WHERE o.id = OLD.order_id AND o.status IN ('COMPLETED', 'CANCELLED'))
+WHEN EXISTS (SELECT 1 FROM orders o WHERE o.id = OLD.order_id AND o.status != 'PENDING_PAYMENT')
+  OR EXISTS (SELECT 1 FROM orders o WHERE o.id = NEW.order_id AND o.status != 'PENDING_PAYMENT')
 BEGIN
-    SELECT RAISE(ABORT, 'Cannot modify order_items for COMPLETED or CANCELLED order');
+    SELECT RAISE(ABORT, 'Cannot modify order_items once order has left PENDING_PAYMENT');
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_order_items_freeze_terminal_delete
+CREATE TRIGGER IF NOT EXISTS trg_order_items_freeze_non_pending_delete
 BEFORE DELETE ON order_items
-WHEN EXISTS (SELECT 1 FROM orders o WHERE o.id = OLD.order_id AND o.status IN ('COMPLETED', 'CANCELLED'))
+WHEN EXISTS (SELECT 1 FROM orders o WHERE o.id = OLD.order_id AND o.status != 'PENDING_PAYMENT')
 BEGIN
-    SELECT RAISE(ABORT, 'Cannot delete order_items for COMPLETED or CANCELLED order');
+    SELECT RAISE(ABORT, 'Cannot delete order_items once order has left PENDING_PAYMENT');
 END;
 
 -- 4. Inventory transition, allocation cap, quarantine/disabled, and SOLD terminal guards
@@ -604,6 +605,9 @@ BEGIN
     SELECT RAISE(ABORT, 'SENT delivery record requires non-NULL delivered_at')
     WHERE NEW.status = 'SENT' AND NEW.delivered_at IS NULL;
 
+    SELECT RAISE(ABORT, 'SENT delivery record must have NULL error_code')
+    WHERE NEW.status = 'SENT' AND NEW.error_code IS NOT NULL;
+
     SELECT RAISE(ABORT, 'SENT delivery record metadata cannot be altered')
     WHERE OLD.status = 'SENT'
       AND (
@@ -638,7 +642,18 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     expires_at TIMESTAMP NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (scope, actor_key, idempotency_key)
+    UNIQUE (scope, actor_key, idempotency_key),
+    CHECK (
+        status = 'IN_PROGRESS'
+        OR (
+            status = 'COMPLETED'
+            AND response_entity_type IS NOT NULL
+            AND TRIM(response_entity_type) != ''
+            AND response_entity_id IS NOT NULL
+            AND typeof(response_entity_id) = 'integer'
+            AND response_entity_id >= 1
+        )
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_idempotency_expires_at

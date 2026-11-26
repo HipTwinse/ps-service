@@ -1121,17 +1121,15 @@ class TestPhase2SecurityGateRemediation(unittest.TestCase):
         self.assertEqual(self.inv_repo.finalize_order_sale(order_sold.id), 2)
         oi_sold_id = self.order_repo.get_order_items(order_sold.id)[0].id
 
-        # 6. Reducing quantity below SOLD count (2 -> 1) MUST be blocked
+        # 6. Reducing OR increasing quantity once order_sold left PENDING_PAYMENT (PAID) is blocked
         self._assert_sql_update_blocked(
             "UPDATE order_items SET quantity = 1 WHERE id = ?",
             (oi_sold_id,),
         )
-        # Increasing quantity after SOLD (2 -> 3) is allowed if needed
-        self.conn.execute("UPDATE order_items SET quantity = 3 WHERE id = ?", (oi_sold_id,))
-        self.conn.commit()
-        # Reducing back down to allowed boundary (3 -> 2, == 2 SOLD) succeeds
-        self.conn.execute("UPDATE order_items SET quantity = 2 WHERE id = ?", (oi_sold_id,))
-        self.conn.commit()
+        self._assert_sql_update_blocked(
+            "UPDATE order_items SET quantity = 3 WHERE id = ?",
+            (oi_sold_id,),
+        )
 
     def test_sg_p2_001_followup_fixed_product_null_denomination_and_product_type_change_guard(self):
         """Scenarios 9 & 10: FIXED_PRODUCT (denomination_id IS NULL) update guards & product_type change blocked when order_items exist without inventory."""
